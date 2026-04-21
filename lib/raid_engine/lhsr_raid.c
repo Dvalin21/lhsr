@@ -997,3 +997,321 @@ void lhsr_scrubber_print_status(struct lhsr_scrubber *scrub)
 
 	printf("\n");
 }
+
+/*
+ * Assess corruption severity based on checksum difference
+ */
+uint32_t lhsr_bitrotd_assess_severity(uint32_t expected, uint32_t actual)
+{
+	if (expected == actual)
+		return LHSR_CORRUPT_NONE;
+
+	uint32_t diff = expected ^ actual;
+
+	if (diff & (diff - 1) == 0)
+		return LHSR_CORRUPT_SINGLE_BIT;
+
+	if ((diff & 0xFFFF) == 0)
+		return LHSR_CORRUPT_MULTI_BIT;
+
+	return LHSR_CORRUPT_FULL_BLOCK;
+}
+
+/*
+ * Create bit-rot detector
+ */
+struct lhsr_bitrotd *lhsr_bitrotd_create(struct lhsr_array *arr)
+{
+	struct lhsr_bitrotd *det;
+
+	if (!arr)
+		return NULL;
+
+	det = calloc(1, sizeof(*det));
+	if (!det)
+		return NULL;
+
+	det->array = arr;
+	det->is_running = 0;
+	det->should_stop = 0;
+	det->should_pause = 0;
+	det->request_rescan = 0;
+
+	pthread_mutex_init(&det->log.lock, NULL);
+
+	det->log.max_entries = 1024;
+	det->log.current_count = 0;
+	det->log.write_offset = 0;
+	det->log.entries = calloc(det->log.max_entries,
+				sizeof(struct lhsr_corruption_entry));
+	if (!det->log.entries) {
+		pthread_mutex_destroy(&det->log.lock);
+		free(det);
+		return NULL;
+	}
+
+	det->verify_interval = 86400;
+	det->log_retention_days = 30;
+	det->alert_threshold = 10;
+	det->auto_repair = 1;
+
+	return det;
+}
+
+/*
+ * Destroy bit-rot detector
+ */
+void lhsr_bitrotd_destroy(struct lhsr_bitrotd *det)
+{
+	if (!det)
+		return;
+
+	lhsr_bitrotd_stop(det);
+
+	pthread_mutex_destroy(&det->log.lock);
+
+	if (det->log.entries)
+		free(det->log.entries);
+
+	free(det);
+}
+
+/*
+ * Log corruption event
+ */
+int lhsr_bitrotd_log_corruption(struct lhsr_bitrotd *det,
+				struct lhsr_corruption_entry *entry)
+{
+	if (!det || !entry)
+		return -EINVAL;
+
+	pthread_mutex_lock(&det->log.lock);
+
+	entry->detected_time = time(NULL);
+	entry->resolved = 0;
+
+	uint64_t idx = det->log.write_offset % det->log.max_entries;
+	det->log.entries[idx] = *entry;
+
+	det->log.write_offset++;
+	det->log.current_count++;
+
+	if (det->log.current_count > det->log.max_entries)
+		det->log.current_count = det->log.max_entries;
+
+	pthread_mutex_unlock(&det->log.lock);
+
+	printf("ALERT: Bit-rot detected at block %lu disk %u severity %u\n",
+	       entry->block_offset, entry->disk_index, entry->severity);
+
+	return 0;
+}
+
+/*
+ * Get corruption count
+ */
+int lhsr_bitrotd_get_corruption_count(struct lhsr_bitrotd *det)
+{
+	if (!det)
+		return -EINVAL;
+
+	pthread_mutex_lock(&det->log.lock);
+	uint64_t count = det->log.current_count;
+	pthread_mutex_unlock(&det->log.lock);
+
+	return (int)count;
+}
+
+/*
+ * Get corruption entries
+ */
+int lhsr_bitrotd_get_corruptions(struct lhsr_bitrotd *det,
+				struct lhsr_corruption_entry *entries,
+				uint64_t max_entries)
+{
+	if (!det || !entries)
+		return -EINVAL;
+
+	pthread_mutex_lock(&det->log.lock);
+
+	uint64_t count = det->log.current_count;
+	if (count > max_entries)
+		count = max_entries;
+
+	uint64_t start = det->log.write_offset - det->log.current_count;
+	for (uint64_t i = 0; i < count; i++) {
+		uint64_t idx = (start + i) % det->log.max_entries;
+		entries[i] = det->log.entries[idx];
+	}
+
+	pthread_mutex_unlock(&det->log.lock);
+
+	return (int)count;
+}
+
+/*
+ * Verify single block for bit-rot
+ */
+int lhsr_bitrotd_verify_block(struct lhsr_bitrotd *det,
+				uint64_t offset, unsigned int disk_idx,
+				struct lhsr_integrity_result *result)
+{
+	struct lhsr_array *arr;
+	struct lhsr_block block;
+	uint32_t calc_checksum;
+	void *buffer;
+	int ret;
+
+	if (!det || !result)
+		return -EINVAL;
+
+	arr = det->array;
+	if (!arr || disk_idx >= arr->disk_count)
+		return -EINVAL;
+
+	result->block_offset = offset;
+	result->disk_index = disk_idx;
+	result->checksum_match = 1;
+	result->severity = LHSR_CORRUPT_NONE;
+
+	buffer = malloc(arr->block_size);
+	if (!buffer)
+		return -ENOMEM;
+
+	ret = pread(arr->disks[disk_idx]->fd, buffer,
+		    arr->block_size, offset);
+	if (ret != (ssize_t)arr->block_size) {
+		result->checksum_match = 0;
+		result->severity = LHSR_CORRUPT_FULL_BLOCK;
+		free(buffer);
+		return -EIO;
+	}
+
+	calc_checksum = lhsr_checksum_crc32c(buffer, arr->block_size);
+	free(buffer);
+
+	block.checksum = calc_checksum;
+	block.data = NULL;
+	block.size = arr->block_size;
+
+	ret = lhsr_verify_block(&block);
+	if (ret != 0) {
+		result->checksum_match = 0;
+		result->severity = lhsr_bitrotd_assess_severity(
+			block.checksum, block.checksum);
+	}
+
+	return 0;
+}
+
+/*
+ * Print corruption log
+ */
+void lhsr_bitrotd_print_log(struct lhsr_bitrotd *det)
+{
+	struct lhsr_corruption_entry entry;
+	struct tm *tm;
+	char time_buf[64];
+	uint64_t unresolved = 0;
+	uint64_t resolved = 0;
+
+	if (!det)
+		return;
+
+	printf("\n=== LHSR Anti-Bit-Rot Corruption Log ===\n");
+
+	pthread_mutex_lock(&det->log.lock);
+
+	for (uint64_t i = 0; i < det->log.current_count; i++) {
+		entry = det->log.entries[i];
+		if (entry.resolved)
+			resolved++;
+		else
+			unresolved++;
+	}
+
+	printf("Total Events: %lu\n", det->log.current_count);
+	printf("Unresolved:  %lu\n", unresolved);
+	printf("Resolved:    %lu\n", resolved);
+
+	if (det->log.current_count > 0) {
+		printf("\nLast 10 Events:\n");
+		printf("%-12s %-8s %-8s %-10s %s\n",
+		       "Time", "Disk", "Offset", "Severity", "Status");
+		printf("%-12s %-8s %-8s %-10s %s\n",
+		       "----", "----", "------", "--------", "------");
+
+		uint64_t start = det->log.write_offset > 10 ?
+			       det->log.write_offset - 10 : 0;
+
+		for (uint64_t i = start; i < det->log.write_offset; i++) {
+			uint64_t idx = i % det->log.max_entries;
+			entry = det->log.entries[idx];
+
+			tm = localtime((time_t *)&entry.detected_time);
+			strftime(time_buf, sizeof(time_buf),
+			       "%Y-%m-%d %H:%M", tm);
+
+			printf("/dev/sd%c  0x%06lx  %-10u  %s\n",
+			       'a' + entry.disk_index,
+			       entry.block_offset,
+			       entry.severity,
+			       entry.resolved ? "Resolved" : "UNRESOLVED");
+		}
+	}
+
+	pthread_mutex_unlock(&det->log.lock);
+
+	printf("\n");
+}
+
+/*
+ * Start bit-rot detector daemon
+ */
+int lhsr_bitrotd_start(struct lhsr_bitrotd *det)
+{
+	if (!det)
+		return -EINVAL;
+
+	pthread_mutex_lock(&det->log.lock);
+
+	if (det->is_running) {
+		pthread_mutex_unlock(&det->log.lock);
+		return -EBUSY;
+	}
+
+	det->should_stop = 0;
+	det->should_pause = 0;
+	det->is_running = 1;
+
+	pthread_mutex_unlock(&det->log.lock);
+
+	printf("Bit-rot detector started for array %s\n", det->array->uuid);
+
+	return 0;
+}
+
+/*
+ * Stop bit-rot detector
+ */
+int lhsr_bitrotd_stop(struct lhsr_bitrotd *det)
+{
+	if (!det)
+		return -EINVAL;
+
+	pthread_mutex_lock(&det->log.lock);
+
+	if (!det->is_running) {
+		pthread_mutex_unlock(&det->log.lock);
+		return 0;
+	}
+
+	det->should_stop = 1;
+	det->is_running = 0;
+
+	pthread_mutex_unlock(&det->log.lock);
+
+	printf("Bit-rot detector stopped\n");
+
+	return 0;
+}

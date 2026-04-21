@@ -113,6 +113,38 @@ struct lhsr_block_entry {
 #define LHSR_BLOCK_SCRUBBED  0x08
 #define LHSR_BLOCK_DIRTY     0x10
 
+/* Anti-Bit-Rot integrity states */
+#define LHSR_INTEGRITY_VERIFIED   0
+#define LHSR_INTEGRITY_CORRUPTED   1
+#define LHSR_INTEGRITY_UNKNOWN    2
+#define LHSR_INTEGRITY_REBUILDING  3
+
+/* Corruption severity levels */
+#define LHSR_CORRUPT_NONE       0
+#define LHSR_CORRUPT_SINGLE_BIT  1
+#define LHSR_CORRUPT_MULTI_BIT   2
+#define LHSR_CORRUPT_FULL_BLOCK  3
+
+/* Corruption log entry - stored in metadata area */
+struct lhsr_corruption_entry {
+    __u64 block_offset;
+    __u32 disk_index;
+    __u32 severity;
+    __u64 detected_time;
+    __u32 expected_checksum;
+    __u32 actual_checksum;
+    __u8  resolved;
+    __u8  padding[7];
+} __attribute__((packed));
+
+/* Integrity verification result */
+struct lhsr_integrity_result {
+    __u64 block_offset;
+    __u32 disk_index;
+    __u32 checksum_match;
+    __u32 severity;
+};
+
 /* IOCTL commands */
 #define LHSR_IOCTL_CREATE      0x100
 #define LHSR_IOCTL_ADD       0x101
@@ -121,6 +153,9 @@ struct lhsr_block_entry {
 #define LHSR_IOCTL_SCRUB    0x104
 #define LHSR_IOCTL_STATUS   0x105
 #define LHSR_IOCTL_REPAIR  0x106
+#define LHSR_IOCTL_VERIFY  0x107
+#define LHSR_IOCTL_GET_CORRUPTION  0x108
+#define LHSR_IOCTL_CLEAR_CORRUPTION 0x109
 
 /* Device numbers */
 #define LHSR_MAJOR          253

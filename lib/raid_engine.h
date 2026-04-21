@@ -66,6 +66,7 @@ struct lhsr_context {
 	uint32_t checksum_algo;
 	uint32_t heal_mode;
 	uint32_t scrub_interval;
+	uint32_t bitrot_detection_enabled;
 
 	pthread_mutex_t lock;
 };
@@ -151,6 +152,70 @@ struct lhsr_block {
 	uint32_t checksum;
 	uint32_t checksum_algo;
 	int corrupted;
+};
+
+/* Integrity states */
+enum lhsr_integrity_state {
+	LHSR_INTEGRITY_VERIFIED = 0,
+	LHSR_INTEGRITY_CORRUPTED = 1,
+	LHSR_INTEGRITY_UNKNOWN = 2,
+	LHSR_INTEGRITY_REBUILDING = 3,
+};
+
+/* Corruption severity */
+enum lhsr_corrupt_severity {
+	LHSR_CORRUPT_NONE = 0,
+	LHSR_CORRUPT_SINGLE_BIT = 1,
+	LHSR_CORRUPT_MULTI_BIT = 2,
+	LHSR_CORRUPT_FULL_BLOCK = 3,
+};
+
+/* Corruption log entry */
+struct lhsr_corruption_entry {
+	uint64_t block_offset;
+	uint32_t disk_index;
+	uint32_t severity;
+	uint64_t detected_time;
+	uint32_t expected_checksum;
+	uint32_t actual_checksum;
+	uint8_t resolved;
+	uint8_t padding[7];
+};
+
+/* Integrity verification result */
+struct lhsr_integrity_result {
+	uint64_t block_offset;
+	uint32_t disk_index;
+	uint32_t checksum_match;
+	uint32_t severity;
+};
+
+/* Corruption log */
+struct lhsr_corruption_log {
+	pthread_mutex_t lock;
+	uint64_t max_entries;
+	uint64_t current_count;
+	uint64_t write_offset;
+	struct lhsr_corruption_entry *entries;
+};
+
+/* Bit-rot detector */
+struct lhsr_bitrotd {
+	pthread_t thread;
+	pthread_mutex_t lock;
+	int is_running;
+	int should_stop;
+	int should_pause;
+	int request_rescan;
+
+	struct lhsr_array *array;
+	struct lhsr_corruption_log log;
+
+	/* Configuration */
+	uint32_t verify_interval;
+	uint32_t log_retention_days;
+	uint32_t alert_threshold;
+	uint32_t auto_repair;
 };
 
 /* Context functions */
@@ -261,5 +326,22 @@ int lhsr_scrubber_verify_block_range(struct lhsr_scrubber *scrub,
 int lhsr_scrubber_repair_block(struct lhsr_scrubber *scrub,
 			       uint64_t offset, unsigned int disk_idx);
 void lhsr_scrubber_print_status(struct lhsr_scrubber *scrub);
+
+/* Bit-rot detector functions */
+struct lhsr_bitrotd *lhsr_bitrotd_create(struct lhsr_array *arr);
+void lhsr_bitrotd_destroy(struct lhsr_bitrotd *det);
+int lhsr_bitrotd_start(struct lhsr_bitrotd *det);
+int lhsr_bitrotd_stop(struct lhsr_bitrotd *det);
+int lhsr_bitrotd_log_corruption(struct lhsr_bitrotd *det,
+				struct lhsr_corruption_entry *entry);
+int lhsr_bitrotd_get_corruption_count(struct lhsr_bitrotd *det);
+int lhsr_bitrotd_get_corruptions(struct lhsr_bitrotd *det,
+				struct lhsr_corruption_entry *entries,
+				uint64_t max_entries);
+int lhsr_bitrotd_verify_block(struct lhsr_bitrotd *det,
+				uint64_t offset, unsigned int disk_idx,
+				struct lhsr_integrity_result *result);
+uint32_t lhsr_bitrotd_assess_severity(uint32_t expected, uint32_t actual);
+void lhsr_bitrotd_print_log(struct lhsr_bitrotd *det);
 
 #endif /* LHSR_RAID_H */
