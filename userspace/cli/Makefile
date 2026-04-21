@@ -3,11 +3,12 @@
 CC ?= clang
 CFLAGS += -Wall -Wextra -O2 -g
 CFLAGS += -I../../include -I../lib
+LDFLAGS += -lpthread
 
 all: lhsrctl
 
 lhsrctl: lhsrctl.c
-	$(CC) $(CFLAGS) -o $@ lhsrctl.c ../../lib/raid_engine/lhsr_raid.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ lhsrctl.c ../../lib/liblhsr.a
 
 clean:
 	rm -f lhsrctl

@@ -514,3 +514,486 @@ void lhsr_array_free(struct lhsr_array *arr)
 
 	free(arr);
 }
+
+/*
+ * Create scrubber for array
+ */
+struct lhsr_scrubber *lhsr_scrubber_create(struct lhsr_array *arr)
+{
+	struct lhsr_scrubber *scrub;
+
+	if (!arr)
+		return NULL;
+
+	scrub = calloc(1, sizeof(*scrub));
+	if (!scrub)
+		return NULL;
+
+	scrub->array = arr;
+	scrub->should_stop = 0;
+	scrub->should_pause = 0;
+	scrub->is_running = 0;
+	scrub->request_rescan = 0;
+
+	pthread_mutex_init(&scrub->lock, NULL);
+	pthread_cond_init(&scrub->wake_cond, NULL);
+
+	scrub->config.rate_limit = 50;
+	scrub->config.max_io_depth = 32;
+	scrub->config.priority = 1;
+	scrub->config.skip_checksummed = 1;
+	scrub->config.repair_on_error = 1;
+	scrub->config.pause_on_error = 0;
+	scrub->config.interruptible = 1;
+
+	return scrub;
+}
+
+/*
+ * Destroy scrubber
+ */
+void lhsr_scrubber_destroy(struct lhsr_scrubber *scrub)
+{
+	if (!scrub)
+		return;
+
+	lhsr_scrubber_stop(scrub);
+
+	pthread_mutex_destroy(&scrub->lock);
+	pthread_cond_destroy(&scrub->wake_cond);
+
+	free(scrub);
+}
+
+/*
+ * Verify a single block across all disks
+ */
+static int scrub_verify_block(struct lhsr_scrubber *scrub,
+			     uint64_t offset, void *buffer, size_t block_size)
+{
+	struct lhsr_array *arr = scrub->array;
+	void *disk_buffers[LHSR_MAX_DISKS];
+	void *parity_buffer = NULL;
+	int has_error = 0;
+	int i;
+
+	memset(disk_buffers, 0, sizeof(disk_buffers));
+
+	if (arr->raid_type >= LHSR_RAID5) {
+		parity_buffer = malloc(block_size);
+		if (!parity_buffer)
+			return -ENOMEM;
+	}
+
+	for (i = 0; i < arr->disk_count; i++) {
+		disk_buffers[i] = malloc(block_size);
+		if (!disk_buffers[i])
+			continue;
+
+		ssize_t ret = pread(arr->disks[i]->fd, disk_buffers[i],
+				    block_size, offset);
+		if (ret != (ssize_t)block_size) {
+			scrub->progress.corrupted_blocks++;
+			has_error = 1;
+			free(disk_buffers[i]);
+			disk_buffers[i] = NULL;
+		}
+	}
+
+	scrub->progress.verified_blocks++;
+
+	if (parity_buffer && disk_buffers[0]) {
+		void *disks_for_calc[LHSR_MAX_DISKS];
+		int disk_count = 0;
+		for (i = 0; i < arr->disk_count; i++) {
+			if (disk_buffers[i])
+				disks_for_calc[disk_count++] = disk_buffers[i];
+		}
+		if (disk_count > 0)
+			lhsr_raid5_calc_parity(parity_buffer, disks_for_calc,
+					       disk_count, block_size);
+	}
+
+	for (i = 0; i < arr->disk_count; i++) {
+		if (disk_buffers[i])
+			free(disk_buffers[i]);
+	}
+	if (parity_buffer)
+		free(parity_buffer);
+
+	return has_error ? -EILSEQ : 0;
+}
+
+/*
+ * Repair block by reconstructing from other disks
+ */
+int lhsr_scrubber_repair_block(struct lhsr_scrubber *scrub,
+			       uint64_t offset, unsigned int disk_idx)
+{
+	struct lhsr_array *arr = scrub->array;
+	void *reconstructed;
+	void *disk_buffers[LHSR_MAX_DISKS];
+	size_t block_size = arr->block_size;
+	int i, ret = 0;
+
+	if (!scrub || disk_idx >= arr->disk_count)
+		return -EINVAL;
+
+	reconstructed = malloc(block_size);
+	if (!reconstructed)
+		return -ENOMEM;
+
+	memset(disk_buffers, 0, sizeof(disk_buffers));
+
+	for (i = 0; i < arr->disk_count; i++) {
+		if (i == disk_idx)
+			continue;
+
+		disk_buffers[i] = malloc(block_size);
+		if (!disk_buffers[i])
+			continue;
+
+		ssize_t r = pread(arr->disks[i]->fd, disk_buffers[i],
+				  block_size, offset);
+		if (r != (ssize_t)block_size) {
+			free(disk_buffers[i]);
+			disk_buffers[i] = NULL;
+		}
+	}
+
+	if (arr->raid_type == LHSR_RAID5) {
+		ret = lhsr_raid5_reconstruct(reconstructed, disk_buffers,
+					      arr->disk_count, disk_idx,
+					      block_size);
+	} else if (arr->raid_type == LHSR_RAID6) {
+		void *p = malloc(block_size);
+		void *q = malloc(block_size);
+		if (p && q) {
+			ret = lhsr_raid6_reconstruct(reconstructed, p, q,
+						      disk_buffers, arr->disk_count,
+						      disk_idx, (disk_idx + 1) % arr->disk_count,
+						      block_size);
+			free(p);
+			free(q);
+		} else {
+			ret = -ENOMEM;
+		}
+	}
+
+	if (ret == 0) {
+		ret = pwrite(arr->disks[disk_idx]->fd, reconstructed,
+			     block_size, offset);
+		if (ret == 0) {
+			scrub->progress.repaired_blocks++;
+			printf("Repaired block at offset %lu on disk %u\n",
+			       offset, disk_idx);
+		}
+	}
+
+	for (i = 0; i < arr->disk_count; i++) {
+		if (disk_buffers[i])
+			free(disk_buffers[i]);
+	}
+	free(reconstructed);
+
+	return ret;
+}
+
+/*
+ * Scrubber worker thread
+ */
+static void *scrub_worker(void *arg)
+{
+	struct lhsr_scrubber *scrub = arg;
+	struct lhsr_array *arr = scrub->array;
+	size_t block_size = arr->block_size;
+	uint64_t offset;
+	int ret;
+
+	pthread_mutex_lock(&scrub->lock);
+
+	scrub->progress.state = LHSR_SCRUB_RUNNING;
+	scrub->progress.start_time = time(NULL);
+
+	printf("Scrubber started for array %s\n", arr->uuid);
+
+	while (!scrub->should_stop) {
+
+		while (scrub->should_pause && !scrub->should_stop) {
+			scrub->progress.state = LHSR_SCRUB_PAUSED;
+			pthread_cond_wait(&scrub->wake_cond, &scrub->lock);
+		}
+
+		if (scrub->should_stop)
+			break;
+
+		scrub->progress.state = LHSR_SCRUB_RUNNING;
+
+		offset = scrub->progress.current_offset;
+
+		if (offset >= arr->total_capacity) {
+			scrub->progress.state = LHSR_SCRUB_COMPLETED;
+			break;
+		}
+
+		pthread_mutex_unlock(&scrub->lock);
+
+		void *buffer = malloc(block_size);
+		if (buffer) {
+			ret = scrub_verify_block(scrub, offset, buffer, block_size);
+			if (ret == -EILSEQ && scrub->config.repair_on_error) {
+				for (unsigned int d = 0; d < arr->disk_count; d++) {
+					lhsr_scrubber_repair_block(scrub, offset, d);
+				}
+			}
+			free(buffer);
+		}
+
+		pthread_mutex_lock(&scrub->lock);
+
+		scrub->progress.processed_blocks++;
+		scrub->progress.current_offset += block_size;
+		scrub->progress.last_update = time(NULL);
+
+		if (scrub->request_rescan) {
+			scrub->progress.current_offset = 0;
+			scrub->progress.processed_blocks = 0;
+			scrub->request_rescan = 0;
+		}
+
+		if (scrub->config.rate_limit > 0) {
+			usleep((block_size * 1000000) / (scrub->config.rate_limit * 1024 * 1024));
+		}
+	}
+
+	scrub->is_running = 0;
+	scrub->progress.state = scrub->should_stop ? LHSR_SCRUB_IDLE : LHSR_SCRUB_COMPLETED;
+
+	printf("Scrubber stopped for array %s\n", arr->uuid);
+
+	pthread_mutex_unlock(&scrub->lock);
+
+	return NULL;
+}
+
+/*
+ * Start scrubber
+ */
+int lhsr_scrubber_start(struct lhsr_scrubber *scrub)
+{
+	int ret;
+
+	if (!scrub)
+		return -EINVAL;
+
+	pthread_mutex_lock(&scrub->lock);
+
+	if (scrub->is_running) {
+		pthread_mutex_unlock(&scrub->lock);
+		return -EBUSY;
+	}
+
+	scrub->should_stop = 0;
+	scrub->should_pause = 0;
+	scrub->progress.current_offset = 0;
+	scrub->progress.processed_blocks = 0;
+	scrub->progress.verified_blocks = 0;
+	scrub->progress.corrupted_blocks = 0;
+	scrub->progress.repaired_blocks = 0;
+	scrub->progress.failed_blocks = 0;
+	scrub->progress.total_capacity = scrub->array->total_capacity;
+
+	ret = pthread_create(&scrub->thread, NULL, scrub_worker, scrub);
+	if (ret == 0)
+		scrub->is_running = 1;
+
+	pthread_mutex_unlock(&scrub->lock);
+
+	return ret;
+}
+
+/*
+ * Stop scrubber
+ */
+int lhsr_scrubber_stop(struct lhsr_scrubber *scrub)
+{
+	if (!scrub)
+		return -EINVAL;
+
+	pthread_mutex_lock(&scrub->lock);
+
+	if (!scrub->is_running) {
+		pthread_mutex_unlock(&scrub->lock);
+		return 0;
+	}
+
+	scrub->should_stop = 1;
+	scrub->should_pause = 0;
+	pthread_cond_signal(&scrub->wake_cond);
+
+	pthread_mutex_unlock(&scrub->lock);
+
+	pthread_join(scrub->thread, NULL);
+
+	return 0;
+}
+
+/*
+ * Pause scrubber
+ */
+int lhsr_scrubber_pause(struct lhsr_scrubber *scrub)
+{
+	if (!scrub)
+		return -EINVAL;
+
+	pthread_mutex_lock(&scrub->lock);
+	scrub->should_pause = 1;
+	pthread_mutex_unlock(&scrub->lock);
+
+	return 0;
+}
+
+/*
+ * Resume scrubber
+ */
+int lhsr_scrubber_resume(struct lhsr_scrubber *scrub)
+{
+	if (!scrub)
+		return -EINVAL;
+
+	pthread_mutex_lock(&scrub->lock);
+	scrub->should_pause = 0;
+	pthread_cond_signal(&scrub->wake_cond);
+	pthread_mutex_unlock(&scrub->lock);
+
+	return 0;
+}
+
+/*
+ * Request rescan
+ */
+int lhsr_scrubber_rescan(struct lhsr_scrubber *scrub)
+{
+	if (!scrub)
+		return -EINVAL;
+
+	pthread_mutex_lock(&scrub->lock);
+	scrub->request_rescan = 1;
+	pthread_mutex_unlock(&scrub->lock);
+
+	return 0;
+}
+
+/*
+ * Get scrub progress
+ */
+int lhsr_scrubber_get_progress(struct lhsr_scrubber *scrub,
+			       struct lhsr_scrub_progress *prog)
+{
+	if (!scrub || !prog)
+		return -EINVAL;
+
+	pthread_mutex_lock(&scrub->lock);
+	*prog = scrub->progress;
+
+	if (scrub->progress.state == LHSR_SCRUB_RUNNING &&
+	    scrub->progress.processed_blocks > 0) {
+		time_t elapsed = time(NULL) - scrub->progress.start_time;
+		if (elapsed > 0) {
+			uint64_t rate = scrub->progress.processed_blocks * scrub->array->block_size / elapsed;
+			uint64_t remaining = scrub->array->total_capacity - scrub->progress.current_offset;
+			scrub->progress.estimated_complete = time(NULL) + (remaining / (rate ?: 1));
+		}
+	}
+
+	pthread_mutex_unlock(&scrub->lock);
+
+	return 0;
+}
+
+/*
+ * Set scrubber configuration
+ */
+void lhsr_scrubber_set_config(struct lhsr_scrubber *scrub,
+			      struct lhsr_scrub_config *cfg)
+{
+	if (!scrub || !cfg)
+		return;
+
+	pthread_mutex_lock(&scrub->lock);
+	scrub->config = *cfg;
+	pthread_mutex_unlock(&scrub->lock);
+}
+
+/*
+ * Verify block range
+ */
+int lhsr_scrubber_verify_block_range(struct lhsr_scrubber *scrub,
+				      uint64_t start, uint64_t end)
+{
+	struct lhsr_array *arr;
+	size_t block_size;
+	uint64_t offset;
+	void *buffer;
+	int errors = 0;
+
+	if (!scrub || !scrub->array)
+		return -EINVAL;
+
+	arr = scrub->array;
+	block_size = arr->block_size;
+
+	if (start >= arr->total_capacity || end > arr->total_capacity || start >= end)
+		return -EINVAL;
+
+	buffer = malloc(block_size);
+	if (!buffer)
+		return -ENOMEM;
+
+	for (offset = start; offset < end; offset += block_size) {
+		int ret = scrub_verify_block(scrub, offset, buffer, block_size);
+		if (ret)
+			errors++;
+	}
+
+	free(buffer);
+
+	return errors;
+}
+
+/*
+ * Print scrub status
+ */
+void lhsr_scrubber_print_status(struct lhsr_scrubber *scrub)
+{
+	struct lhsr_scrub_progress prog;
+
+	if (!scrub)
+		return;
+
+	lhsr_scrubber_get_progress(scrub, &prog);
+
+	printf("\n=== LHSR Scrub Status ===\n");
+	printf("State:      %s\n",
+	       prog.state == LHSR_SCRUB_IDLE ? "Idle" :
+	       prog.state == LHSR_SCRUB_RUNNING ? "Running" :
+	       prog.state == LHSR_SCRUB_PAUSED ? "Paused" :
+	       prog.state == LHSR_SCRUB_COMPLETED ? "Completed" :
+	       prog.state == LHSR_SCRUB_FAILED ? "Failed" : "Unknown");
+	printf("Progress:   %lu / %lu blocks (%.1f%%)\n",
+	       prog.processed_blocks, prog.total_capacity,
+	       prog.total_capacity ? (double)prog.processed_blocks * 100 / prog.total_capacity : 0);
+	printf("Verified:   %lu blocks\n", prog.verified_blocks);
+	printf("Corrupted:  %lu blocks\n", prog.corrupted_blocks);
+	printf("Repaired:   %lu blocks\n", prog.repaired_blocks);
+	printf("Failed:     %lu blocks\n", prog.failed_blocks);
+
+	if (prog.estimated_complete > 0) {
+		char time_buf[64];
+		struct tm *tm = localtime(&prog.estimated_complete);
+		strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm);
+		printf("ETA:        %s\n", time_buf);
+	}
+
+	printf("\n");
+}

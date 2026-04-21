@@ -168,22 +168,66 @@ static int cmd_predict(int argc, char **argv)
 }
 
 /* Command scrub */
-static int cmd_scrub(int argc, char **argv, const char *mode)
+static int cmd_scrub(int argc, char **argv)
 {
-	(void)argc; (void)argv;
-	printf("LHSR Scrub\n");
-	printf("==========\n");
+	struct lhsr_context *ctx;
+	struct lhsr_array *arr;
+	struct lhsr_disk *disks;
+	struct lhsr_scrubber *scrub;
+	struct lhsr_scrub_config config;
+	struct lhsr_scrub_progress prog;
+	int ret = 0;
 
-	if (mode && strcmp(mode, "quick") == 0) {
-		printf("Running quick scrub...\n");
-	} else if (mode && strcmp(mode, "deep") == 0) {
-		printf("Running deep scrub...\n");
-	} else {
-		printf("Running scheduled scrub...\n");
+	printf("LHSR Scrub\n");
+	printf("==========\n\n");
+
+	ctx = lhsr_init();
+	if (!ctx) {
+		fprintf(stderr, "Error: Failed to initialize\n");
+		return 1;
 	}
 
-	/* In production, would start background scrub */
-	printf("Note: This is a stub - scrub engine not implemented\n");
+	/* In production, would load array from config */
+	printf("Note: No array configured - run 'create' first\n");
+	printf("Usage: %s scrub [--start|--stop|--pause|--resume|--status]\n", PROGNAME);
+
+	(void)argc; (void)argv;
+	lhsr_free(ctx);
+
+	return 1;
+
+	arr = NULL;
+	scrub = lhsr_scrubber_create(arr);
+	if (!scrub) {
+		fprintf(stderr, "Error: Failed to create scrubber\n");
+		lhsr_free(ctx);
+		return 1;
+	}
+
+	config.rate_limit = 50;
+	config.max_io_depth = 32;
+	config.priority = 1;
+	config.skip_checksummed = 1;
+	config.repair_on_error = 1;
+	lhsr_scrubber_set_config(scrub, &config);
+
+	ret = lhsr_scrubber_start(scrub);
+	if (ret < 0) {
+		fprintf(stderr, "Error: Failed to start scrub: %s\n", strerror(-ret));
+		lhsr_scrubber_destroy(scrub);
+		lhsr_array_free(arr);
+		lhsr_free(ctx);
+		return 1;
+	}
+
+	printf("Scrub started.\n");
+	printf("Use 'lhsrctl scrub --status' to monitor\n");
+
+	lhsr_scrubber_print_status(scrub);
+
+	lhsr_scrubber_destroy(scrub);
+	lhsr_array_free(arr);
+	lhsr_free(ctx);
 
 	return 0;
 }
@@ -209,6 +253,8 @@ int main(int argc, char **argv)
 	} else if (strcmp(argv[1], "predict") == 0) {
 		cmd = CMD_PREDICT;
 	} else if (strcmp(argv[1], "scrub") == 0) {
+		cmd = CMD_SCRUB;
+	} else if (strcmp(argv[1], "scrub-status") == 0) {
 		cmd = CMD_SCRUB;
 	} else if (strcmp(argv[1], "add") == 0) {
 		fprintf(stderr, "Error: 'add' not implemented\n");
@@ -286,7 +332,7 @@ int main(int argc, char **argv)
 		ret = cmd_predict(argc, argv);
 		break;
 	case CMD_SCRUB:
-		ret = cmd_scrub(argc, argv, NULL);
+		ret = cmd_scrub(argc, argv);
 		break;
 	default:
 		usage(basename(argv[0]));

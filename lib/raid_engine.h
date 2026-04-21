@@ -193,4 +193,73 @@ const char *lhsr_raid_name(enum lhsr_raid_type type);
 /* Checksum */
 uint32_t lhsr_checksum_crc32c(const void *data, size_t len);
 
+/* Scrubber states */
+enum lhsr_scrub_state {
+	LHSR_SCRUB_IDLE = 0,
+	LHSR_SCRUB_RUNNING = 1,
+	LHSR_SCRUB_PAUSED = 2,
+	LHSR_SCRUB_COMPLETED = 3,
+	LHSR_SCRUB_FAILED = 4,
+};
+
+/* Scrubber configuration */
+struct lhsr_scrub_config {
+	uint64_t rate_limit;          /* MB/s limit for scrub */
+	uint32_t max_io_depth;        /* Max concurrent I/O operations */
+	uint32_t priority;            /* I/O priority (0=low, 3=high) */
+	uint32_t skip_checksummed;    /* Skip blocks with valid checksums */
+	uint32_t repair_on_error;     /* Auto-repair corrupted blocks */
+	uint32_t pause_on_error;      /* Pause on uncorrectable error */
+	uint32_t interruptible;       /* Allow scrub to be interrupted */
+};
+
+/* Scrubber progress */
+struct lhsr_scrub_progress {
+	enum lhsr_scrub_state state;
+	uint64_t total_blocks;
+	uint64_t processed_blocks;
+	uint64_t verified_blocks;
+	uint64_t corrupted_blocks;
+	uint64_t repaired_blocks;
+	uint64_t failed_blocks;
+	uint64_t current_offset;
+	uint64_t total_capacity;
+	time_t start_time;
+	time_t last_update;
+	time_t estimated_complete;
+};
+
+/* Scrubber */
+struct lhsr_scrubber {
+	pthread_t thread;
+	pthread_cond_t wake_cond;
+	pthread_mutex_t lock;
+	int should_stop;
+	int should_pause;
+	int is_running;
+	int request_rescan;
+
+	struct lhsr_array *array;
+	struct lhsr_scrub_config config;
+	struct lhsr_scrub_progress progress;
+};
+
+/* Scrubber functions */
+struct lhsr_scrubber *lhsr_scrubber_create(struct lhsr_array *arr);
+void lhsr_scrubber_destroy(struct lhsr_scrubber *scrub);
+int lhsr_scrubber_start(struct lhsr_scrubber *scrub);
+int lhsr_scrubber_stop(struct lhsr_scrubber *scrub);
+int lhsr_scrubber_pause(struct lhsr_scrubber *scrub);
+int lhsr_scrubber_resume(struct lhsr_scrubber *scrub);
+int lhsr_scrubber_rescan(struct lhsr_scrubber *scrub);
+int lhsr_scrubber_get_progress(struct lhsr_scrubber *scrub,
+			       struct lhsr_scrub_progress *prog);
+void lhsr_scrubber_set_config(struct lhsr_scrubber *scrub,
+			      struct lhsr_scrub_config *cfg);
+int lhsr_scrubber_verify_block_range(struct lhsr_scrubber *scrub,
+				      uint64_t start, uint64_t end);
+int lhsr_scrubber_repair_block(struct lhsr_scrubber *scrub,
+			       uint64_t offset, unsigned int disk_idx);
+void lhsr_scrubber_print_status(struct lhsr_scrubber *scrub);
+
 #endif /* LHSR_RAID_H */
