@@ -8,7 +8,7 @@ KERNEL_DIR ?= /lib/modules/$(shell uname -r)/build
 UID := $(shell id -u)
 
 # Default target
-all: modules userspace
+all: lib modules userspace
 
 # Build kernel modules
 modules:
@@ -16,10 +16,10 @@ modules:
 
 # Build userspace tools
 userspace:
+	$(MAKE) -C lib
 	$(MAKE) -C userspace/cli
 	$(MAKE) -C userspace/daemon
 	$(MAKE) -C userspace/recovery
-	$(MAKE) -C lib
 
 # Clean all
 clean:

@@ -1,7 +1,6 @@
 # LHSR Device Mapper Makefile
 
 obj-m += dm-lhsr.o
-dm-lhsr-objs := dm_lhsr.o dm_lhsr_map.o dm_lhsr_io.o dm_lhsr_checksum.o
 
 # Kernel build directory
 KDIR ?= /lib/modules/$(shell uname -r)/build
@@ -10,7 +9,7 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
 # Extra compiler flags
-ccflags-y := -I$(PWD)/../include -DLHSR_VERSION='"1.0"'
+ccflags-y := -I$(PWD)/../include
 
 # Default target
 all:

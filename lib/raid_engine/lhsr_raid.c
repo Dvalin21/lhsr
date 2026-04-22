@@ -152,6 +152,9 @@ int lhsr_raid6_reconstruct(void *result, void *p, void *q,
 			    void **disks, unsigned int count,
 			    unsigned int failed1, unsigned int failed2, size_t block_size)
 {
+	(void)p;
+	(void)q;
+	(void)failed1;
 	/* Simplified reconstruction - in production would use proper GF math */
 	return lhsr_raid5_reconstruct(result, disks, count - 2, failed2, block_size);
 }
@@ -207,7 +210,7 @@ int lhsr_disk_read(struct lhsr_disk *disk, uint64_t offset, void *buf, size_t le
 	if (ret < 0)
 		return -errno;
 
-	return (ret == len) ? 0 : -EIO;
+	return (ret == (ssize_t)len) ? 0 : -EIO;
 }
 
 /*
@@ -224,7 +227,7 @@ int lhsr_disk_write(struct lhsr_disk *disk, uint64_t offset, const void *buf, si
 	if (ret < 0)
 		return -errno;
 
-	return (ret == len) ? 0 : -EIO;
+	return (ret == (ssize_t)len) ? 0 : -EIO;
 }
 
 /*
@@ -232,7 +235,7 @@ int lhsr_disk_write(struct lhsr_disk *disk, uint64_t offset, const void *buf, si
  */
 int lhsr_disk_get_smart(struct lhsr_disk *disk, struct lhsr_smart_data *smart)
 {
-	char cmd[256];
+	char cmd[512];
 	FILE *fp;
 
 	if (!disk || !smart)
@@ -304,9 +307,10 @@ struct lhsr_array *lhsr_array_create(struct lhsr_context *ctx,
 
 	/* Generate UUID */
 	static unsigned int uuid_counter = 0;
+	unsigned int seq = uuid_counter++;
 	snprintf(arr->uuid, sizeof(arr->uuid), "%08x-%04x-%04x-%04x-%08x%04x",
 		(unsigned int)time(NULL), getpid() & 0xFFFF,
-		(uuid_counter++) & 0xFFFF, 0,
+		seq & 0xFFFF, 0,
 		(unsigned int)time(NULL), uuid_counter);
 
 	/* Set configuration */
@@ -363,7 +367,8 @@ struct lhsr_array *lhsr_array_create(struct lhsr_context *ctx,
 
 	/* Generate device name */
 	snprintf(name, sizeof(name), "lhsr-%s", arr->uuid + 24);
-	strncpy(arr->name, name, sizeof(arr->name) - 1);
+	strncpy(arr->name, name, sizeof(arr->name));
+	arr->name[sizeof(arr->name) - 1] = '\0';
 
 	printf("Created %s array: %u disks, capacity %lu sectors\n",
 	       lhsr_raid_name(raid_type), disk_count, arr->total_capacity);
@@ -571,11 +576,12 @@ void lhsr_scrubber_destroy(struct lhsr_scrubber *scrub)
 static int scrub_verify_block(struct lhsr_scrubber *scrub,
 			     uint64_t offset, void *buffer, size_t block_size)
 {
+	(void)buffer;
 	struct lhsr_array *arr = scrub->array;
 	void *disk_buffers[LHSR_MAX_DISKS];
 	void *parity_buffer = NULL;
 	int has_error = 0;
-	int i;
+	unsigned int i;
 
 	memset(disk_buffers, 0, sizeof(disk_buffers));
 
@@ -604,11 +610,10 @@ static int scrub_verify_block(struct lhsr_scrubber *scrub,
 
 	if (parity_buffer && disk_buffers[0]) {
 		void *disks_for_calc[LHSR_MAX_DISKS];
-		int disk_count = 0;
-		for (i = 0; i < arr->disk_count; i++) {
-			if (disk_buffers[i])
-				disks_for_calc[disk_count++] = disk_buffers[i];
-		}
+		unsigned int disk_count = 0;
+	for (i = 0; i < arr->disk_count; i++) {
+		free(disk_buffers[i]);
+	}
 		if (disk_count > 0)
 			lhsr_raid5_calc_parity(parity_buffer, disks_for_calc,
 					       disk_count, block_size);
@@ -634,7 +639,8 @@ int lhsr_scrubber_repair_block(struct lhsr_scrubber *scrub,
 	void *reconstructed;
 	void *disk_buffers[LHSR_MAX_DISKS];
 	size_t block_size = arr->block_size;
-	int i, ret = 0;
+	unsigned int i;
+	int ret = 0;
 
 	if (!scrub || disk_idx >= arr->disk_count)
 		return -EINVAL;
@@ -1008,7 +1014,7 @@ uint32_t lhsr_bitrotd_assess_severity(uint32_t expected, uint32_t actual)
 
 	uint32_t diff = expected ^ actual;
 
-	if (diff & (diff - 1) == 0)
+	if ((diff & (diff - 1)) == 0)
 		return LHSR_CORRUPT_SINGLE_BIT;
 
 	if ((diff & 0xFFFF) == 0)

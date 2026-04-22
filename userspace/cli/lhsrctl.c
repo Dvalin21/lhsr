@@ -97,7 +97,7 @@ static int cmd_create(int argc, char **argv, enum lhsr_raid_type raid_type)
 	}
 
 	/* Open all disks */
-	for (disk_count = 0; disk_count < argc - 2; disk_count++) {
+	for (disk_count = 0; disk_count < (unsigned int)(argc - 2); disk_count++) {
 		ret = lhsr_disk_open(&disks[disk_count], argv[disk_count + 2]);
 		if (ret < 0) {
 			fprintf(stderr, "Error: Cannot open %s: %s\n",
@@ -206,12 +206,14 @@ static int cmd_bitrot_log(int argc, char **argv)
 static int cmd_scrub(int argc, char **argv)
 {
 	struct lhsr_context *ctx;
-	struct lhsr_array *arr;
-	struct lhsr_disk *disks;
-	struct lhsr_scrubber *scrub;
+	struct lhsr_array *arr = NULL;
+	struct lhsr_disk *disks = NULL;
+	struct lhsr_scrubber *scrub = NULL;
 	struct lhsr_scrub_config config;
 	struct lhsr_scrub_progress prog;
 	int ret = 0;
+
+	(void)arr; (void)disks; (void)scrub; (void)config; (void)prog;
 
 	printf("LHSR Scrub\n");
 	printf("==========\n\n");

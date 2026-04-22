@@ -116,6 +116,7 @@ struct lhsr_array {
 
 	/* Disks */
 	struct block_device **disk;
+	struct dm_dev **dm_devs;
 	struct list_head disks_list;
 
 	/* Segments for SHR layout */
