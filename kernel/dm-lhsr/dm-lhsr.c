@@ -33,6 +33,8 @@ struct lhsr_array {
 	struct block_device *disk[32];
 	struct dm_dev *dm_devs[32];
 	u32 state;
+	u32 primary_disk;      /* Which disk is primary for reads */
+	u32 failed_disks;      /* Bitmask of failed disks */
 };
 
 /* Fast hash for UUID generation */
@@ -66,14 +68,23 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	/* Parse raid type from argv[0] */
 	if (strcmp(argv[0], "single") == 0) {
-		raid_type = 0;
+		raid_type = 0;  /* JBOD - single disk */
+	} else if (strcmp(argv[0], "mirror") == 0) {
+		raid_type = 1;  /* RAID1 - mirroring */
 	} else {
 		DMERR("Unknown raid type: %s", argv[0]);
 		ti->error = "Unknown raid type";
 		return -EINVAL;
 	}
 
+	/* For mirror, require exactly 2 disks */
 	num_disks = argc - 1;
+	if (raid_type == 1 && num_disks != 2) {
+		DMERR("Mirror requires exactly 2 disks, got %u", num_disks);
+		ti->error = "Mirror requires exactly 2 disks";
+		return -EINVAL;
+	}
+
 	DMINFO("Creating RAID type=%u disks=%u", raid_type, num_disks);
 
 	/* Allocate array - zero initialize */
@@ -90,6 +101,8 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	arr->disks = num_disks;
 	arr->state = LHSR_STATE_OFFLINE;
 	arr->size = 0;
+	arr->primary_disk = 0;
+	arr->failed_disks = 0;
 
 	/* Get devices */
 	for (i = 0; i < num_disks; i++) {
@@ -166,6 +179,7 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 {
 	struct lhsr_array *arr = ti->private;
 	sector_t offset;
+	struct bio *clone = NULL;
 
 	if (!arr || arr->state != LHSR_STATE_ONLINE) {
 		bio->bi_status = BLK_STS_IOERR;
@@ -188,8 +202,40 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	bio->bi_status = BLK_STS_IOERR;
-	bio_endio(bio);
+	/* RAID1 Mirror - write to all disks */
+	if (bio_op(bio) != REQ_OP_READ) {
+		/* Write: send to both disks */
+		bio_set_dev(bio, arr->disk[0]);
+		bio->bi_iter.bi_sector = offset;
+		submit_bio(bio);
+
+		/* Clone for second disk */
+		clone = bio_alloc_clone(arr->disk[1], bio, GFP_NOIO, &fs_bio_set);
+		if (!clone) {
+			DMWARN("Failed to clone bio for mirror write");
+			return DM_MAPIO_SUBMITTED;
+		}
+		submit_bio(clone);
+		return DM_MAPIO_SUBMITTED;
+	}
+
+	/* Read: try primary, failover to secondary if failed */
+	if (!(arr->failed_disks & (1 << arr->primary_disk))) {
+		bio_set_dev(bio, arr->disk[arr->primary_disk]);
+		bio->bi_iter.bi_sector = offset;
+		submit_bio(bio);
+	} else {
+		/* Primary failed, use other disk */
+		unsigned int other = arr->primary_disk == 0 ? 1 : 0;
+		if (!(arr->failed_disks & (1 << other))) {
+			bio_set_dev(bio, arr->disk[other]);
+			bio->bi_iter.bi_sector = offset;
+			submit_bio(bio);
+		} else {
+			bio->bi_status = BLK_STS_IOERR;
+			bio_endio(bio);
+		}
+	}
 	return DM_MAPIO_SUBMITTED;
 }
 
@@ -205,13 +251,19 @@ static void lhsr_status(struct dm_target *ti, status_type_t type, unsigned int f
 
 	switch (type) {
 	case STATUSTYPE_INFO:
-		sz += scnprintf(result + sz, maxlen - sz, "%s %u/%llu",
-			       arr->state == LHSR_STATE_ONLINE ? "OK" : "DEGRADED",
-			       arr->disks, arr->size);
+		if (arr->raid_type == 0) {
+			sz += scnprintf(result + sz, maxlen - sz, "OK %u/%llu",
+				       arr->disks, arr->size);
+		} else if (arr->raid_type == 1) {
+			unsigned int healthy = (arr->failed_disks == 0) ? arr->disks : arr->disks - 1;
+			const char *state = (arr->failed_disks == 0) ? "OK" : "DEGRADED";
+			sz += scnprintf(result + sz, maxlen - sz, "%s %u/%u",
+				       state, healthy, arr->disks);
+		}
 		break;
 	case STATUSTYPE_TABLE:
-		sz += scnprintf(result + sz, maxlen - sz, "UUID=%llx RAID=%u",
-			       arr->uuid, arr->raid_type);
+		sz += scnprintf(result + sz, maxlen - sz, "UUID=%llx RAID=%u DISKS=%u",
+			       arr->uuid, arr->raid_type, arr->disks);
 		break;
 	default:
 		break;
