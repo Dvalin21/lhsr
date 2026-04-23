@@ -170,6 +170,9 @@ EXPORT_SYMBOL(lhsr_free_array);
 /* Add disk to array */
 int lhsr_array_add_disk(struct lhsr_array *arr, unsigned int index, struct block_device *bdev)
 {
+	if (!arr || !bdev)
+		return -EINVAL;
+		
 	if (index >= arr->disks)
 		return -EINVAL;
 
@@ -796,6 +799,10 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	/* Allocate array */
+	if (!ti || !argv) {
+		ti->error = "Invalid target";
+		return -EINVAL;
+	}
 	arr = lhsr_alloc_array(fast_hash_32(raid_type), disks);
 	if (!arr) {
 		ti->error = "Failed to allocate array";
@@ -810,6 +817,13 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		if (r) {
 			DMERR("Cannot get device %s", argv[i + 1]);
 			ti->error = "Failed to get device";
+			goto bad_get_device;
+		}
+
+		/* Validate bdev is valid */
+		if (!dm_dev || !dm_dev->bdev) {
+			DMERR("Invalid block device for %s", argv[i + 1]);
+			ti->error = "Invalid device";
 			goto bad_get_device;
 		}
 
