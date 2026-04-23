@@ -1,13 +1,12 @@
 #!/bin/bash
-# LHSR Disk Setup Script
-# Partitions empty drive for LHSR RAID arrays
+# LHSR Disk Setup - Simple version using fdisk
+# Run: sudo ./setup_drives.sh sdc
 
 DRIVE="${1:-sdc}"
 DEVICE="/dev/$DRIVE"
 
 echo "=== LHSR Disk Setup ==="
 echo "Drive: $DEVICE"
-echo ""
 
 # Check if drive exists
 if [ ! -b "$DEVICE" ]; then
@@ -15,44 +14,36 @@ if [ ! -b "$DEVICE" ]; then
     exit 1
 fi
 
-# Show current partition layout
-echo "Current layout:"
-lsblk $DEVICE
-
-# Warn if drive has data
-if [ -n "$(lsblk $DEVICE -o MOUNTPOINT --noheaders 2>/dev/null | grep -v '^$')" ]; then
+# Warn if mounted
+if lsblk $DEVICE -o MOUNTPOINT --noheaders 2>/dev/null | grep -v '^$' | grep -v 'MOUNTPOINT' >/dev/null; then
     echo "ERROR: $DEVICE has mounted filesystems!"
     exit 1
 fi
 
+echo "Current:"
+lsblk $DEVICE
+
 echo ""
-echo "Creating partition table..."
-# Create GPT partition table
-parted -s $DEVICE mklabel gpt
+echo "Using fdisk to create partition..."
 
-# Create single partition using full disk
-parted -s $DEVICE mkpart primary 0% 100%
-
-# Set partition to Linux RAID auto-detect
-parted -s $DEVICE set 1 raid on
+# Use fdisk to create partition
+# n = new, p = primary, 1 = partition number, default = first sector, default = last sector
+# w = write
+echo -e "n\np\n1\n\n\nw" | fdisk $DEVICE 2>&1 || {
+    echo "fdisk failed, trying alternative..."
+    # Alternative: use sfdisk
+    echo "1 : start=0, size=0, type=83" | sfdisk $DEVICE
+}
 
 # Notify kernel
-partprobe $DEVICE
+partprobe $DEVICE 2>/dev/null || true
 
 sleep 1
 
 echo ""
-echo "New layout:"
+echo "Results:"
 lsblk $DEVICE
-
-echo ""
-echo "Partitions created:"
 cat /proc/partitions | grep $DRIVE
 
 echo ""
-echo "=== Ready for LHSR ==="
-echo "Partition: ${DEVICE}1"
-echo ""
-echo "Now run test:"
-echo "  sudo dmsetup create lhsr_test --table '0 1000000 lhsr single ${DEVICE}1 0'"
-echo "  sudo dmsetup status lhsr_test"
+echo "Partition ready: ${DEVICE}1"
