@@ -69,6 +69,11 @@ struct lhsr_superblock {
 #define LHSR_REBUILD_RUNNING  2
 #define LHSR_REBUILD_COMPLETE 3
 
+/* Write verification */
+#define LHSR_WRITE_VERIFY_NONE  0
+#define LHSR_WRITE_VERIFY_SIMPLE 1
+#define LHSR_WRITE_VERIFY_FULL   2
+
 /* Checksummed block metadata stored in reserved superblock area */
 struct lhsr_block_meta {
 	__u64 offset;       /* Block offset in sectors */

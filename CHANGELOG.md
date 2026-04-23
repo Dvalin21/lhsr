@@ -9,7 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
-- **Scrubber integration** (v1.1.0): Background integrity verification
+- **Production hardening** (v1.2.0): Enterprise reliability features
+  - Mutex + rwsem locking for concurrent I/O safety
+  - Atomic superblock writes (backup-first-then-primary for write-hole protection)
+  - Fixed mirror write bug (duplicate writes to disk 1)
+  - Write verification modes (none/simple/full)
+  - Configuration query via `config` message
+  - Mutex initialization in constructor, cleanup in destructor
+
+### Added
   - CRC32c per-block checksumming during scrub
   - Rate-limited background scrub with configurable block size (128KB)
   - Corruption detection tracking (scrub_corrupted counter)

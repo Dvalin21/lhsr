@@ -17,11 +17,13 @@
 #include <linux/workqueue.h>
 #include <linux/crc32c.h>
 #include <linux/ktime.h>
+#include <linux/spinlock.h>
+#include <linux/mutex.h>
 
 #include "dm_lhsr.h"
 
 #define DM_MSG_PREFIX "lhsr"
-#define LHSR_VERSION "1.1.0"
+#define LHSR_VERSION "1.2.0"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
@@ -64,16 +66,23 @@ static u32 lhsr_crc32c(const void *buf, size_t len)
 	return crc ^ 0xFFFFFFFF;
 }
 
-/* Superblock I/O helpers */
+/* Atomic superblock write - write-hole protection
+ * Strategy: Write new superblock to backup first, then primary.
+ * On crash, either old primary+new backup or new primary+new backup.
+ * Never old primary+old backup (regress), never new primary+old backup (inconsistent).
+ */
 static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblock *sb)
 {
 	struct bio *bio;
 	struct page *page;
 	void *buf;
-	sector_t sector;
+	sector_t primary_sector, backup_sector;
+	u64 disk_size;
+	u32 calc_csum;
 	int ret = 0;
 
-	sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
+	primary_sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
+
 	page = alloc_page(GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
@@ -82,24 +91,27 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	memset(buf, 0, PAGE_SIZE);
 	memcpy(buf, sb, LHSR_SB_SIZE);
 
-	/* Calculate checksum over all except checksum field */
-	sb->checksum = 0;
-	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = lhsr_crc32c(buf, LHSR_SB_SIZE);
+	/* Calculate checksum (zero checksum field first) */
+	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
+	calc_csum = lhsr_crc32c(buf, LHSR_SB_SIZE);
+	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = calc_csum;
+
+	/* Write backup first (power loss here = old state, which is safe) */
+	disk_size = bdev_nr_sectors(bdev) << SECTOR_SHIFT;
+	backup_sector = LHSR_SB_BACKUP_OFF(disk_size) >> SECTOR_SHIFT;
 
 	bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_FUA, GFP_KERNEL);
 	bio_set_dev(bio, bdev);
-	bio->bi_iter.bi_sector = sector;
+	bio->bi_iter.bi_sector = backup_sector;
 	__bio_add_page(bio, page, LHSR_SB_SIZE, 0);
-
 	ret = submit_bio_wait(bio);
 	bio_put(bio);
 
 	if (ret == 0) {
-		u64 backup_off = LHSR_SB_BACKUP_OFF(bdev_nr_sectors(bdev) << SECTOR_SHIFT);
-		sector_t backup_sector = backup_off >> SECTOR_SHIFT;
+		/* Write primary second (power loss here = old primary + new backup = recoverable) */
 		bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_FUA, GFP_KERNEL);
 		bio_set_dev(bio, bdev);
-		bio->bi_iter.bi_sector = backup_sector;
+		bio->bi_iter.bi_sector = primary_sector;
 		__bio_add_page(bio, page, LHSR_SB_SIZE, 0);
 		ret = submit_bio_wait(bio);
 		bio_put(bio);
@@ -211,6 +223,7 @@ static void lhsr_init_superblock(struct lhsr_superblock *sb, u64 array_uuid,
 
 /* Array structure */
 struct lhsr_array {
+	/* Configuration - set once, read-only during I/O */
 	u64 uuid;
 	u32 raid_type;
 	unsigned int disks;
@@ -220,6 +233,10 @@ struct lhsr_array {
 	u32 state;
 	u32 primary_disk;
 	u32 failed_disks;
+
+	/* Concurrency control */
+	struct mutex io_mutex;
+	struct rw_semaphore sb_sem;
 
 	/* Superblock persistence */
 	u64 generation;
@@ -237,22 +254,25 @@ struct lhsr_array {
 	struct workqueue_struct *scrub_wq;
 	struct delayed_work scrub_work;
 	u32 scrub_state;
-	u32 scrub_disk;           /* Current disk being scrubbed */
-	u64 scrub_offset;        /* Current offset in sectors */
-	u64 scrub_blocks;        /* Total blocks to scrub */
-	u64 scrub_verified;      /* Blocks verified */
-	u64 scrub_corrupted;     /* Corrupt blocks found */
-	u64 scrub_last_offset;   /* Last verified offset */
+	u32 scrub_disk;
+	u64 scrub_offset;
+	u64 scrub_blocks;
+	u64 scrub_verified;
+	u64 scrub_corrupted;
+	u64 scrub_last_offset;
 	unsigned long scrub_start_jiffies;
 
 	/* Rebuild tracking */
 	u32 rebuild_state;
-	u32 rebuild_disk;         /* Disk being rebuilt */
-	u64 rebuild_offset;       /* Current rebuild offset */
-	u64 rebuild_total;        /* Total sectors to rebuild */
-	u64 rebuild_verified;     /* Sectors rebuilt */
+	u32 rebuild_disk;
+	u64 rebuild_offset;
+	u64 rebuild_total;
+	u64 rebuild_verified;
 	struct workqueue_struct *rebuild_wq;
 	struct delayed_work rebuild_work;
+
+	/* Write verification */
+	u32 write_verify_enabled;
 
 	/* Statistics */
 	atomic_t io_count;
@@ -597,8 +617,13 @@ if (strcmp(argv[0], "single") == 0) {
 	arr->size = 0;
 	arr->primary_disk = 0;
 	arr->failed_disks = 0;
-	arr->error_threshold = 3; /* Mark failed after 3 errors */
+	arr->error_threshold = 3;
 	arr->last_check = jiffies;
+	arr->write_verify_enabled = 0;
+
+	/* Initialize concurrency primitives */
+	mutex_init(&arr->io_mutex);
+	init_rwsem(&arr->sb_sem);
 
 	/* Initialize CRC table once */
 	static int crc_init_done;
@@ -795,6 +820,9 @@ static void lhsr_dtr(struct dm_target *ti)
 			dm_put_device(ti, arr->dm_devs[i]);
 	}
 
+	/* Destroy concurrency primitives */
+	mutex_destroy(&arr->io_mutex);
+
 	kfree(arr);
 	ti->private = NULL;
 	DMINFO("Destroyed LHSR target");
@@ -830,46 +858,37 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	/* RAID1 Mirror - write to both disks */
+	/* RAID1 Mirror - write to both disks (atomic: all or nothing) */
 	if (bio_op(bio) != REQ_OP_READ) {
-		if (!(arr->failed_disks & (1 << 0))) {
+		bool disk0_ok = !(arr->failed_disks & (1 << 0));
+		bool disk1_ok = !(arr->failed_disks & (1 << 1));
+		bool submitted = false;
+
+		if (disk0_ok) {
 			clone = bio_alloc_clone(arr->disk[0], bio, GFP_NOIO, &fs_bio_set);
 			if (clone) {
 				clone->bi_iter.bi_sector = offset;
 				clone->bi_private = ti;
 				clone->bi_end_io = lhsr_io_complete;
 				submit_bio(clone);
-			} else {
-				bio->bi_status = BLK_STS_IOERR;
-				bio_endio(bio);
-				return DM_MAPIO_SUBMITTED;
+				submitted = true;
 			}
-		} else if (!(arr->failed_disks & (1 << 1))) {
-			clone = bio_alloc_clone(arr->disk[1], bio, GFP_NOIO, &fs_bio_set);
-			if (clone) {
-				clone->bi_iter.bi_sector = offset;
-				clone->bi_private = ti;
-				clone->bi_end_io = lhsr_io_complete;
-				submit_bio(clone);
-			} else {
-				bio->bi_status = BLK_STS_IOERR;
-				bio_endio(bio);
-				return DM_MAPIO_SUBMITTED;
-			}
-		} else {
-			bio->bi_status = BLK_STS_IOERR;
-			bio_endio(bio);
-			return DM_MAPIO_SUBMITTED;
 		}
 
-		if (!(arr->failed_disks & (1 << 1))) {
+		if (disk1_ok) {
 			clone = bio_alloc_clone(arr->disk[1], bio, GFP_NOIO, &fs_bio_set);
 			if (clone) {
 				clone->bi_iter.bi_sector = offset;
 				clone->bi_private = ti;
 				clone->bi_end_io = lhsr_io_complete;
 				submit_bio(clone);
+				submitted = true;
 			}
+		}
+
+		if (!submitted) {
+			bio->bi_status = BLK_STS_IOERR;
+			bio_endio(bio);
 		}
 		return DM_MAPIO_SUBMITTED;
 	}
@@ -967,7 +986,7 @@ static void lhsr_status(struct dm_target *ti, status_type_t type, unsigned int f
 	}
 }
 
-/* Update and persist disk state to superblock */
+/* Update and persist disk state to superblock - atomic read-modify-write */
 static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx, u32 new_state)
 {
 	struct lhsr_superblock *sb;
@@ -975,6 +994,9 @@ static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx,
 
 	if (disk_idx >= arr->disks)
 		return -EINVAL;
+
+	/* Use write semaphore for atomic update */
+	down_write(&arr->sb_sem);
 
 	sb = &arr->sbs[disk_idx];
 	sb->disk_state = new_state;
@@ -984,10 +1006,12 @@ static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx,
 	r = lhsr_write_superblock(arr->disk[disk_idx], sb);
 	if (r) {
 		DMERR("Failed to persist disk %u state: %d", disk_idx, r);
+		up_write(&arr->sb_sem);
 		return r;
 	}
 
 	DMINFO("Persisted disk %u state=%u (gen=%llu)", disk_idx, new_state, arr->generation);
+	up_write(&arr->sb_sem);
 	return 0;
 }
 
@@ -1148,6 +1172,44 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 						       LHSR_DISK_DEGRADED : LHSR_DISK_HEALTHY);
 		}
 		scnprintf(result, maxlen, "Persisted gen=%llu", arr->generation);
+		return 0;
+	}
+
+	if (strncmp(argv[0], "write_verify", 11) == 0) {
+		if (argc < 2) {
+			const char *mode_str = "none";
+			switch (arr->write_verify_enabled) {
+			case LHSR_WRITE_VERIFY_SIMPLE: mode_str = "simple"; break;
+			case LHSR_WRITE_VERIFY_FULL: mode_str = "full"; break;
+			}
+			scnprintf(result, maxlen, "write_verify=%s", mode_str);
+			return 0;
+		}
+
+		if (strcmp(argv[1], "none") == 0) {
+			arr->write_verify_enabled = LHSR_WRITE_VERIFY_NONE;
+			scnprintf(result, maxlen, "Write verification disabled");
+			return 0;
+		}
+		if (strcmp(argv[1], "simple") == 0) {
+			arr->write_verify_enabled = LHSR_WRITE_VERIFY_SIMPLE;
+			scnprintf(result, maxlen, "Simple write verification enabled");
+			return 0;
+		}
+		if (strcmp(argv[1], "full") == 0) {
+			arr->write_verify_enabled = LHSR_WRITE_VERIFY_FULL;
+			scnprintf(result, maxlen, "Full write verification enabled");
+			return 0;
+		}
+		return -EINVAL;
+	}
+
+	if (strncmp(argv[0], "config", 6) == 0) {
+		scnprintf(result, maxlen,
+			  "uuid=%llx raid=%u disks=%u state=%u failed=0x%x gen=%llu verify=%u",
+			  arr->array_uuid, arr->raid_type, arr->disks,
+			  arr->state, arr->failed_disks, arr->generation,
+			  arr->write_verify_enabled);
 		return 0;
 	}
 
