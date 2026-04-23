@@ -1,0 +1,28 @@
+# Build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+modules.order
+Module.symvers
+*.cmd
+.dm-*.cmd
+..*.cmd
+
+# Pre-processed files
+dm_lhsr.c
+
+# Binary files
+userspace/cli/lhsrctl
+userspace/daemon/lhsrd
+userspace/daemon/lhsrd.o
+userspace/recovery/lhsr-scan
+userspace/recovery/lhsr-scan.o
+lib/*.a
+lib/raid_engine/*.o
+
+# Backup files
+*~
+*.swp
+*.swo

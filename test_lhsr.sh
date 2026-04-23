@@ -1,6 +1,15 @@
 #!/bin/bash
 # LHSR Test Script
 # Run as: sudo ./test_lhsr.sh
+#
+# If sudo requires password, run these commands manually:
+#   sudo modprobe dm-mod
+#   sudo insmod kernel/dm-lhsr/dm-lhsr.ko
+#   dmesg | tail
+#   echo "0 1000000 lhsr mirror /dev/sdb /dev/sdc" | sudo dmsetup create lhsr_test
+#   sudo dmsetup status lhsr_test
+#   sudo dmsetup remove lhsr_test
+#   sudo rmmod dm_lhsr
 
 set -e
 

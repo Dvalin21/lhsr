@@ -114,6 +114,12 @@ struct lhsr_array {
 	u32 state;
 	atomic_t refcount;
 
+	/* Scrub state */
+	u64 scrub_offset;
+	u64 scrub_errors;
+	u32 scrub_finished;
+	u32 verify_on_read;
+
 	/* Disks */
 	struct block_device **disk;
 	struct dm_dev **dm_devs;
@@ -169,7 +175,6 @@ unsigned int lhsr_get_disk_count(struct lhsr_array *arr);
 
 /* RAID Operations */
 int lhsr_calculate_parity(struct lhsr_array *arr, void *data, void **disks, unsigned int count);
-int lhsr_reconstruct_block(struct lhsr_array *arr, unsigned int block_idx, void *result);
 int lhsr_verify_checksum(struct lhsr_array *arr, void *data, u32 expected, unsigned int algo);
 
 /* Self-Healing */
