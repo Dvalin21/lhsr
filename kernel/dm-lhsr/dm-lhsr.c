@@ -197,13 +197,29 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	/* Parse raid type from argv[0] */
-	if (strcmp(argv[0], "single") == 0) {
-		raid_type = 0;  /* JBOD - single disk */
+if (strcmp(argv[0], "single") == 0) {
+		raid_type = 0;
 	} else if (strcmp(argv[0], "mirror") == 0) {
-		raid_type = 1;  /* RAID1 - mirroring */
+		raid_type = 1;
+	} else if (strcmp(argv[0], "raid5") == 0) {
+		raid_type = 2;
+	} else if (strcmp(argv[0], "raid6") == 0) {
+		raid_type = 3;
 	} else {
 		DMERR("Unknown raid type: %s", argv[0]);
 		ti->error = "Unknown raid type";
+		return -EINVAL;
+	}
+
+	num_disks = argc - 1;
+	if (raid_type == 1 && num_disks != 2) {
+		DMERR("Mirror requires exactly 2 disks");
+		ti->error = "Mirror requires exactly 2 disks";
+		return -EINVAL;
+	}
+	if (raid_type >= 2 && num_disks < 3) {
+		DMERR("RAID5/6 requires at least 3 disks");
+		ti->error = "RAID5/6 requires at least 3 disks";
 		return -EINVAL;
 	}
 
@@ -285,6 +301,14 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	ti->num_discard_bios = 0;
 
 	DMINFO("Created LHSR: type=%u size=%llu", raid_type, size);
+
+	/* Log RAID level info */
+	if (raid_type == 2) {
+		DMINFO("RAID5 configured: %u data + 1 parity", num_disks - 1);
+	} else if (raid_type == 3) {
+		DMINFO("RAID6 configured: %u data + 2 parity", num_disks - 2);
+	}
+
 	return 0;
 
 bad:
@@ -396,6 +420,27 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
+	/* RAID5/6 handling - fallback to first data disk */
+	if (arr->raid_type >= 2) {
+		unsigned int data_disk = 0;
+
+		/* Use a working data disk */
+		while (data_disk < arr->disks && (arr->failed_disks & (1 << data_disk)))
+			data_disk++;
+
+		if (data_disk < arr->disks) {
+			bio_set_dev(bio, arr->disk[data_disk]);
+			bio->bi_iter.bi_sector = offset;
+			bio->bi_private = ti;
+			bio->bi_end_io = lhsr_io_complete;
+			submit_bio(bio);
+		} else {
+			bio->bi_status = BLK_STS_IOERR;
+			bio_endio(bio);
+		}
+		return DM_MAPIO_SUBMITTED;
+	}
+
 	/* Read: try primary, failover to secondary on error */
 	if (!(arr->failed_disks & (1 << arr->primary_disk))) {
 		bio_set_dev(bio, arr->disk[arr->primary_disk]);
@@ -448,6 +493,10 @@ static void lhsr_status(struct dm_target *ti, status_type_t type, unsigned int f
 	case STATUSTYPE_TABLE:
 		sz += scnprintf(result + sz, maxlen - sz, "UUID=%llx RAID=%u DISKS=%u",
 			       arr->uuid, arr->raid_type, arr->disks);
+		if (arr->raid_type >= 2) {
+			const char *raid_name = arr->raid_type == 2 ? "RAID5" : "RAID6";
+			sz += scnprintf(result + sz, maxlen - sz, " TYPE=%s", raid_name);
+		}
 		break;
 	default:
 		break;
