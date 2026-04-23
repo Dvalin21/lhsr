@@ -9,6 +9,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **Scrubber integration** (v1.1.0): Background integrity verification
+  - CRC32c per-block checksumming during scrub
+  - Rate-limited background scrub with configurable block size (128KB)
+  - Corruption detection tracking (scrub_corrupted counter)
+  - `scrub start/stop` dmsetup message handlers
+  - Scrub progress in status output
+
+- **Rebuild tracking** (v1.1.0): Disk replacement state machine
+  - Rebuild states: NONE, PENDING, RUNNING, COMPLETE
+  - `rebuild start <disk>` and `rebuild status` message handlers
+  - Superblock state updates during rebuild
+
+- **Userspace recovery tool** (v1.1.0): lhsr-scan superblock reader
+  - Read and validate superblocks from raw disks
+  - Displays array UUID, disk UUID, generation, timestamps
+  - Auto-detects primary vs backup superblock locations
+  - Reports generation conflicts between primary/backup
+
 - **Superblock persistence** (v1.0.4): On-disk metadata at 4MB primary + backup at end-8MB
   - CRC32c checksum validation with automatic backup recovery
   - Generation counter for crash recovery ordering

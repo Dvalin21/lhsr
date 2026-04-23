@@ -54,4 +54,31 @@ struct lhsr_superblock {
 #define LHSR_DISK_FAILED      2
 #define LHSR_DISK_REBUILDING  3
 
+/* Scrubber states */
+#define LHSR_SCRUB_IDLE       0
+#define LHSR_SCRUB_RUNNING    1
+#define LHSR_SCRUB_PAUSED     2
+#define LHSR_SCRUB_COMPLETED  3
+
+/* Default scrub block size (128KB) */
+#define LHSR_SCRUB_BLOCK_SIZE (128 * 1024)
+
+/* Rebuild states */
+#define LHSR_REBUILD_NONE     0
+#define LHSR_REBUILD_PENDING  1
+#define LHSR_REBUILD_RUNNING  2
+#define LHSR_REBUILD_COMPLETE 3
+
+/* Checksummed block metadata stored in reserved superblock area */
+struct lhsr_block_meta {
+	__u64 offset;       /* Block offset in sectors */
+	__u32 checksum;     /* CRC32c of block data */
+	__u32 flags;        /* Block flags */
+	__u64 scrub_gen;    /* Last scrub generation */
+} __attribute__((packed));
+
+#define LHSR_BLOCK_VERIFIED   0x01
+#define LHSR_BLOCK_CORRUPT    0x02
+#define LHSR_BLOCK_DIRTY      0x04
+
 #endif /* DM_LHSR_H */

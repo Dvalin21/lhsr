@@ -21,7 +21,7 @@
 #include "dm_lhsr.h"
 
 #define DM_MSG_PREFIX "lhsr"
-#define LHSR_VERSION "1.0.4"
+#define LHSR_VERSION "1.1.0"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
@@ -233,10 +233,33 @@ struct lhsr_array {
 	struct delayed_work check_work;
 	unsigned long last_check;
 
+	/* Scrubber */
+	struct workqueue_struct *scrub_wq;
+	struct delayed_work scrub_work;
+	u32 scrub_state;
+	u32 scrub_disk;           /* Current disk being scrubbed */
+	u64 scrub_offset;        /* Current offset in sectors */
+	u64 scrub_blocks;        /* Total blocks to scrub */
+	u64 scrub_verified;      /* Blocks verified */
+	u64 scrub_corrupted;     /* Corrupt blocks found */
+	u64 scrub_last_offset;   /* Last verified offset */
+	unsigned long scrub_start_jiffies;
+
+	/* Rebuild tracking */
+	u32 rebuild_state;
+	u32 rebuild_disk;         /* Disk being rebuilt */
+	u64 rebuild_offset;       /* Current rebuild offset */
+	u64 rebuild_total;        /* Total sectors to rebuild */
+	u64 rebuild_verified;     /* Sectors rebuilt */
+	struct workqueue_struct *rebuild_wq;
+	struct delayed_work rebuild_work;
+
 	/* Statistics */
 	atomic_t io_count;
 	atomic_t io_errors;
 	atomic_t failovers;
+	atomic_t corruptions_detected;
+	atomic_t repairs;
 
 	/* I/O tracking */
 	unsigned long last_error_jiffies;
@@ -383,6 +406,120 @@ static void disk_check_work(struct work_struct *work)
 	/* Schedule next check */
 	arr->last_check = jiffies;
 	queue_delayed_work(arr->check_wq, &arr->check_work, 30 * HZ);
+}
+
+/* Scrub a block - reads and checksums */
+static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 offset)
+{
+	struct bio *bio;
+	struct page *page;
+	void *buf;
+	int ret = 0;
+
+	if (arr->failed_disks & (1 << disk_idx))
+		return -EINVAL;
+
+	page = alloc_page(GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+
+	buf = page_address(page);
+
+	bio = bio_alloc(arr->disk[disk_idx], 1, REQ_OP_READ, GFP_KERNEL);
+	bio_set_dev(bio, arr->disk[disk_idx]);
+	bio->bi_iter.bi_sector = offset;
+	__bio_add_page(bio, page, LHSR_SCRUB_BLOCK_SIZE, 0);
+
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+
+	if (ret == 0) {
+		u32 csum = lhsr_crc32c(buf, LHSR_SCRUB_BLOCK_SIZE);
+		*(u32 *)buf = csum;
+	}
+
+	__free_page(page);
+	return ret;
+}
+
+/* Periodic scrub work */
+static void scrub_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct lhsr_array *arr = container_of(dwork, struct lhsr_array, scrub_work);
+	u64 block_size = LHSR_SCRUB_BLOCK_SIZE >> SECTOR_SHIFT;
+	unsigned int disk_idx;
+	int ret;
+
+	if (arr->scrub_state != LHSR_SCRUB_RUNNING)
+		return;
+
+	/* Skip superblock area */
+	if (arr->scrub_offset < (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8)
+		arr->scrub_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+
+	/* Check if we're done with current disk */
+	if (arr->scrub_offset >= arr->size) {
+		/* Move to next disk */
+		disk_idx = (arr->scrub_disk + 1) % arr->disks;
+		while (disk_idx != arr->scrub_disk && (arr->failed_disks & (1 << disk_idx)))
+			disk_idx = (disk_idx + 1) % arr->disks;
+
+		if (disk_idx == arr->scrub_disk) {
+			/* All disks done */
+			DMINFO("Scrub completed: %llu blocks verified, %llu corruptions detected",
+			       arr->scrub_verified, arr->scrub_corrupted);
+			arr->scrub_state = LHSR_SCRUB_COMPLETED;
+			return;
+		}
+
+		arr->scrub_disk = disk_idx;
+		arr->scrub_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+		DMINFO("Scrub advancing to disk %u", disk_idx);
+	}
+
+	disk_idx = arr->scrub_disk;
+
+	/* Scrub current block */
+	ret = lhsr_scrub_block(arr, disk_idx, arr->scrub_offset);
+	if (ret == 0) {
+		arr->scrub_verified++;
+		arr->scrub_last_offset = arr->scrub_offset;
+	} else {
+		DMERR("Scrub failed at disk %u offset 0x%llx: %d", disk_idx, arr->scrub_offset, ret);
+	}
+
+	arr->scrub_offset += block_size;
+
+	/* Schedule next chunk - rate limited to avoid impacting I/O */
+	queue_delayed_work(arr->scrub_wq, &arr->scrub_work, HZ / 10);
+}
+
+/* Start scrubber */
+static int lhsr_scrub_start(struct lhsr_array *arr)
+{
+	if (arr->scrub_state == LHSR_SCRUB_RUNNING)
+		return 0;
+
+	if (!arr->scrub_wq) {
+		arr->scrub_wq = alloc_workqueue("lhsr_scrub", WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
+		if (!arr->scrub_wq)
+			return -ENOMEM;
+	}
+
+	arr->scrub_state = LHSR_SCRUB_RUNNING;
+	arr->scrub_disk = 0;
+	arr->scrub_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+	arr->scrub_verified = 0;
+	arr->scrub_corrupted = 0;
+	arr->scrub_last_offset = 0;
+	arr->scrub_start_jiffies = jiffies;
+
+	INIT_DELAYED_WORK(&arr->scrub_work, scrub_work);
+	queue_delayed_work(arr->scrub_wq, &arr->scrub_work, 0);
+
+	DMINFO("Scrubber started");
+	return 0;
 }
 
 /* Target constructor */
@@ -557,6 +694,23 @@ if (strcmp(argv[0], "single") == 0) {
 	INIT_DELAYED_WORK(&arr->check_work, disk_check_work);
 	queue_delayed_work(arr->check_wq, &arr->check_work, 10 * HZ);
 
+	/* Initialize scrubber state */
+	arr->scrub_state = LHSR_SCRUB_IDLE;
+	arr->scrub_wq = NULL;
+	arr->scrub_offset = 0;
+	arr->scrub_verified = 0;
+	arr->scrub_corrupted = 0;
+	atomic_set(&arr->corruptions_detected, 0);
+	atomic_set(&arr->repairs, 0);
+
+	/* Initialize rebuild state */
+	arr->rebuild_state = LHSR_REBUILD_NONE;
+	arr->rebuild_disk = 0;
+	arr->rebuild_offset = 0;
+	arr->rebuild_total = 0;
+	arr->rebuild_verified = 0;
+	arr->rebuild_wq = NULL;
+
 	ti->private = arr;
 	ti->len = size;
 	ti->begin = 0;
@@ -614,6 +768,26 @@ static void lhsr_dtr(struct dm_target *ti)
 			DMERR("Failed to persist superblock for disk %u: %d", i, r);
 		else
 			DMINFO("Persisted state for disk %u (gen=%llu)", i, sb->generation);
+	}
+
+	/* Stop scrubber */
+	if (arr->scrub_wq) {
+		cancel_delayed_work_sync(&arr->scrub_work);
+		destroy_workqueue(arr->scrub_wq);
+		DMINFO("Scrubber stopped");
+	}
+
+	/* Stop rebuild */
+	if (arr->rebuild_wq) {
+		cancel_delayed_work_sync(&arr->rebuild_work);
+		destroy_workqueue(arr->rebuild_wq);
+		DMINFO("Rebuild stopped");
+	}
+
+	/* Stop health check */
+	if (arr->check_wq) {
+		cancel_delayed_work_sync(&arr->check_work);
+		destroy_workqueue(arr->check_wq);
 	}
 
 	for (i = 0; i < arr->disks; i++) {
@@ -769,6 +943,16 @@ static void lhsr_status(struct dm_target *ti, status_type_t type, unsigned int f
 				       atomic_read(&arr->io_errors),
 				       atomic_read(&arr->failovers));
 		}
+		if (arr->scrub_state != LHSR_SCRUB_IDLE) {
+			const char *state_str = "IDLE";
+			switch (arr->scrub_state) {
+			case LHSR_SCRUB_RUNNING: state_str = "RUN"; break;
+			case LHSR_SCRUB_PAUSED: state_str = "PAUSED"; break;
+			case LHSR_SCRUB_COMPLETED: state_str = "DONE"; break;
+			}
+			sz += scnprintf(result + sz, maxlen - sz, " scrub=%s-%llu",
+				       state_str, arr->scrub_verified);
+		}
 		break;
 	case STATUSTYPE_TABLE:
 		sz += scnprintf(result + sz, maxlen - sz, "UUID=%llx RAID=%u DISKS=%u",
@@ -877,6 +1061,83 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			  arr->sbs[disk_idx].generation);
 
 		return 0;
+	}
+
+	if (strncmp(argv[0], "scrub", 4) == 0) {
+		if (argc < 2) {
+			const char *state_str = "IDLE";
+			switch (arr->scrub_state) {
+			case LHSR_SCRUB_RUNNING: state_str = "RUNNING"; break;
+			case LHSR_SCRUB_PAUSED: state_str = "PAUSED"; break;
+			case LHSR_SCRUB_COMPLETED: state_str = "COMPLETED"; break;
+			}
+			scnprintf(result, maxlen,
+				  "scrub: state=%s disk=%u offset=0x%llx verified=%llu corrupted=%llu",
+				  state_str, arr->scrub_disk, arr->scrub_offset,
+				  arr->scrub_verified, arr->scrub_corrupted);
+			return 0;
+		}
+
+		if (strcmp(argv[1], "start") == 0) {
+			lhsr_scrub_start(arr);
+			scnprintf(result, maxlen, "Scrub started");
+			return 0;
+		}
+
+		if (strcmp(argv[1], "stop") == 0) {
+			arr->scrub_state = LHSR_SCRUB_IDLE;
+			scnprintf(result, maxlen, "Scrub stopped at offset 0x%llx", arr->scrub_offset);
+			return 0;
+		}
+
+		return -EINVAL;
+	}
+
+	if (strncmp(argv[0], "rebuild", 6) == 0) {
+		if (argc < 2) {
+			const char *state_str = "NONE";
+			switch (arr->rebuild_state) {
+			case LHSR_REBUILD_PENDING: state_str = "PENDING"; break;
+			case LHSR_REBUILD_RUNNING: state_str = "RUNNING"; break;
+			case LHSR_REBUILD_COMPLETE: state_str = "COMPLETE"; break;
+			}
+			scnprintf(result, maxlen,
+				  "rebuild: state=%s disk=%u offset=0x%llx/%llx",
+				  state_str, arr->rebuild_disk,
+				  arr->rebuild_offset, arr->rebuild_total);
+			return 0;
+		}
+
+		if (strcmp(argv[1], "start") == 0) {
+			if (argc < 3)
+				return -EINVAL;
+			err = kstrtouint(argv[2], 10, &disk_idx);
+			if (err || disk_idx >= arr->disks)
+				return -EINVAL;
+
+			arr->rebuild_disk = disk_idx;
+			arr->rebuild_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+			arr->rebuild_total = arr->size;
+			arr->rebuild_verified = 0;
+			arr->rebuild_state = LHSR_REBUILD_PENDING;
+			lhsr_update_disk_state(arr, disk_idx, LHSR_DISK_REBUILDING);
+
+			scnprintf(result, maxlen, "Rebuild pending for disk %u", disk_idx);
+			return 0;
+		}
+
+		if (strcmp(argv[1], "status") == 0) {
+			if (arr->rebuild_state == LHSR_REBUILD_NONE) {
+				scnprintf(result, maxlen, "No rebuild in progress");
+			} else {
+				u32 pct = arr->rebuild_total ? (u32)((arr->rebuild_offset * 100) / arr->rebuild_total) : 0;
+				scnprintf(result, maxlen, "Rebuild disk=%u progress=%u%%",
+					  arr->rebuild_disk, pct);
+			}
+			return 0;
+		}
+
+		return -EINVAL;
 	}
 
 	if (strncmp(argv[0], "persist", 7) == 0) {

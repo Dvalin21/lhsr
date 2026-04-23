@@ -92,17 +92,25 @@ rmmod dm-lhsr
 
 ## dm-lhsr.ko Current State
 
-- **Version**: 1.0.4
+- **Version**: 1.1.0
 - **Features**: RAID0, RAID1, RAID5, RAID6, SHR, Single, Mirror
-- **Parameters**: default_block_size, default_io_threads, default_scrub_enabled
-- **Status**: Superblock persistence implemented - crash recovery supported
-- **Superblock**: Primary at 4MB, backup at end-8MB, CRC32c checksummed
+- **Scrubber**: Background integrity verification with CRC32c
+- **Rebuild**: Disk replacement state machine
+- **Status**: Superblock persistence + scrubber + rebuild tracking implemented
 
-### Superblock Persistence Features
-- Read existing superblock on array load (recover previous state)
-- Write superblock on module unload (persist current state)
+### Superblock Persistence
+- Primary at 4MB offset, backup at end-8MB
+- CRC32c checksummed with auto-backup recovery
 - Generation counter tracks state transitions
-- Automatic failover to backup superblock if primary checksum fails
+
+### Scrubber
+- Rate-limited 128KB block verification
+- Corruption detection tracking
+- Control: `dmsetup message <dev> scrub start|stop`
+
+### Rebuild Tracking
+- States: NONE, PENDING, RUNNING, COMPLETE
+- Control: `dmsetup message <dev> rebuild start <disk>|status`
 
 ---
 Updated: 2026-04-21
