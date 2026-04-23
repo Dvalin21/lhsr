@@ -92,10 +92,17 @@ rmmod dm-lhsr
 
 ## dm-lhsr.ko Current State
 
-- **Version**: 1.0.0
-- **Features**: RAID0, RAID1, RAID5, RAID6, SHR, SHR2
+- **Version**: 1.0.4
+- **Features**: RAID0, RAID1, RAID5, RAID6, SHR, Single, Mirror
 - **Parameters**: default_block_size, default_io_threads, default_scrub_enabled
-- **Status**: Builds successfully, basic I/O functional
+- **Status**: Superblock persistence implemented - crash recovery supported
+- **Superblock**: Primary at 4MB, backup at end-8MB, CRC32c checksummed
+
+### Superblock Persistence Features
+- Read existing superblock on array load (recover previous state)
+- Write superblock on module unload (persist current state)
+- Generation counter tracks state transitions
+- Automatic failover to backup superblock if primary checksum fails
 
 ---
 Updated: 2026-04-21

@@ -8,6 +8,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added
+- **Superblock persistence** (v1.0.4): On-disk metadata at 4MB primary + backup at end-8MB
+  - CRC32c checksum validation with automatic backup recovery
+  - Generation counter for crash recovery ordering
+  - Array UUID derived from disk name
+  - State persisted on: disk_fail, disk_online, I/O errors, periodic check, module unload
+
 ### Planned
 - Core RAID engine (Phase 1)
 - Self-healing engine (Phase 2)

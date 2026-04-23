@@ -47,7 +47,10 @@
 
 /* Superblock locations */
 #define LHSR_SUPERBLOCK_PRIMARY_OFFSET  (4 * 1024 * 1024)  /* 4MB */
-#define LHSR_SUPERBLOCK_BACKUP_OFFSET   (0 - (4 * 1024 * 1024)) /* End - 4MB */
+#define LHSR_SUPERBLOCK_BACKUP_OFFSET   (8 * 1024 * 1024)   /* End - 8MB */
+
+/* Superblock versions */
+#define LHSR_SB_VERSION         1
 
 /* Checksum algorithms */
 #define LHSR_CHECKSUM_CRC32C  0

@@ -15,16 +15,199 @@
 #include <linux/device-mapper.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
+#include <linux/crc32c.h>
+#include <linux/ktime.h>
 
 #include "dm_lhsr.h"
 
 #define DM_MSG_PREFIX "lhsr"
-#define LHSR_VERSION "1.0.3"
+#define LHSR_VERSION "1.0.4"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
 MODULE_DESCRIPTION("Linux Hybrid Self-Healing RAID");
 MODULE_VERSION(LHSR_VERSION);
+
+/* CRC32c lookup table for fast checksum */
+static u32 lhsr_crc_table[256];
+
+static void lhsr_init_crc_table(void)
+{
+	u32 crc;
+	int i, j;
+
+	for (i = 0; i < 256; i++) {
+		crc = i;
+		for (j = 0; j < 8; j++) {
+			if (crc & 1)
+				crc = (crc >> 1) ^ 0x82F63B78;
+			else
+				crc >>= 1;
+		}
+		lhsr_crc_table[i] = crc;
+	}
+}
+
+static u32 lhsr_crc32c(const void *buf, size_t len)
+{
+	const u8 *p = buf;
+	u32 crc = 0xFFFFFFFF;
+
+	while (len--) {
+		crc = crc ^ *p++;
+		crc = (crc >> 8) ^ lhsr_crc_table[crc & 0xFF];
+		crc = (crc >> 8) ^ lhsr_crc_table[crc & 0xFF];
+		crc = (crc >> 8) ^ lhsr_crc_table[crc & 0xFF];
+		crc = (crc >> 8) ^ lhsr_crc_table[crc & 0xFF];
+	}
+
+	return crc ^ 0xFFFFFFFF;
+}
+
+/* Superblock I/O helpers */
+static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblock *sb)
+{
+	struct bio *bio;
+	struct page *page;
+	void *buf;
+	sector_t sector;
+	int ret = 0;
+
+	sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
+	page = alloc_page(GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+
+	buf = page_address(page);
+	memset(buf, 0, PAGE_SIZE);
+	memcpy(buf, sb, LHSR_SB_SIZE);
+
+	/* Calculate checksum over all except checksum field */
+	sb->checksum = 0;
+	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = lhsr_crc32c(buf, LHSR_SB_SIZE);
+
+	bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_FUA, GFP_KERNEL);
+	bio_set_dev(bio, bdev);
+	bio->bi_iter.bi_sector = sector;
+	__bio_add_page(bio, page, LHSR_SB_SIZE, 0);
+
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+
+	if (ret == 0) {
+		u64 backup_off = LHSR_SB_BACKUP_OFF(bdev_nr_sectors(bdev) << SECTOR_SHIFT);
+		sector_t backup_sector = backup_off >> SECTOR_SHIFT;
+		bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_FUA, GFP_KERNEL);
+		bio_set_dev(bio, bdev);
+		bio->bi_iter.bi_sector = backup_sector;
+		__bio_add_page(bio, page, LHSR_SB_SIZE, 0);
+		ret = submit_bio_wait(bio);
+		bio_put(bio);
+	}
+
+	__free_page(page);
+	return ret;
+}
+
+static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superblock *sb)
+{
+	struct bio *bio;
+	struct page *page;
+	void *buf;
+	sector_t sector;
+	u32 stored_csum, calc_csum;
+
+	sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
+	page = alloc_page(GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+
+	bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
+	bio_set_dev(bio, bdev);
+	bio->bi_iter.bi_sector = sector;
+	__bio_add_page(bio, page, PAGE_SIZE, 0);
+
+	if (submit_bio_wait(bio) != 0) {
+		bio_put(bio);
+		__free_page(page);
+		return -EIO;
+	}
+	bio_put(bio);
+
+	buf = page_address(page);
+	stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
+	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
+	calc_csum = lhsr_crc32c(buf, LHSR_SB_SIZE);
+
+	if (stored_csum != calc_csum) {
+		u64 backup_off = LHSR_SB_BACKUP_OFF(bdev_nr_sectors(bdev) << SECTOR_SHIFT);
+		sector_t backup_sector = backup_off >> SECTOR_SHIFT;
+		DMWARN("Primary superblock checksum mismatch (0x%08x vs 0x%08x), trying backup",
+		       stored_csum, calc_csum);
+
+		bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
+		bio_set_dev(bio, bdev);
+		bio->bi_iter.bi_sector = backup_sector;
+		__bio_add_page(bio, page, PAGE_SIZE, 0);
+
+		if (submit_bio_wait(bio) != 0) {
+			bio_put(bio);
+			__free_page(page);
+			return -EIO;
+		}
+		bio_put(bio);
+
+		stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
+		*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
+		calc_csum = lhsr_crc32c(buf, LHSR_SB_SIZE);
+
+		if (stored_csum != calc_csum) {
+			DMERR("Both primary and backup superblock checksums invalid");
+			__free_page(page);
+			return -EINVAL;
+		}
+		DMINFO("Restored from backup superblock");
+	}
+
+	memcpy(sb, buf, LHSR_SB_SIZE);
+	__free_page(page);
+	return 0;
+}
+
+static int lhsr_validate_superblock(struct lhsr_superblock *sb)
+{
+	if (memcmp(sb->magic, LHSR_SB_MAGIC, LHSR_SB_MAGIC_LEN) != 0) {
+		DMERR("Invalid superblock magic");
+		return -EINVAL;
+	}
+
+	if (sb->version != LHSR_SB_VERSION) {
+		DMERR("Unsupported superblock version %u (expected %u)", sb->version, LHSR_SB_VERSION);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void lhsr_init_superblock(struct lhsr_superblock *sb, u64 array_uuid,
+				  unsigned int disk_idx, unsigned int raid_type,
+				  unsigned int disk_count, sector_t total_sectors)
+{
+	memset(sb, 0, LHSR_SB_SIZE);
+	memcpy(sb->magic, LHSR_SB_MAGIC, LHSR_SB_MAGIC_LEN);
+	sb->version = LHSR_SB_VERSION;
+	sb->array_uuid = array_uuid;
+	sb->disk_uuid = (u64)disk_idx << 32 | (u32)(jiffies & 0xFFFFFFFF);
+	sb->creation_time = ktime_get_real_seconds();
+	sb->last_update = sb->creation_time;
+	sb->disk_index = disk_idx;
+	sb->disk_state = LHSR_DISK_HEALTHY;
+	sb->raid_type = raid_type;
+	sb->disk_count = disk_count;
+	sb->total_sectors = total_sectors;
+	sb->generation = 1;
+	sb->checksum = lhsr_crc32c((void *)sb, LHSR_SB_SIZE);
+}
 
 /* Array structure */
 struct lhsr_array {
@@ -37,6 +220,11 @@ struct lhsr_array {
 	u32 state;
 	u32 primary_disk;
 	u32 failed_disks;
+
+	/* Superblock persistence */
+	u64 generation;
+	u64 array_uuid;
+	struct lhsr_superblock sbs[32];
 
 	/* Disk failure detection */
 	u32 disk_errors[32];
@@ -54,6 +242,8 @@ struct lhsr_array {
 	unsigned long last_error_jiffies;
 	u32 last_error_disk;
 };
+
+static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx, u32 new_state);
 
 /* I/O completion callback - tracks errors */
 static void lhsr_io_complete(struct bio *bio)
@@ -83,10 +273,12 @@ static void lhsr_io_complete(struct bio *bio)
 						if (!(arr->failed_disks & (1 << i))) {
 							DMERR("Disk %u failed due to I/O errors", i);
 							arr->failed_disks |= (1 << i);
+							lhsr_update_disk_state(arr, i, LHSR_DISK_DEGRADED);
 							if (arr->primary_disk == i) {
 								arr->primary_disk = i == 0 ? 1 : 0;
 								DMINFO("Failover to disk %u", arr->primary_disk);
 							}
+							arr->state = LHSR_STATE_DEGRADED;
 							atomic_inc(&arr->failovers);
 						}
 					}
@@ -107,6 +299,18 @@ static inline u64 fast_hash_32(u32 val)
 {
 	u32 hash = val * 0x9e370001UL;
 	return hash >> 16;
+}
+
+/* Simple string hash */
+static u64 simple_hash(const char *str, size_t len)
+{
+	u64 hash = 0;
+	size_t i;
+
+	for (i = 0; i < len; i++) {
+		hash = hash * 31 + str[i];
+	}
+	return hash;
 }
 
 /* Check if a disk is accessible */
@@ -166,7 +370,14 @@ static void disk_check_work(struct work_struct *work)
 
 	if (new_failed) {
 		arr->failed_disks |= new_failed;
+		arr->state = LHSR_STATE_DEGRADED;
 		DMWARN("Failed disks mask: 0x%x", arr->failed_disks);
+
+		/* Persist new failed state for each failed disk */
+		for (i = 0; i < arr->disks; i++) {
+			if (new_failed & (1 << i))
+				lhsr_update_disk_state(arr, i, LHSR_DISK_DEGRADED);
+		}
 	}
 
 	/* Schedule next check */
@@ -252,6 +463,13 @@ if (strcmp(argv[0], "single") == 0) {
 	arr->error_threshold = 3; /* Mark failed after 3 errors */
 	arr->last_check = jiffies;
 
+	/* Initialize CRC table once */
+	static int crc_init_done;
+	if (!crc_init_done) {
+		lhsr_init_crc_table();
+		crc_init_done = 1;
+	}
+
 	/* Get devices */
 	for (i = 0; i < num_disks; i++) {
 		DMINFO("Getting device %u: %s", i, argv[i + 1]);
@@ -282,7 +500,52 @@ if (strcmp(argv[0], "single") == 0) {
 	}
 
 	arr->size = size;
-	arr->state = LHSR_STATE_ONLINE;
+
+	/* Generate stable array UUID from disk name or size/raid_type */
+	arr->array_uuid = 0;
+	if (arr->disk[0] && arr->disk[0]->bd_disk) {
+		struct gendisk *gd = arr->disk[0]->bd_disk;
+		arr->array_uuid = simple_hash(gd->disk_name, strlen(gd->disk_name));
+	}
+	if (!arr->array_uuid)
+		arr->array_uuid = (u64)size ^ ((u64)raid_type << 48);
+	arr->generation = 1;
+
+	/* Read or create superblock for each disk */
+	for (i = 0; i < num_disks; i++) {
+		struct lhsr_superblock *sb = &arr->sbs[i];
+
+		if (lhsr_read_superblock(arr->disk[i], sb) == 0 &&
+		    lhsr_validate_superblock(sb) == 0) {
+			DMINFO("Disk %u: Found valid superblock (gen=%llu)", i, sb->generation);
+			if (sb->array_uuid != arr->array_uuid) {
+				DMWARN("Disk %u array_uuid mismatch (0x%llx vs 0x%llx)",
+				       i, sb->array_uuid, arr->array_uuid);
+			}
+			arr->failed_disks |= (sb->disk_state >= LHSR_DISK_DEGRADED) ? (1 << i) : 0;
+		} else {
+			DMINFO("Disk %u: No valid superblock, initializing", i);
+			lhsr_init_superblock(sb, arr->array_uuid, i, raid_type, num_disks, size);
+			if (lhsr_write_superblock(arr->disk[i], sb)) {
+				DMERR("Failed to write superblock to disk %u", i);
+				ti->error = "Failed to write superblock";
+				goto bad;
+			}
+			DMINFO("Wrote new superblock to disk %u", i);
+		}
+
+		/* Track highest generation */
+		if (sb->generation > arr->generation)
+			arr->generation = sb->generation;
+	}
+
+	/* Recover failed disks from superblock state */
+	for (i = 0; i < num_disks; i++) {
+		if (arr->sbs[i].disk_state >= LHSR_DISK_DEGRADED)
+			arr->failed_disks |= (1 << i);
+	}
+
+	arr->state = (arr->failed_disks == 0) ? LHSR_STATE_HEALTHY : LHSR_STATE_DEGRADED;
 
 	/* Create workqueue for disk health checks */
 	arr->check_wq = alloc_workqueue("lhsr_check", WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
@@ -326,6 +589,7 @@ static void lhsr_dtr(struct dm_target *ti)
 {
 	struct lhsr_array *arr = ti->private;
 	unsigned int i;
+	int r;
 
 	if (!arr)
 		return;
@@ -334,6 +598,22 @@ static void lhsr_dtr(struct dm_target *ti)
 	if (arr->check_wq) {
 		cancel_delayed_work_sync(&arr->check_work);
 		destroy_workqueue(arr->check_wq);
+	}
+
+	/* Write updated superblocks for all disks before destroying */
+	arr->generation++;
+	for (i = 0; i < arr->disks; i++) {
+		struct lhsr_superblock *sb = &arr->sbs[i];
+
+		sb->last_update = ktime_get_real_seconds();
+		sb->generation = arr->generation;
+		sb->disk_state = (arr->failed_disks & (1 << i)) ? LHSR_DISK_DEGRADED : LHSR_DISK_HEALTHY;
+
+		r = lhsr_write_superblock(arr->disk[i], sb);
+		if (r)
+			DMERR("Failed to persist superblock for disk %u: %d", i, r);
+		else
+			DMINFO("Persisted state for disk %u (gen=%llu)", i, sb->generation);
 	}
 
 	for (i = 0; i < arr->disks; i++) {
@@ -503,6 +783,30 @@ static void lhsr_status(struct dm_target *ti, status_type_t type, unsigned int f
 	}
 }
 
+/* Update and persist disk state to superblock */
+static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx, u32 new_state)
+{
+	struct lhsr_superblock *sb;
+	int r;
+
+	if (disk_idx >= arr->disks)
+		return -EINVAL;
+
+	sb = &arr->sbs[disk_idx];
+	sb->disk_state = new_state;
+	sb->last_update = ktime_get_real_seconds();
+	sb->generation = ++arr->generation;
+
+	r = lhsr_write_superblock(arr->disk[disk_idx], sb);
+	if (r) {
+		DMERR("Failed to persist disk %u state: %d", disk_idx, r);
+		return r;
+	}
+
+	DMINFO("Persisted disk %u state=%u (gen=%llu)", disk_idx, new_state, arr->generation);
+	return 0;
+}
+
 /* Message handler - allows userspace to communicate with kernel */
 static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		       char *result, unsigned int maxlen)
@@ -529,12 +833,14 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		DMINFO("Userspace marking disk %u as failed", disk_idx);
 		arr->failed_disks |= (1 << disk_idx);
 		arr->disk_errors[disk_idx] = arr->error_threshold;
+		lhsr_update_disk_state(arr, disk_idx, LHSR_DISK_DEGRADED);
 
 		if (arr->primary_disk == disk_idx) {
 			arr->primary_disk = (disk_idx == 0) ? 1 : 0;
 			DMINFO("Primary disk failed, failover to disk %u", arr->primary_disk);
 		}
 
+		arr->state = LHSR_STATE_DEGRADED;
 		return 0;
 	}
 
@@ -548,6 +854,12 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		DMINFO("Userspace marking disk %u as online", disk_idx);
 		arr->failed_disks &= ~(1 << disk_idx);
 		arr->disk_errors[disk_idx] = 0;
+		lhsr_update_disk_state(arr, disk_idx, LHSR_DISK_HEALTHY);
+
+		if (arr->failed_disks == 0)
+			arr->state = LHSR_STATE_HEALTHY;
+		else
+			arr->state = LHSR_STATE_DEGRADED;
 
 		return 0;
 	}
@@ -559,10 +871,22 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		if (err || disk_idx >= arr->disks)
 			return -EINVAL;
 
-		scnprintf(result, maxlen, "disk[%u]: errors=%u failed=%d",
+		scnprintf(result, maxlen, "disk[%u]: errors=%u failed=%d gen=%llu",
 			  disk_idx, arr->disk_errors[disk_idx],
-			  (arr->failed_disks >> disk_idx) & 1);
+			  (arr->failed_disks >> disk_idx) & 1,
+			  arr->sbs[disk_idx].generation);
 
+		return 0;
+	}
+
+	if (strncmp(argv[0], "persist", 7) == 0) {
+		unsigned int i;
+		arr->generation++;
+		for (i = 0; i < arr->disks; i++) {
+			lhsr_update_disk_state(arr, i, (arr->failed_disks & (1 << i)) ?
+						       LHSR_DISK_DEGRADED : LHSR_DISK_HEALTHY);
+		}
+		scnprintf(result, maxlen, "Persisted gen=%llu", arr->generation);
 		return 0;
 	}
 
