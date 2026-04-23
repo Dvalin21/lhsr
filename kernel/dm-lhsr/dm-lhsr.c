@@ -23,7 +23,7 @@
 #include "dm_lhsr.h"
 
 #define DM_MSG_PREFIX "lhsr"
-#define LHSR_VERSION "1.2.0"
+#define LHSR_VERSION "1.3.0"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
@@ -539,6 +539,138 @@ static int lhsr_scrub_start(struct lhsr_array *arr)
 	queue_delayed_work(arr->scrub_wq, &arr->scrub_work, 0);
 
 	DMINFO("Scrubber started");
+	return 0;
+}
+
+/* Rebuild work function - copies data from good disk to replacement */
+static void rebuild_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct lhsr_array *arr = container_of(dwork, struct lhsr_array, rebuild_work);
+	struct bio *bio;
+	struct page *page;
+	void *buf;
+	unsigned int source_disk;
+	u64 block_size = 128 * 1024;  /* 128KB chunks */
+	u64 offset;
+	int ret;
+
+	if (arr->rebuild_state != LHSR_REBUILD_RUNNING)
+		return;
+
+	if (arr->rebuild_disk >= arr->disks) {
+		DMINFO("Rebuild complete: %llu sectors copied", arr->rebuild_verified);
+		arr->rebuild_state = LHSR_REBUILD_COMPLETE;
+		lhsr_update_disk_state(arr, arr->rebuild_disk, LHSR_DISK_HEALTHY);
+		return;
+	}
+
+	/* Find source disk (the one that's not being rebuilt) */
+	if (arr->rebuild_disk == 0)
+		source_disk = 1;
+	else
+		source_disk = 0;
+
+	if (arr->failed_disks & (1 << source_disk)) {
+		DMERR("Rebuild failed: no source disk available");
+		arr->rebuild_state = LHSR_REBUILD_NONE;
+		return;
+	}
+
+	offset = arr->rebuild_offset;
+
+	/* Skip superblock area */
+	if (offset < (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8)
+		offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+
+	/* Check if done */
+	if (offset >= arr->size) {
+		DMINFO("Rebuild complete: %llu sectors copied", arr->rebuild_verified);
+		arr->rebuild_state = LHSR_REBUILD_COMPLETE;
+		lhsr_update_disk_state(arr, arr->rebuild_disk, LHSR_DISK_HEALTHY);
+		return;
+	}
+
+	/* Allocate page for I/O */
+	page = alloc_page(GFP_KERNEL);
+	if (!page) {
+		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
+		return;
+	}
+
+	buf = page_address(page);
+
+	/* Read from source disk */
+	bio = bio_alloc(arr->disk[source_disk], 1, REQ_OP_READ, GFP_KERNEL);
+	bio_set_dev(bio, arr->disk[source_disk]);
+	bio->bi_iter.bi_sector = offset;
+	__bio_add_page(bio, page, block_size, 0);
+
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+
+	if (ret != 0) {
+		DMERR("Rebuild read failed at offset 0x%llx", offset << SECTOR_SHIFT);
+		__free_page(page);
+		arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
+		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
+		return;
+	}
+
+	/* Write to rebuild disk */
+	bio = bio_alloc(arr->disk[arr->rebuild_disk], 1, REQ_OP_WRITE, GFP_KERNEL);
+	bio_set_dev(bio, arr->disk[arr->rebuild_disk]);
+	bio->bi_iter.bi_sector = offset;
+	__bio_add_page(bio, page, block_size, 0);
+
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	__free_page(page);
+
+	if (ret != 0) {
+		DMERR("Rebuild write failed at offset 0x%llx", offset << SECTOR_SHIFT);
+	}
+
+	arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
+	arr->rebuild_verified += (block_size >> SECTOR_SHIFT);
+
+	/* Rate limit: process one chunk every 100ms to avoid impacting I/O */
+	queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ / 10);
+}
+
+/* Start rebuild for a specific disk */
+static int lhsr_rebuild_start(struct lhsr_array *arr, unsigned int disk_idx)
+{
+	if (disk_idx >= arr->disks)
+		return -EINVAL;
+
+	if (!(arr->failed_disks & (1 << disk_idx))) {
+		DMERR("Disk %u is not failed, no rebuild needed", disk_idx);
+		return -EINVAL;
+	}
+
+	if (!arr->rebuild_wq) {
+		arr->rebuild_wq = alloc_workqueue("lhsr_rebuild", WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
+		if (!arr->rebuild_wq)
+			return -ENOMEM;
+	}
+
+	/* Find source disk */
+	if (disk_idx == 0 && !(arr->failed_disks & (1 << 1)))
+		arr->primary_disk = 1;
+	else if (disk_idx == 1 && !(arr->failed_disks & (1 << 0)))
+		arr->primary_disk = 0;
+
+	arr->rebuild_state = LHSR_REBUILD_RUNNING;
+	arr->rebuild_disk = disk_idx;
+	arr->rebuild_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+	arr->rebuild_total = arr->size;
+	arr->rebuild_verified = 0;
+
+	INIT_DELAYED_WORK(&arr->rebuild_work, rebuild_work);
+	queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, 0);
+
+	DMINFO("Rebuild started for disk %u (source disk %u)", disk_idx, arr->primary_disk);
 	return 0;
 }
 
@@ -1139,14 +1271,13 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			if (err || disk_idx >= arr->disks)
 				return -EINVAL;
 
-			arr->rebuild_disk = disk_idx;
-			arr->rebuild_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
-			arr->rebuild_total = arr->size;
-			arr->rebuild_verified = 0;
-			arr->rebuild_state = LHSR_REBUILD_PENDING;
-			lhsr_update_disk_state(arr, disk_idx, LHSR_DISK_REBUILDING);
+			err = lhsr_rebuild_start(arr, disk_idx);
+			if (err) {
+				scnprintf(result, maxlen, "Rebuild failed: %d", err);
+				return err;
+			}
 
-			scnprintf(result, maxlen, "Rebuild pending for disk %u", disk_idx);
+			scnprintf(result, maxlen, "Rebuild started for disk %u", disk_idx);
 			return 0;
 		}
 
@@ -1155,9 +1286,15 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 				scnprintf(result, maxlen, "No rebuild in progress");
 			} else {
 				u32 pct = arr->rebuild_total ? (u32)((arr->rebuild_offset * 100) / arr->rebuild_total) : 0;
-				scnprintf(result, maxlen, "Rebuild disk=%u progress=%u%%",
-					  arr->rebuild_disk, pct);
+				scnprintf(result, maxlen, "Rebuild disk=%u progress=%u%% (%llu/%llu sectors)",
+					  arr->rebuild_disk, pct, arr->rebuild_verified, arr->rebuild_total);
 			}
+			return 0;
+		}
+
+		if (strcmp(argv[1], "stop") == 0) {
+			arr->rebuild_state = LHSR_REBUILD_NONE;
+			scnprintf(result, maxlen, "Rebuild stopped at offset 0x%llx", arr->rebuild_offset);
 			return 0;
 		}
 

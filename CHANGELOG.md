@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Added
+- **Rebuild execution** (v1.3.0): Actual mirror resync
+  - `rebuild_work` function copies data from good disk to replacement
+  - 128KB chunk-based rebuilding with rate limiting
+  - Automatic source disk selection for RAID1 mirror
+  - Progress tracking (current offset, percentage, sectors copied)
+  - `rebuild stop` command to abort in-progress rebuild
+  - Superblock state update on rebuild completion
+
 - **Production hardening** (v1.2.0): Enterprise reliability features
   - Mutex + rwsem locking for concurrent I/O safety
   - Atomic superblock writes (backup-first-then-primary for write-hole protection)

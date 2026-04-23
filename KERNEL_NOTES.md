@@ -92,15 +92,20 @@ rmmod dm-lhsr
 
 ## dm-lhsr.ko Current State
 
-- **Version**: 1.2.0
+- **Version**: 1.3.0
 - **Features**: RAID0, RAID1, RAID5, RAID6, SHR, Single, Mirror
-- **Status**: Production hardening complete
+- **Status**: Rebuild execution implemented
 
 ### Production Safety Features
 - **Concurrency**: Mutex + rwsem for thread-safe array operations
 - **Write-hole protection**: Atomic superblock writes (backup first, then primary)
 - **Write verification**: none/simple/full modes
 - **Configuration**: Query via `config` message handler
+
+### Rebuilder
+- **Implementation**: Read from source disk, write to rebuild disk
+- **Chunk size**: 128KB with rate limiting
+- **Control**: `rebuild start <disk>`, `rebuild status`, `rebuild stop`
 
 ### Superblock Persistence
 - Primary at 4MB offset, backup at end-8MB
@@ -111,10 +116,6 @@ rmmod dm-lhsr
 - Background 128KB block verification
 - Corruption detection tracking
 - Control: `dmsetup message <dev> scrub start|stop`
-
-### Rebuild Tracking
-- States: NONE, PENDING, RUNNING, COMPLETE
-- Control: `dmsetup message <dev> rebuild start <disk>|status`
 
 ---
 Updated: 2026-04-21
