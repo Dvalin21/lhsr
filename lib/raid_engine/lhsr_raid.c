@@ -69,7 +69,7 @@ uint32_t lhsr_checksum_crc32c(const void *data, size_t len)
 		crc ^= *p++;
 		for (int i = 0; i < 8; i++) {
 			if (crc & 1)
-				crc = (crc >> 1) ^ 0xEDB88320;
+				crc = (crc >> 1) ^ 0x82F63B78;
 			else
 				crc >>= 1;
 		}
