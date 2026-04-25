@@ -905,10 +905,15 @@ static void lhsr_dtr(struct dm_target *ti)
 	if (!arr)
 		return;
 
-	/* Stop the health check workqueue */
+	/* Stop the health check workqueue with timeout */
 	if (arr->check_wq) {
-		cancel_delayed_work_sync(&arr->check_work);
+		DMINFO("Canceling check workqueue...");
+		if (!cancel_delayed_work_sync(&arr->check_work)) {
+			DMWARN("check_work did not complete in time, forcing");
+			flush_workqueue(arr->check_wq);
+		}
 		destroy_workqueue(arr->check_wq);
+		arr->check_wq = NULL;
 	}
 
 	/* Write updated superblocks for all disks before destroying */
@@ -929,22 +934,28 @@ static void lhsr_dtr(struct dm_target *ti)
 
 	/* Stop scrubber */
 	if (arr->scrub_wq) {
-		cancel_delayed_work_sync(&arr->scrub_work);
+		DMINFO("Canceling scrub workqueue...");
+		arr->scrub_state = LHSR_SCRUB_IDLE;
+		if (!cancel_delayed_work_sync(&arr->scrub_work)) {
+			DMWARN("scrub_work did not complete in time, forcing");
+			flush_workqueue(arr->scrub_wq);
+		}
 		destroy_workqueue(arr->scrub_wq);
+		arr->scrub_wq = NULL;
 		DMINFO("Scrubber stopped");
 	}
 
 	/* Stop rebuild */
 	if (arr->rebuild_wq) {
-		cancel_delayed_work_sync(&arr->rebuild_work);
+		DMINFO("Canceling rebuild workqueue...");
+		arr->rebuild_state = LHSR_REBUILD_NONE;
+		if (!cancel_delayed_work_sync(&arr->rebuild_work)) {
+			DMWARN("rebuild_work did not complete in time, forcing");
+			flush_workqueue(arr->rebuild_wq);
+		}
 		destroy_workqueue(arr->rebuild_wq);
+		arr->rebuild_wq = NULL;
 		DMINFO("Rebuild stopped");
-	}
-
-	/* Stop health check */
-	if (arr->check_wq) {
-		cancel_delayed_work_sync(&arr->check_work);
-		destroy_workqueue(arr->check_wq);
 	}
 
 	for (i = 0; i < arr->disks; i++) {
