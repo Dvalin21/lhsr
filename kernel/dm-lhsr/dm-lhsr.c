@@ -140,6 +140,7 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	__bio_add_page(bio, page, PAGE_SIZE, 0);
 
 	if (submit_bio_wait(bio) != 0) {
+		DMERR("Superblock read failed at sector %llu", (u64)sector);
 		bio_put(bio);
 		__free_page(page);
 		return -EIO;
@@ -163,6 +164,7 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		__bio_add_page(bio, page, PAGE_SIZE, 0);
 
 		if (submit_bio_wait(bio) != 0) {
+			DMERR("Superblock read failed at backup sector %llu", (u64)backup_sector);
 			bio_put(bio);
 			__free_page(page);
 			return -EIO;
