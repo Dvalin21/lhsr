@@ -26,3 +26,7 @@ lib/raid_engine/*.o
 *~
 *.swp
 *.swo
+
+# Worktrees
+.worktrees
+worktrees
