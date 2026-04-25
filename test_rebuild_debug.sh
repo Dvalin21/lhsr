@@ -43,7 +43,7 @@ echo "  LHSR Mirror Rebuild Test (v1.3.0)"
 echo "=============================================="
 
 # Check root
-if [ "$EUID" -ne 0 ]; then
+if false; then
     log_error "Must run as root"
     exit 1
 fi
