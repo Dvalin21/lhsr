@@ -25,6 +25,46 @@
 #define DM_MSG_PREFIX "lhsr"
 #define LHSR_VERSION "1.3.0"
 
+/* Timeout for BIO operations (5 seconds) */
+#define LHSR_BIO_TIMEOUT (5 * HZ)
+
+/* Completion-based BIO submission with timeout */
+struct lhsr_bio_ctx {
+	struct completion done;
+	int error;
+};
+
+static void lhsr_bio_complete(struct bio *bio)
+{
+	struct lhsr_bio_ctx *ctx = bio->bi_private;
+	ctx->error = bio->bi_status;
+	complete(&ctx->done);
+}
+
+/* Submit BIO with timeout - returns 0 on success, -errno on failure */
+static int lhsr_submit_bio_timeout(struct bio *bio)
+{
+	struct lhsr_bio_ctx ctx;
+	int ret;
+
+	init_completion(&ctx.done);
+	ctx.error = 0;
+	bio->bi_private = &ctx;
+	bio->bi_end_io = lhsr_bio_complete;
+
+	submit_bio(bio);
+
+	/* Wait up to LHSR_BIO_TIMEOUT for completion */
+	ret = wait_for_completion_timeout(&ctx.done, LHSR_BIO_TIMEOUT);
+	if (ret == 0) {
+		/* Timeout - BIO didn't complete */
+		DMERR("BIO timed out after %d seconds", LHSR_BIO_TIMEOUT / HZ);
+		return -ETIMEDOUT;
+	}
+
+	return ctx.error ? -EIO : 0;
+}
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
 MODULE_DESCRIPTION("Linux Hybrid Self-Healing RAID");
@@ -116,6 +156,7 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	void *buf;
 	sector_t sector;
 	u32 stored_csum, calc_csum;
+	int ret;
 
 	sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
 	DMINFO("lhsr_read_superblock: sector=0x%llx", sector);
@@ -130,13 +171,14 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	bio->bi_iter.bi_sector = sector;
 	__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-	DMINFO("lhsr_read_superblock: submitting bio");
-	if (submit_bio_wait(bio) != 0) {
-		bio_put(bio);
-		__free_page(page);
-		return -EIO;
-	}
+	DMINFO("lhsr_read_superblock: submitting bio with timeout");
+	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
+
+	if (ret != 0) {
+		__free_page(page);
+		return ret;
+	}
 
 	buf = page_address(page);
 	stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
@@ -154,12 +196,13 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		bio->bi_iter.bi_sector = backup_sector;
 		__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-		if (submit_bio_wait(bio) != 0) {
-			bio_put(bio);
-			__free_page(page);
-			return -EIO;
-		}
+		ret = lhsr_submit_bio_timeout(bio);
 		bio_put(bio);
+
+		if (ret != 0) {
+			__free_page(page);
+			return ret;
+		}
 
 		stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
 		*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
@@ -439,7 +482,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	bio->bi_iter.bi_sector = offset;
 	__bio_add_page(bio, page, LHSR_SCRUB_BLOCK_SIZE, 0);
 
-	ret = submit_bio_wait(bio);
+	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
 
 	if (ret == 0) {
@@ -612,9 +655,9 @@ static void rebuild_work(struct work_struct *work)
 	}
 	bio_set_dev(bio, arr->disk[source_disk]);
 	bio->bi_iter.bi_sector = offset;
-	__bio_add_page(bio, page, block_size, 0);
+	__bio_add_page(bio, page, block_size,0);
 
-	ret = submit_bio_wait(bio);
+	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
 
 	if (ret != 0) {
@@ -635,9 +678,9 @@ static void rebuild_work(struct work_struct *work)
 	}
 	bio_set_dev(bio, arr->disk[arr->rebuild_disk]);
 	bio->bi_iter.bi_sector = offset;
-	__bio_add_page(bio, page, block_size, 0);
+	__bio_add_page(bio, page, block_size,0);
 
-	ret = submit_bio_wait(bio);
+	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
 	__free_page(page);
 
