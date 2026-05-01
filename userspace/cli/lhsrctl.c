@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <linux/fs.h>
+#include <sys/wait.h>
 
 #include "../lib/raid_engine.h"
 
@@ -235,18 +236,22 @@ static int cmd_message(int argc, char **argv)
 		return 1;
 	}
 
-	/* Use execvp to avoid shell injection */
-	const char *dmsetup argv[] = {"dmsetup", "message", argv[2], argv[3],
-				    argc > 4 ? argv[4] : NULL, NULL};
-	ret = fork();
-	if (ret == 0) {
+	/* Use fork+execvp to avoid shell injection */
+	pid_t pid = fork();
+	if (pid == 0) {
 		/* Child process */
-		execvp("dmsetup", (char * const *)dmsetup_argv);
+		char *dmsetup_argv[5];
+		dmsetup_argv[0] = "dmsetup";
+		dmsetup_argv[1] = "message";
+		dmsetup_argv[2] = argv[2];
+		dmsetup_argv[3] = argv[3];
+		dmsetup_argv[4] = argc > 4 ? argv[4] : NULL;
+		execvp("dmsetup", dmsetup_argv);
 		exit(127);
-	} else if (ret > 0) {
+	} else if (pid > 0) {
 		/* Parent process */
 		int status;
-		waitpid(ret, &status, 0);
+		waitpid(pid, &status, 0);
 		return WEXITSTATUS(status) != 0;
 	}
 	return 1;

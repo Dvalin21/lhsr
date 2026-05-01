@@ -20,6 +20,7 @@
 #include <syslog.h>
 #include <time.h>
 #include <glob.h>
+#include <sys/wait.h>
 
 #include "../../lib/raid_engine.h"
 
@@ -116,7 +117,7 @@ static void log_status(const char *msg)
 }
 
 /* Execute command and get output - safe version using fork+exec+pipe */
-static int run_command(const char *const *argv, char *output, size_t out_size)
+static int run_command(const char *cmd, char *output, size_t out_size)
 {
     int pipefd[2];
     pid_t pid;
@@ -131,7 +132,28 @@ static int run_command(const char *const *argv, char *output, size_t out_size)
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         close(pipefd[1]);
-        execvp(argv[0], (char * const *)argv);
+        /* Build argv array from cmd */
+        char *argv[4];
+        argv[0] = "dmsetup";
+        argv[1] = "message";
+        /* Parse cmd to extract device and message */
+        char cmd_copy[512];
+        strncpy(cmd_copy, cmd, sizeof(cmd_copy)-1);
+        cmd_copy[sizeof(cmd_copy)-1] = '\0';
+        char *token = strtok(cmd_copy, " ");
+        int argc = 0;
+        while (token && argc < 3) {
+            if (argc >= 2) break;
+            token = strtok(NULL, " ");
+            argc++;
+        }
+        if (token) {
+            argv[2] = token;
+            argv[3] = NULL;
+        } else {
+            argv[2] = NULL;
+        }
+        execvp("dmsetup", argv);
         exit(127);
     } else if (pid > 0) {
         /* Parent process */
@@ -168,11 +190,12 @@ static int poll_smart_data(const char *device, struct lhsr_smart_data *smart)
     smart->health = 100;
 
     /* Use smartctl directly with -A flag, then parse output */
-    /* We'll run smartctl and filter with grep - no shell pipeline needed */
-    const char *argv[] = {"smartctl", "-A", device, NULL};
+    /* Build command string */
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "smartctl -A %s", device);
     output[0] = '\0';
 
-    ret = run_command(argv, output, sizeof(output));
+    ret = run_command(cmd, output, sizeof(output));
     if (ret != 0 || output[0] == '\0') {
         syslog(LOG_WARNING, "Failed to run smartctl on %s", device);
         return -1;
