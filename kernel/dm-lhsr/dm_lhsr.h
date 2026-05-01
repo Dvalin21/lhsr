@@ -14,6 +14,9 @@
 #include <linux/device-mapper.h>
 #include <linux/list.h>
 
+/* Workqueue timeout in jiffies (5 seconds) */
+#define LHSR_WORKQUEUE_TIMEOUT (5 * HZ)
+
 /* RAID states */
 #define LHSR_STATE_OFFLINE    0
 #define LHSR_STATE_ONLINE     1

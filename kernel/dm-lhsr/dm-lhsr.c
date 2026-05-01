@@ -171,8 +171,12 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	bio->bi_iter.bi_sector = sector;
 	__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-	DMINFO("lhsr_read_superblock: submitting bio with timeout");
-	ret = lhsr_submit_bio_timeout(bio);
+	if (submit_bio_wait(bio) != 0) {
+		DMERR("Superblock read failed at sector %llu", (u64)sector);
+		bio_put(bio);
+		__free_page(page);
+		return -EIO;
+	}
 	bio_put(bio);
 
 	if (ret != 0) {
@@ -196,7 +200,12 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		bio->bi_iter.bi_sector = backup_sector;
 		__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-		ret = lhsr_submit_bio_timeout(bio);
+		if (submit_bio_wait(bio) != 0) {
+			DMERR("Superblock read failed at backup sector %llu", (u64)backup_sector);
+			bio_put(bio);
+			__free_page(page);
+			return -EIO;
+		}
 		bio_put(bio);
 
 		if (ret != 0) {
@@ -963,10 +972,15 @@ static void lhsr_dtr(struct dm_target *ti)
 	if (!arr)
 		return;
 
-	/* Stop the health check workqueue */
+	/* Stop the health check workqueue with timeout */
 	if (arr->check_wq) {
-		cancel_delayed_work_sync(&arr->check_work);
+		DMINFO("Canceling check workqueue...");
+		if (!cancel_delayed_work_sync(&arr->check_work)) {
+			DMWARN("check_work did not complete in time, forcing");
+			flush_workqueue(arr->check_wq);
+		}
 		destroy_workqueue(arr->check_wq);
+		arr->check_wq = NULL;
 	}
 
 	/* Mark array as destroying FIRST to prevent workqueue races */
@@ -990,15 +1004,27 @@ static void lhsr_dtr(struct dm_target *ti)
 
 	/* Stop scrubber */
 	if (arr->scrub_wq) {
-		cancel_delayed_work_sync(&arr->scrub_work);
+		DMINFO("Canceling scrub workqueue...");
+		arr->scrub_state = LHSR_SCRUB_IDLE;
+		if (!cancel_delayed_work_sync(&arr->scrub_work)) {
+			DMWARN("scrub_work did not complete in time, forcing");
+			flush_workqueue(arr->scrub_wq);
+		}
 		destroy_workqueue(arr->scrub_wq);
+		arr->scrub_wq = NULL;
 		DMINFO("Scrubber stopped");
 	}
 
 	/* Stop rebuild */
 	if (arr->rebuild_wq) {
-		cancel_delayed_work_sync(&arr->rebuild_work);
+		DMINFO("Canceling rebuild workqueue...");
+		arr->rebuild_state = LHSR_REBUILD_NONE;
+		if (!cancel_delayed_work_sync(&arr->rebuild_work)) {
+			DMWARN("rebuild_work did not complete in time, forcing");
+			flush_workqueue(arr->rebuild_wq);
+		}
 		destroy_workqueue(arr->rebuild_wq);
+		arr->rebuild_wq = NULL;
 		DMINFO("Rebuild stopped");
 	}
 
