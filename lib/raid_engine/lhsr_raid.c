@@ -69,10 +69,45 @@ uint32_t lhsr_checksum_crc32c(const void *data, size_t len)
 		crc ^= *p++;
 		for (int i = 0; i < 8; i++) {
 			if (crc & 1)
-				crc = (crc >> 1) ^ 0xEDB88320;
+				crc = (crc >> 1) ^ 0x82F63B78;  /* CRC32C (Castagnoli) - matches kernel */
 			else
 				crc >>= 1;
 		}
+	}
+
+	return ~crc;
+}
+/* CRC32C table lookup for faster computation */
+static uint32_t crc32c_table[256];
+static int crc32c_table_initialized = 0;
+
+static void init_crc32c_table(void)
+{
+	if (crc32c_table_initialized)
+		return;
+
+	for (int i = 0; i < 256; i++) {
+		uint32_t crc = i;
+		for (int j = 0; j < 8; j++) {
+			if (crc & 1)
+				crc = (crc >> 1) ^ 0x82F63B78;
+			else
+				crc >>= 1;
+		}
+		crc32c_table[i] = crc;
+	}
+	crc32c_table_initialized = 1;
+}
+
+uint32_t lhsr_checksum_crc32c_fast(const void *data, size_t len)
+{
+	const uint8_t *p = data;
+	uint32_t crc = 0xFFFFFFFF;
+
+	init_crc32c_table();
+
+	while (len--) {
+		crc = crc32c_table[(crc ^ *p++) & 0xFF] ^ (crc >> 8);
 	}
 
 	return ~crc;

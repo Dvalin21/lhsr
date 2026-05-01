@@ -1020,7 +1020,6 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 {
 	struct lhsr_array *arr = ti->private;
 	sector_t offset;
-	struct bio *clone = NULL;
 
 	if (!arr || arr->state == LHSR_STATE_OFFLINE) {
 		bio->bi_status = BLK_STS_IOERR;

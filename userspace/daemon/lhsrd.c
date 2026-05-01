@@ -115,26 +115,50 @@ static void log_status(const char *msg)
         syslog(LOG_DEBUG, "%s", msg);
 }
 
-/* Execute command and get output */
-static int run_command(const char *cmd, char *output, size_t out_size)
+/* Execute command and get output - safe version using fork+exec+pipe */
+static int run_command(const char *const *argv, char *output, size_t out_size)
 {
-    FILE *p = popen(cmd, "r");
-    if (!p)
+    int pipefd[2];
+    pid_t pid;
+    int status;
+
+    if (pipe(pipefd) == -1)
         return -1;
 
-    if (output && fgets(output, out_size, p))
-        output[strlen(output) - 1] = '\0';
-
-    int ret = pclose(p);
-    return WEXITSTATUS(ret);
+    pid = fork();
+    if (pid == 0) {
+        /* Child process */
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        execvp(argv[0], (char * const *)argv);
+        exit(127);
+    } else if (pid > 0) {
+        /* Parent process */
+        close(pipefd[1]);
+        if (output) {
+            ssize_t n = read(pipefd[0], output, out_size - 1);
+            if (n > 0) {
+                output[n] = '\0';
+                /* Remove trailing newline */
+                if (n > 0 && output[n-1] == '\n')
+                    output[n-1] = '\0';
+            } else {
+                output[0] = '\0';
+            }
+        }
+        close(pipefd[0]);
+        waitpid(pid, &status, 0);
+        return WEXITSTATUS(status);
+    }
+    return -1;
 }
 
 /* Poll SMART data from a disk - supports both SATA and NVMe */
 static int poll_smart_data(const char *device, struct lhsr_smart_data *smart)
 {
-    char cmd[512];
     char line[256];
-    FILE *p;
+    char output[4096];
     int ret = -1;
 
     smart->reallocated = 0;
@@ -143,37 +167,36 @@ static int poll_smart_data(const char *device, struct lhsr_smart_data *smart)
     smart->temperature = 0;
     smart->health = 100;
 
-    /* Check if NVMe device */
-    if (strstr(device, "nvme")) {
-        snprintf(cmd, sizeof(cmd),
-            "smartctl -A %s 2>/dev/null | grep -E 'Reallocated_Sector_Ct|Pending_Sector|Offline_Uncorrectable|Temperature_Celsius'",
-            device);
-    } else {
-        /* SATA device - extract drive letter */
-        snprintf(cmd, sizeof(cmd),
-            "smartctl -A /dev/sd%c 2>/dev/null | grep -E 'Reallocated_Sector_Ct|Pending_Sector|Offline_Uncorrectable|Temperature_Celsius'",
-            device[strlen(device) - 1]);
-    }
+    /* Use smartctl directly with -A flag, then parse output */
+    /* We'll run smartctl and filter with grep - no shell pipeline needed */
+    const char *argv[] = {"smartctl", "-A", device, NULL};
+    output[0] = '\0';
 
-    p = popen(cmd, "r");
-    if (!p)
+    ret = run_command(argv, output, sizeof(output));
+    if (ret != 0 || output[0] == '\0') {
+        syslog(LOG_WARNING, "Failed to run smartctl on %s", device);
         return -1;
-
-    while (fgets(line, sizeof(line), p)) {
-        if (sscanf(line, "%d %d", &ret, &smart->reallocated) == 2) {
-            continue;
-        }
-        if (strstr(line, "Reallocated")) {
-            sscanf(line, "%*s %d", &smart->reallocated);
-        } else if (strstr(line, "Pending")) {
-            sscanf(line, "%*s %d", &smart->pending);
-        } else if (strstr(line, "Uncorrectable")) {
-            sscanf(line, "%*s %d", &smart->uncorrectable);
-        } else if (strstr(line, "Temperature")) {
-            sscanf(line, "%*s %d", &smart->temperature);
-        }
     }
-    pclose(p);
+
+    /* Parse smartctl output */
+    char *pos = output;
+    while (pos && *pos) {
+        char *next_line = strchr(pos, '\n');
+        if (next_line) *next_line = '\0';
+
+        if (strstr(pos, "Reallocated_Sector_Ct")) {
+            sscanf(pos, "%*s %*s %d", &smart->reallocated);
+        } else if (strstr(pos, "Current_Pending_Sector")) {
+            sscanf(pos, "%*s %*s %d", &smart->pending);
+        } else if (strstr(pos, "Offline_Uncorrectable")) {
+            sscanf(pos, "%*s %*s %d", &smart->uncorrectable);
+        } else if (strstr(pos, "Temperature_Celsius")) {
+            sscanf(pos, "%*s %*s %d", &smart->temperature);
+        }
+
+        if (!next_line) break;
+        pos = next_line + 1;
+    }
 
     if (smart->reallocated > SMART_REALLOCATED_THRESHOLD)
         smart->health -= 30;

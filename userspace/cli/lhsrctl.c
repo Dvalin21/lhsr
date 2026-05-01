@@ -215,7 +215,6 @@ static int cmd_bitrot_log(int argc, char **argv)
 /* Message command - send message to kernel via dmsetup */
 static int cmd_message(int argc, char **argv)
 {
-	char cmd[256];
 	int ret;
 
 	if (argc < 4) {
@@ -224,11 +223,33 @@ static int cmd_message(int argc, char **argv)
 		return 1;
 	}
 
-	snprintf(cmd, sizeof(cmd), "dmsetup message %s %s %s",
-		argv[2], argv[3], argc > 4 ? argv[4] : "");
+	/* Validate device path and message for basic safety */
+	if (strchr(argv[2], '`') || strchr(argv[2], '$') ||
+	    strchr(argv[2], ';') || strchr(argv[2], '|')) {
+		fprintf(stderr, "Error: Invalid characters in device path\n");
+		return 1;
+	}
+	if (strchr(argv[3], '`') || strchr(argv[3], '$') ||
+	    strchr(argv[3], ';') || strchr(argv[3], '|')) {
+		fprintf(stderr, "Error: Invalid characters in message\n");
+		return 1;
+	}
 
-	ret = system(cmd);
-	return ret != 0;
+	/* Use execvp to avoid shell injection */
+	const char *dmsetup argv[] = {"dmsetup", "message", argv[2], argv[3],
+				    argc > 4 ? argv[4] : NULL, NULL};
+	ret = fork();
+	if (ret == 0) {
+		/* Child process */
+		execvp("dmsetup", (char * const *)dmsetup_argv);
+		exit(127);
+	} else if (ret > 0) {
+		/* Parent process */
+		int status;
+		waitpid(ret, &status, 0);
+		return WEXITSTATUS(status) != 0;
+	}
+	return 1;
 }
 
 /* Command scrub */
@@ -344,44 +365,103 @@ int main(int argc, char **argv)
 				PROGNAME);
 			return 1;
 		}
-		char cmd[256];
-		snprintf(cmd, sizeof(cmd), "dmsetup message %s disk_fail %s",
-			argv[2], argv[3]);
-		ret = system(cmd);
-		if (ret == 0)
-			printf("Disk %s marked as failed\n", argv[3]);
-		return ret;
+		/* Validate inputs */
+		if (strchr(argv[2], '`') || strchr(argv[2], '$') ||
+		    strchr(argv[2], ';') || strchr(argv[2], '|')) {
+			fprintf(stderr, "Error: Invalid characters in device\n");
+			return 1;
+		}
+		if (strchr(argv[3], '`') || strchr(argv[3], '$') ||
+		    strchr(argv[3], ';') || strchr(argv[3], '|')) {
+			fprintf(stderr, "Error: Invalid characters in disk index\n");
+			return 1;
+		}
+		const char *dmsetup_argv[] = {"dmsetup", "message", argv[2], "disk_fail", argv[3], NULL};
+		ret = fork();
+		if (ret == 0) {
+			execvp("dmsetup", (char * const *)dmsetup_argv);
+			exit(127);
+		} else if (ret > 0) {
+			int status;
+			waitpid(ret, &status, 0);
+			if (WEXITSTATUS(status) == 0)
+				printf("Disk %s marked as failed\n", argv[3]);
+			return WEXITSTATUS(status);
+		}
+		return 1;
 	} else if (strcmp(argv[1], "disk-online") == 0) {
 		if (argc < 4) {
 			fprintf(stderr, "Usage: %s disk-online <device> <disk_idx>\n",
 				PROGNAME);
 			return 1;
 		}
-		char cmd[256];
-		snprintf(cmd, sizeof(cmd), "dmsetup message %s disk_online %s",
-			argv[2], argv[3]);
-		ret = system(cmd);
-		if (ret == 0)
-			printf("Disk %s marked as online\n", argv[3]);
-		return ret;
+		/* Validate inputs */
+		if (strchr(argv[2], '`') || strchr(argv[2], '$') ||
+		    strchr(argv[2], ';') || strchr(argv[2], '|')) {
+			fprintf(stderr, "Error: Invalid characters in device\n");
+			return 1;
+		}
+		if (strchr(argv[3], '`') || strchr(argv[3], '$') ||
+		    strchr(argv[3], ';') || strchr(argv[3], '|')) {
+			fprintf(stderr, "Error: Invalid characters in disk index\n");
+			return 1;
+		}
+		const char *dmsetup_argv[] = {"dmsetup", "message", argv[2], "disk_online", argv[3], NULL};
+		ret = fork();
+		if (ret == 0) {
+			execvp("dmsetup", (char * const *)dmsetup_argv);
+			exit(127);
+		} else if (ret > 0) {
+			int status;
+			waitpid(ret, &status, 0);
+			if (WEXITSTATUS(status) == 0)
+				printf("Disk %s marked as online\n", argv[3]);
+			return WEXITSTATUS(status);
+		}
+		return 1;
 	} else if (strcmp(argv[1], "disk-health") == 0) {
 		if (argc < 4) {
 			fprintf(stderr, "Usage: %s disk-health <device> <disk_idx>\n",
 				PROGNAME);
 			return 1;
 		}
-		char cmd[256];
-		char buf[256];
-		FILE *p;
-
-		snprintf(cmd, sizeof(cmd), "dmsetup message %s disk_health %s",
-			argv[2], argv[3]);
-		p = popen(cmd, "r");
-		if (p) {
-			if (fgets(buf, sizeof(buf), p))
+		/* Validate inputs */
+		if (strchr(argv[2], '`') || strchr(argv[2], '$') ||
+		    strchr(argv[2], ';') || strchr(argv[2], '|')) {
+			fprintf(stderr, "Error: Invalid characters in device\n");
+			return 1;
+		}
+		if (strchr(argv[3], '`') || strchr(argv[3], '$') ||
+		    strchr(argv[3], ';') || strchr(argv[3], '|')) {
+			fprintf(stderr, "Error: Invalid characters in disk index\n");
+			return 1;
+		}
+		/* Use pipe() + fork() + execvp() instead of popen() */
+		int pipefd[2];
+		if (pipe(pipefd) == -1)
+			return 1;
+		ret = fork();
+		if (ret == 0) {
+			/* Child: redirect stdout to pipe, exec dmsetup */
+			close(pipefd[0]);
+			dup2(pipefd[1], STDOUT_FILENO);
+			close(pipefd[1]);
+			const char *dmsetup_argv[] = {"dmsetup", "message", argv[2], "disk_health", argv[3], NULL};
+			execvp("dmsetup", (char * const *)dmsetup_argv);
+			exit(127);
+		} else if (ret > 0) {
+			/* Parent: read from pipe */
+			char buf[256];
+			ssize_t n;
+			close(pipefd[1]);
+			while ((n = read(pipefd[0], buf, sizeof(buf)-1)) > 0) {
+				buf[n] = '\0';
 				printf("%s", buf);
-			pclose(p);
-			return 0;
+			}
+			close(pipefd[0]);
+			int status;
+			waitpid(ret, &status, 0);
+			return WEXITSTATUS(status);
 		}
 		return 1;
 	} else if (strcmp(argv[1], "message") == 0) {
