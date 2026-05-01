@@ -379,7 +379,7 @@ static void lhsr_io_complete(struct bio *bio)
 	}
 
 out:
-	bio_put(bio);
+	bio_endio(bio);
 }
 
 /* Fast hash for UUID generation */
