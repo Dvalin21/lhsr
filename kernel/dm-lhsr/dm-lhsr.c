@@ -969,76 +969,100 @@ static void lhsr_dtr(struct dm_target *ti)
 	unsigned int i;
 	int r;
 
-	if (!arr)
+	DMINFO("dtr: START - arr=%p", arr);
+
+	if (!arr) {
+		DMINFO("dtr: arr is NULL, returning");
 		return;
+	}
+
+	DMINFO("dtr: Stopping health check workqueue (check_wq=%p)", arr->check_wq);
 
 	/* Stop the health check workqueue with timeout */
 	if (arr->check_wq) {
-		DMINFO("Canceling check workqueue...");
+		DMINFO("dtr: Canceling check workqueue...");
 		if (!cancel_delayed_work_sync(&arr->check_work)) {
-			DMWARN("check_work did not complete in time, forcing");
+			DMWARN("dtr: check_work did not complete in time, forcing");
 			flush_workqueue(arr->check_wq);
 		}
 		destroy_workqueue(arr->check_wq);
 		arr->check_wq = NULL;
+		DMINFO("dtr: check workqueue destroyed");
 	}
 
 	/* Mark array as destroying FIRST to prevent workqueue races */
+	DMINFO("dtr: Setting destroying flag");
 	atomic_set(&arr->destroying, 1);
+
+	DMINFO("dtr: Writing superblocks for %u disks", arr->disks);
 
 	/* Write updated superblocks for all disks before destroying */
 	arr->generation++;
 	for (i = 0; i < arr->disks; i++) {
 		struct lhsr_superblock *sb = &arr->sbs[i];
 
+		DMINFO("dtr: Processing disk %u", i);
 		sb->last_update = ktime_get_real_seconds();
 		sb->generation = arr->generation;
 		sb->disk_state = (arr->failed_disks & (1 << i)) ? LHSR_DISK_DEGRADED : LHSR_DISK_HEALTHY;
 
+		DMINFO("dtr: Writing superblock for disk %u", i);
 		r = lhsr_write_superblock(arr->disk[i], sb, arr->size);
 		if (r)
-			DMERR("Failed to persist superblock for disk %u: %d", i, r);
+			DMERR("dtr: Failed to persist superblock for disk %u: %d", i, r);
 		else
-			DMINFO("Persisted state for disk %u (gen=%llu)", i, sb->generation);
+			DMINFO("dtr: Persisted state for disk %u (gen=%llu)", i, sb->generation);
 	}
+
+	DMINFO("dtr: Stopping scrubber (scrub_wq=%p)", arr->scrub_wq);
 
 	/* Stop scrubber */
 	if (arr->scrub_wq) {
-		DMINFO("Canceling scrub workqueue...");
+		DMINFO("dtr: Canceling scrub workqueue...");
 		arr->scrub_state = LHSR_SCRUB_IDLE;
 		if (!cancel_delayed_work_sync(&arr->scrub_work)) {
-			DMWARN("scrub_work did not complete in time, forcing");
+			DMWARN("dtr: scrub_work did not complete in time, forcing");
 			flush_workqueue(arr->scrub_wq);
 		}
 		destroy_workqueue(arr->scrub_wq);
 		arr->scrub_wq = NULL;
-		DMINFO("Scrubber stopped");
+		DMINFO("dtr: Scrubber stopped");
 	}
+
+	DMINFO("dtr: Stopping rebuild (rebuild_wq=%p)", arr->rebuild_wq);
 
 	/* Stop rebuild */
 	if (arr->rebuild_wq) {
-		DMINFO("Canceling rebuild workqueue...");
+		DMINFO("dtr: Canceling rebuild workqueue...");
 		arr->rebuild_state = LHSR_REBUILD_NONE;
 		if (!cancel_delayed_work_sync(&arr->rebuild_work)) {
-			DMWARN("rebuild_work did not complete in time, forcing");
+			DMWARN("dtr: rebuild_work did not complete in time, forcing");
 			flush_workqueue(arr->rebuild_wq);
 		}
 		destroy_workqueue(arr->rebuild_wq);
 		arr->rebuild_wq = NULL;
-		DMINFO("Rebuild stopped");
+		DMINFO("dtr: Rebuild stopped");
 	}
 
+	DMINFO("dtr: Putting devices...");
+
 	for (i = 0; i < arr->disks; i++) {
-		if (arr->dm_devs[i])
+		DMINFO("dtr: Putting device %u (dm_devs[%u]=%p)", i, i, arr->dm_devs[i]);
+		if (arr->dm_devs[i]) {
 			dm_put_device(ti, arr->dm_devs[i]);
+			DMINFO("dtr: Device %u released", i);
+		}
 	}
+
+	DMINFO("dtr: Destroying mutex");
 
 	/* Destroy concurrency primitives */
 	mutex_destroy(&arr->io_mutex);
 
+	DMINFO("dtr: Freeing arr %p", arr);
 	kfree(arr);
 	ti->private = NULL;
-	DMINFO("Destroyed LHSR target");
+	DMINFO("dtr: END - Destroyed LHSR target");
 }
 
 /* Map function - with error tracking */
