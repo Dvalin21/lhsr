@@ -1918,5 +1918,48 @@ static void __exit lhsr_exit(void)
 	DMINFO("Module unloaded");
 }
 
+/*
+ * Reed-Solomon P+Q parity for RAID6
+ * P = XOR of all data blocks (same as RAID5)
+ * Q = sum of (2^i * data[i]) where coefficient is 2^i in GF(2^8)
+ */
+static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
+                         unsigned int data_disks, size_t len)
+{
+	u8 *p = parity_p;
+	u8 *q = parity_q;
+	u8 **src = (u8 **)data;
+	unsigned int i, j;
+
+	/* Initialize P and Q with first data block */
+	memcpy(p, src[0], len);
+	memcpy(q, src[0], len);
+
+	/* For each remaining data block, compute P and Q */
+	for (i = 1; i < data_disks; i++) {
+		u8 *s = src[i];
+
+		/* P = XOR (same as RAID5) */
+		for (j = 0; j < len; j++)
+			p[j] ^= s[j];
+
+		/*
+		 * Q = sum of (2^i * data[i]) in GF(2^8)
+		 * For RAID6: Q_i = 2^i * D_i (multiplication in GF(2^8))
+		 * Simplified: multiply by 2^i using primitive polynomial 0x11d
+		 */
+		for (j = 0; j < len; j++) {
+			/* Multiply by 2^i in GF(2^8) */
+			u8 val = s[j];
+			unsigned int k;
+			for (k = 0; k < i; k++) {
+				/* Multiply by 2 in GF(2^8) with primitive polynomial 0x11d */
+				val = (val << 1) ^ (val & 0x80 ? 0x1d : 0);
+			}
+			q[j] ^= val;
+		}
+	}
+}
+
 module_init(lhsr_init);
 module_exit(lhsr_exit);
