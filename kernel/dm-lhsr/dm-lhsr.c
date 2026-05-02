@@ -364,6 +364,11 @@ struct lhsr_array {
 };
 
 static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx, u32 new_state);
+static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
+static void *lhsr_alloc_parity_buf(size_t size);
+static void lhsr_free_parity_buf(void *buf);
+static int lhsr_alloc_data_bufs(struct lhsr_array *arr, size_t size);
+static void lhsr_free_data_bufs(struct lhsr_array *arr);
 
 /* I/O context to save original completion */
 struct lhsr_io_ctx {
@@ -1199,6 +1204,10 @@ static void lhsr_dtr(struct dm_target *ti)
 
 	DMINFO("dtr: Destroying mutex");
 
+	/* Free RAID5 write tracking buffers */
+	lhsr_free_parity_buf(arr->parity_buf);
+	lhsr_free_data_bufs(arr);
+
 	/* Destroy concurrency primitives */
 	mutex_destroy(&arr->io_mutex);
 
@@ -1214,18 +1223,75 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 	u8 *p = parity;
 	u8 **src = (u8 **)data;
 	unsigned int i, j;
+	size_t long_words = len / sizeof(long);
+	size_t rem_bytes = len % sizeof(long);
 
 	/* Initialize parity with first data block */
 	memcpy(p, src[0], len);
 
-	/* XOR remaining data blocks */
+	/* XOR remaining data blocks using long words */
 	for (i = 1; i < data_disks; i++) {
-		for (j = 0; j < len; j += sizeof(long)) {
-			long *p_long = (long *)(p + j);
-			long *s_long = (long *)(src[i] + j);
-			*p_long ^= *s_long;
+		long *p_long = (long *)p;
+		long *s_long = (long *)src[i];
+		for (j = 0; j < long_words; j++)
+			p_long[j] ^= s_long[j];
+	}
+
+	/* Handle remaining bytes */
+	if (rem_bytes) {
+		size_t offset = long_words * sizeof(long);
+		for (i = 1; i < data_disks; i++) {
+			for (j = 0; j < rem_bytes; j++)
+				p[offset + j] ^= src[i][offset + j];
 		}
 	}
+}
+
+/* RAID5 parity helpers */
+static void *lhsr_alloc_parity_buf(size_t size)
+{
+	return kzalloc(size, GFP_NOIO);
+}
+
+static void lhsr_free_parity_buf(void *buf)
+{
+	kfree(buf);
+}
+
+static int lhsr_alloc_data_bufs(struct lhsr_array *arr, size_t size)
+{
+	unsigned int data_disks = arr->disks - 1;
+	int i;
+
+	arr->data_bufs = kcalloc(data_disks, sizeof(void *), GFP_NOIO);
+	if (!arr->data_bufs)
+		return -ENOMEM;
+
+	for (i = 0; i < data_disks; i++) {
+		arr->data_bufs[i] = kzalloc(size, GFP_NOIO);
+		if (!arr->data_bufs[i]) {
+			while (--i >= 0)
+				kfree(arr->data_bufs[i]);
+			kfree(arr->data_bufs);
+			arr->data_bufs = NULL;
+			return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
+static void lhsr_free_data_bufs(struct lhsr_array *arr)
+{
+	unsigned int data_disks = arr->disks - 1;
+	int i;
+
+	if (!arr->data_bufs)
+		return;
+
+	for (i = 0; i < data_disks; i++)
+		kfree(arr->data_bufs[i]);
+	kfree(arr->data_bufs);
+	arr->data_bufs = NULL;
 }
 
 /* Map function - with error tracking */
