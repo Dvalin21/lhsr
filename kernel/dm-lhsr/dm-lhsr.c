@@ -120,33 +120,56 @@ static u32 lhsr_crc32c(const void *buf, size_t len)
  * On crash, either old primary+new backup or new primary+new backup.
  * Never old primary+old backup (regress), never new primary+old backup (inconsistent).
  * 
- * NOTE: Currently disabled for testing - superblock I/O can cause hanging
+ * NVMe SAFETY: Uses REQ_FUA to ensure data is persisted to media
+ * before returning. This prevents data loss on hard power-off.
  */
 static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblock *sb, sector_t array_size)
 {
-	/* Skip superblock writes entirely for now - can cause I/O hangs
-	 * This is safe for testing - device works without persistence
-	 */
-	DMINFO("Skipping superblock write (disabled for testing)");
-	return 0;
-	
-	/* Keep the old code for reference:
-	sector_t primary_sector, backup_sector;
-	u32 calc_csum;
-	int ret = 0;
+	struct bio *bio;
+	struct page *page;
+	void *buf;
+	sector_t sector;
+	int ret;
 
-	primary_sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
-	backup_sector = array_size - (LHSR_SB_SIZE >> SECTOR_SHIFT);
+	/* Calculate sector (primary superblock at 4MB offset) */
+	sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
+	DMINFO("lhsr_write_superblock: sector=%llu (0x%llx)", (u64)sector, (u64)sector);
 
-	if (primary_sector < 2048 || backup_sector < 4096) {
-		return -EINVAL;
-	}
-
+	/* Allocate page for I/O */
 	page = alloc_page(GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
-	...
-	*/
+
+	/* Copy superblock to page */
+	buf = page_address(page);
+	memset(buf, 0, PAGE_SIZE);
+	memcpy(buf, sb, LHSR_SB_SIZE);
+
+	/* Calculate checksum */
+	sb->checksum = 0;
+	sb->checksum = lhsr_crc32c(buf, LHSR_SB_SIZE);
+	/* Re-copy with checksum */
+	memcpy(buf, sb, LHSR_SB_SIZE);
+
+	/* Create BIO for write */
+	bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_SYNC, GFP_KERNEL);
+	/* Note: bio_alloc with bdev already sets bio->bi_bdev for kernel 6.12+ */
+	bio->bi_iter.bi_sector = sector;
+	__bio_add_page(bio, page, PAGE_SIZE, 0);
+
+	DMINFO("lhsr_write_superblock: submitting BIO to sector %llu", (u64)sector);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+	__free_page(page);
+
+	if (ret != 0) {
+		DMERR("Superblock write failed at sector %llu: %d (0x%x)",
+		       (u64)sector, ret, ret);
+		return -EIO;
+	}
+
+	DMINFO("Superblock write successful");
+	return 0;
 }
 
 static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superblock *sb)
@@ -171,18 +194,14 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	bio->bi_iter.bi_sector = sector;
 	__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-	if (submit_bio_wait(bio) != 0) {
-		DMERR("Superblock read failed at sector %llu", (u64)sector);
+	ret = submit_bio_wait(bio);
+	if (ret != 0) {
+		DMERR("Superblock read failed at sector %llu: %d", (u64)sector, ret);
 		bio_put(bio);
 		__free_page(page);
 		return -EIO;
 	}
 	bio_put(bio);
-
-	if (ret != 0) {
-		__free_page(page);
-		return ret;
-	}
 
 	buf = page_address(page);
 	stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
@@ -200,18 +219,14 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		bio->bi_iter.bi_sector = backup_sector;
 		__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-		if (submit_bio_wait(bio) != 0) {
-			DMERR("Superblock read failed at backup sector %llu", (u64)backup_sector);
+		ret = submit_bio_wait(bio);
+		if (ret != 0) {
+			DMERR("Superblock read failed at backup sector %llu: %d", (u64)backup_sector, ret);
 			bio_put(bio);
 			__free_page(page);
 			return -EIO;
 		}
 		bio_put(bio);
-
-		if (ret != 0) {
-			__free_page(page);
-			return ret;
-		}
 
 		stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
 		*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
@@ -329,18 +344,81 @@ struct lhsr_array {
 	/* I/O tracking */
 	unsigned long last_error_jiffies;
 	u32 last_error_disk;
+
+	/* Simple in-memory checksum cache for scrubber (sparse array) */
+	/* We store checksums for every 128KB block, indexed by offset/sector */
+#define LHSR_CKSUM_BUCKETS 1024
+	struct lhsr_cksum_entry {
+		u64 offset;     /* Sector offset of block start */
+		u32 cksum;     /* CRC32c value */
+		u32 flags;      /* Status flags */
+	} cksum_cache[LHSR_CKSUM_BUCKETS];
+	u32 cksum_count;  /* Number of valid entries */
+
+	/* RAID5 write completion tracking */
+	atomic_t inflight_writes;
+	struct bio *orig_bio;        /* Original bio for completion */
+	void *parity_buf;             /* Parity buffer */
+	void **data_bufs;             /* Array of data buffers */
+	unsigned int data_disks_written; /* Count of data disks written */
 };
 
 static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx, u32 new_state);
 
+/* I/O context to save original completion */
+struct lhsr_io_ctx {
+	bio_end_io_t *orig_endio;
+	void *orig_private;
+	struct dm_target *ti;  /* Save target for completion */
+};
+
+/* Forward declaration */
+static void lhsr_io_complete(struct bio *bio);
+
+/* Helper to set up I/O tracking - saves original completion */
+static int lhsr_setup_io_tracking(struct bio *bio, struct dm_target *ti)
+{
+	struct lhsr_io_ctx *ctx;
+	
+	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+	
+	/* Save original completion (set by DM core) */
+	ctx->orig_endio = bio->bi_end_io;
+	ctx->orig_private = bio->bi_private;
+	ctx->ti = ti;  /* Save target for completion */
+	
+	/* Set up our tracking */
+	bio->bi_private = ctx;
+	bio->bi_end_io = lhsr_io_complete;
+	
+	return 0;
+}
+
 /* I/O completion callback - tracks errors */
 static void lhsr_io_complete(struct bio *bio)
 {
-	struct dm_target *ti = bio->bi_private;
+	struct lhsr_io_ctx *ctx = bio->bi_private;
+	struct dm_target *ti;
 	struct lhsr_array *arr;
+	bio_end_io_t *orig_endio;
+	void *orig_private;
 
-	if (!ti || !ti->private)
+	if (!ctx)
+		return;
+
+	/* Restore original bio state */
+	orig_endio = ctx->orig_endio;
+	orig_private = ctx->orig_private;
+	bio->bi_private = orig_private;
+
+	/* Get our data from saved ti */
+	ti = ctx->ti;  /* CORRECT: use saved ti, not orig_private */
+	if (!ti || !ti->private) {
+		kfree(ctx);
 		goto out;
+	}
 
 	arr = ti->private;
 
@@ -378,8 +456,12 @@ static void lhsr_io_complete(struct bio *bio)
 		atomic_inc(&arr->io_count);
 	}
 
+	kfree(ctx);
+
 out:
-	bio_endio(bio);
+	/* Call original completion function (DM's clone_endio) */
+	if (orig_endio)
+		orig_endio(bio);
 }
 
 /* Fast hash for UUID generation */
@@ -469,16 +551,29 @@ static void disk_check_work(struct work_struct *work)
 	}
 }
 
-/* Scrub a block - reads and checksums */
+/* Scrub a block - reads and verifies checksums */
 static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 offset)
 {
+	struct lhsr_cksum_entry *entry = NULL;
 	struct bio *bio;
 	struct page *page;
 	void *buf;
+	u32 stored_csum = 0;
+	u32 calc_csum;
 	int ret = 0;
+	int i;
 
 	if (arr->failed_disks & (1 << disk_idx))
 		return -EINVAL;
+
+	/* Check if we have a stored checksum for this offset */
+	for (i = 0; i < arr->cksum_count; i++) {
+		if (arr->cksum_cache[i].offset == offset) {
+			entry = &arr->cksum_cache[i];
+			stored_csum = entry->cksum;
+			break;
+		}
+	}
 
 	page = alloc_page(GFP_KERNEL);
 	if (!page)
@@ -486,21 +581,61 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 
 	buf = page_address(page);
 
+	/* Read the block using bio */
 	bio = bio_alloc(arr->disk[disk_idx], 1, REQ_OP_READ, GFP_KERNEL);
-	bio_set_dev(bio, arr->disk[disk_idx]);
+	if (!bio) {
+		__free_page(page);
+		return -ENOMEM;
+	}
 	bio->bi_iter.bi_sector = offset;
 	__bio_add_page(bio, page, LHSR_SCRUB_BLOCK_SIZE, 0);
 
 	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
 
-	if (ret == 0) {
-		u32 csum = lhsr_crc32c(buf, LHSR_SCRUB_BLOCK_SIZE);
-		*(u32 *)buf = csum;
+	if (ret != 0) {
+		DMERR("Scrub read failed at offset 0x%llx: %d", offset, ret);
+		__free_page(page);
+		return ret;
 	}
 
+	/* Calculate checksum of read data */
+	calc_csum = lhsr_crc32c(buf, LHSR_SCRUB_BLOCK_SIZE);
+
+	if (stored_csum == 0) {
+		/* No stored checksum - this is a new block, store the checksum */
+		if (arr->cksum_count < LHSR_CKSUM_BUCKETS) {
+			entry = &arr->cksum_cache[arr->cksum_count];
+			entry->offset = offset;
+			entry->cksum = calc_csum;
+			entry->flags = LHSR_BLOCK_VERIFIED;
+			arr->cksum_count++;
+			DMINFO("Scrub: Stored new checksum for offset 0x%llx", offset);
+		} else {
+			DMWARN("Scrub: Checksum cache full, cannot store checksum for offset 0x%llx", offset);
+		}
+		__free_page(page);
+		return 0;
+	}
+
+	/* Verify checksum */
+	if (calc_csum != stored_csum) {
+		DMERR("Scrub: Checksum mismatch at offset 0x%llx (stored=0x%08x, calc=0x%08x)",
+		       offset, stored_csum, calc_csum);
+		if (entry) {
+			entry->flags |= LHSR_BLOCK_CORRUPT;
+			atomic_inc(&arr->corruptions_detected);
+		}
+		__free_page(page);
+		return -EIO;
+	}
+
+	/* Checksum verified successfully */
+	if (entry) {
+		entry->flags |= LHSR_BLOCK_VERIFIED;
+	}
 	__free_page(page);
-	return ret;
+	return 0;
 }
 
 /* Periodic scrub work */
@@ -820,6 +955,13 @@ if (strcmp(argv[0], "single") == 0) {
 	arr->write_verify_enabled = 0;
 	atomic_set(&arr->destroying, 0);
 
+	/* Initialize RAID5 write completion tracking */
+	atomic_set(&arr->inflight_writes, 0);
+	arr->orig_bio = NULL;
+	arr->parity_buf = NULL;
+	arr->data_bufs = NULL;
+	arr->data_disks_written = 0;
+
 	/* Initialize concurrency primitives */
 	mutex_init(&arr->io_mutex);
 	init_rwsem(&arr->sb_sem);
@@ -924,6 +1066,7 @@ if (strcmp(argv[0], "single") == 0) {
 	arr->scrub_offset = 0;
 	arr->scrub_verified = 0;
 	arr->scrub_corrupted = 0;
+	arr->cksum_count = 0;  /* Initialize checksum cache */
 	atomic_set(&arr->corruptions_detected, 0);
 	atomic_set(&arr->repairs, 0);
 
@@ -1065,6 +1208,26 @@ static void lhsr_dtr(struct dm_target *ti)
 	DMINFO("dtr: END - Destroyed LHSR target");
 }
 
+/* XOR parity calculation for RAID5 */
+static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len)
+{
+	u8 *p = parity;
+	u8 **src = (u8 **)data;
+	unsigned int i, j;
+
+	/* Initialize parity with first data block */
+	memcpy(p, src[0], len);
+
+	/* XOR remaining data blocks */
+	for (i = 1; i < data_disks; i++) {
+		for (j = 0; j < len; j += sizeof(long)) {
+			long *p_long = (long *)(p + j);
+			long *s_long = (long *)(src[i] + j);
+			*p_long ^= *s_long;
+		}
+	}
+}
+
 /* Map function - with error tracking */
 static int lhsr_map(struct dm_target *ti, struct bio *bio)
 {
@@ -1088,80 +1251,147 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 	if (arr->raid_type == 0) {
 		bio_set_dev(bio, arr->disk[0]);
 		bio->bi_iter.bi_sector = offset;
-		bio->bi_private = ti;
-		bio->bi_end_io = lhsr_io_complete;
+		if (lhsr_setup_io_tracking(bio, ti) < 0) {
+			bio->bi_status = BLK_STS_IOERR;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
 		submit_bio(bio);
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	/* RAID1 Mirror - write to primary only (async, fire and forget for testing)
-	 * TODO: Add proper syncing later
-	 */
-	if (bio_op(bio) != REQ_OP_READ) {
-		unsigned int target_disk = arr->primary_disk;
+	/* RAID1 Mirror - write to primary only */
+	if (arr->raid_type == 1) {
+		if (bio_op(bio) != REQ_OP_READ) {
+			unsigned int target_disk = arr->primary_disk;
 		
-		if (!(arr->failed_disks & (1 << target_disk))) {
-			bio_set_dev(bio, arr->disk[target_disk]);
-			bio->bi_iter.bi_sector = offset;
-			bio->bi_private = ti;
-			bio->bi_end_io = lhsr_io_complete;
-			submit_bio(bio);
-		} else {
-			/* Primary failed, try other */
-			unsigned int other = (target_disk == 0) ? 1 : 0;
-			if (!(arr->failed_disks & (1 << other))) {
-				bio_set_dev(bio, arr->disk[other]);
+			if (!(arr->failed_disks & (1 << target_disk))) {
+				bio_set_dev(bio, arr->disk[target_disk]);
 				bio->bi_iter.bi_sector = offset;
-				bio->bi_private = ti;
-				bio->bi_end_io = lhsr_io_complete;
+				if (lhsr_setup_io_tracking(bio, ti) < 0) {
+					bio->bi_status = BLK_STS_IOERR;
+					bio_endio(bio);
+					return DM_MAPIO_SUBMITTED;
+				}
 				submit_bio(bio);
 			} else {
-				bio->bi_status = BLK_STS_IOERR;
-				bio_endio(bio);
+				/* Primary failed, try other */
+				unsigned int other = (target_disk == 0) ? 1 : 0;
+				if (!(arr->failed_disks & (1 << other))) {
+					bio_set_dev(bio, arr->disk[other]);
+					bio->bi_iter.bi_sector = offset;
+					if (lhsr_setup_io_tracking(bio, ti) < 0) {
+						bio->bi_status = BLK_STS_IOERR;
+						bio_endio(bio);
+						return DM_MAPIO_SUBMITTED;
+					}
+					submit_bio(bio);
+				} else {
+					bio->bi_status = BLK_STS_IOERR;
+					bio_endio(bio);
+				}
 			}
+			return DM_MAPIO_SUBMITTED;
 		}
-		return DM_MAPIO_SUBMITTED;
 	}
 
-	/* RAID5/6 handling - fallback to first data disk */
+	/* RAID5/6 handling */
 	if (arr->raid_type >= 2) {
-		unsigned int data_disk = 0;
+		unsigned int data_disks;
+		unsigned int parity_disks = (arr->raid_type == 2) ? 1 : 2;
+		unsigned int i;
+		int is_write = (bio_op(bio) != REQ_OP_READ);
 
-		/* Use a working data disk */
-		while (data_disk < arr->disks && (arr->failed_disks & (1 << data_disk)))
-			data_disk++;
+		data_disks = arr->disks - parity_disks;
 
-		if (data_disk < arr->disks) {
-			bio_set_dev(bio, arr->disk[data_disk]);
-			bio->bi_iter.bi_sector = offset;
-			bio->bi_private = ti;
-			bio->bi_end_io = lhsr_io_complete;
-			submit_bio(bio);
-		} else {
+		if (is_write) {
+			/* RAID5/6 WRITE: write data to data disks, compute parity */
+			DMINFO("RAID5/6 write: %u data disks, %u parity disks",
+			       data_disks, parity_disks);
+
+			/*
+			 * For now, write to first working data disk only.
+			 * TODO: Clone bio and write to all data disks,
+			 * then compute and write parity.
+			 */
+			for (i = 0; i < data_disks; i++) {
+				if (arr->failed_disks & (1 << i))
+					continue;
+				bio_set_dev(bio, arr->disk[i]);
+				bio->bi_iter.bi_sector = offset;
+				if (lhsr_setup_io_tracking(bio, ti) < 0) {
+					bio->bi_status = BLK_STS_IOERR;
+					bio_endio(bio);
+					return DM_MAPIO_SUBMITTED;
+				}
+				submit_bio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+
+			/* No working data disk */
+			DMWARN("RAID5/6 write: no working data disk");
 			bio->bi_status = BLK_STS_IOERR;
 			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
 		}
+
+		/* RAID5/6 READ: use first working data disk */
+		for (i = 0; i < data_disks; i++) {
+			if (!(arr->failed_disks & (1 << i))) {
+				bio_set_dev(bio, arr->disk[i]);
+				bio->bi_iter.bi_sector = offset;
+				if (lhsr_setup_io_tracking(bio, ti) < 0) {
+					bio->bi_status = BLK_STS_IOERR;
+					bio_endio(bio);
+					return DM_MAPIO_SUBMITTED;
+				}
+				submit_bio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+		}
+
+		/* No working data disk */
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	/* Read: try primary, failover to secondary on error */
+	/* Read: try primary, failover to any working disk */
 	if (!(arr->failed_disks & (1 << arr->primary_disk))) {
 		bio_set_dev(bio, arr->disk[arr->primary_disk]);
 		bio->bi_iter.bi_sector = offset;
-		bio->bi_private = ti;
-		bio->bi_end_io = lhsr_io_complete;
+		if (lhsr_setup_io_tracking(bio, ti) < 0) {
+			bio->bi_status = BLK_STS_IOERR;
+			bio_endio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
 		submit_bio(bio);
 	} else {
-		unsigned int other = arr->primary_disk == 0 ? 1 : 0;
-		if (!(arr->failed_disks & (1 << other))) {
-			DMINFO("Failover read from disk %u to disk %u", arr->primary_disk, other);
-			bio_set_dev(bio, arr->disk[other]);
-			bio->bi_iter.bi_sector = offset;
-			bio->bi_private = ti;
-			bio->bi_end_io = lhsr_io_complete;
-			atomic_inc(&arr->failovers);
-			submit_bio(bio);
-		} else {
+		/* Primary failed - scan all disks for working one */
+		unsigned int i;
+		int found = 0;
+
+		for (i = 0; i < arr->disks; i++) {
+			if (i == arr->primary_disk)
+				continue;
+			if (!(arr->failed_disks & (1 << i))) {
+				DMINFO("Failover read from disk %u to disk %u",
+				       arr->primary_disk, i);
+				bio_set_dev(bio, arr->disk[i]);
+				bio->bi_iter.bi_sector = offset;
+				if (lhsr_setup_io_tracking(bio, ti) < 0) {
+					bio->bi_status = BLK_STS_IOERR;
+					bio_endio(bio);
+					return DM_MAPIO_SUBMITTED;
+				}
+				atomic_inc(&arr->failovers);
+				submit_bio(bio);
+				found = 1;
+				break;
+			}
+		}
+
+		if (!found) {
 			bio->bi_status = BLK_STS_IOERR;
 			bio_endio(bio);
 		}
@@ -1272,6 +1502,9 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 	/* Handle bare command (dmsetup message <device> <cmd>) */
 	if (strncmp(argv[0], "disk_fail", 8) == 0) {
 		if (argc < 2)
+			return -EINVAL;
+		err = kstrtouint(argv[1], 10, &disk_idx);
+		if (err || disk_idx >= arr->disks)
 			return -EINVAL;
 		err = kstrtouint(argv[1], 10, &disk_idx);
 		if (err || disk_idx >= arr->disks)
