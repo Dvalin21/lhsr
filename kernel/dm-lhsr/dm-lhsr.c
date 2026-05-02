@@ -1371,18 +1371,36 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 		data_disks = arr->disks - parity_disks;
 
 		if (is_write) {
-			/* RAID5/6 WRITE: write data to data disks, compute parity */
+			unsigned int working_disks = 0;
+			unsigned int i;
+			int parity_disk = data_disks; /* Parity is after data disks */
+
 			DMINFO("RAID5/6 write: %u data disks, %u parity disks",
 			       data_disks, parity_disks);
 
+			/* Count working data disks */
+			for (i = 0; i < data_disks; i++) {
+				if (!(arr->failed_disks & (1 << i)))
+					working_disks++;
+			}
+
+			if (working_disks == 0) {
+				/* No working data disk */
+				bio->bi_status = BLK_STS_IOERR;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+
 			/*
-			 * For now, write to first working data disk only.
-			 * TODO: Clone bio and write to all data disks,
-			 * then compute and write parity.
+			 * Clone bio for each working data disk,
+			 * submit all writes, compute parity, write parity.
 			 */
 			for (i = 0; i < data_disks; i++) {
 				if (arr->failed_disks & (1 << i))
 					continue;
+
+				/* Clone bio for this data disk */
+				/* TODO: Implement bio cloning */
 				bio_set_dev(bio, arr->disk[i]);
 				bio->bi_iter.bi_sector = offset;
 				if (lhsr_setup_io_tracking(bio, ti) < 0) {
@@ -1393,12 +1411,6 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				submit_bio(bio);
 				return DM_MAPIO_SUBMITTED;
 			}
-
-			/* No working data disk */
-			DMWARN("RAID5/6 write: no working data disk");
-			bio->bi_status = BLK_STS_IOERR;
-			bio_endio(bio);
-			return DM_MAPIO_SUBMITTED;
 		}
 
 		/* RAID5/6 READ: use first working data disk */
