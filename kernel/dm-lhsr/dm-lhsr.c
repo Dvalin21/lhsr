@@ -34,6 +34,26 @@ struct lhsr_bio_ctx {
 	int error;
 };
 
+/* Forward declarations for RAID5 write */
+struct lhsr_raid5_write_ctx;
+static void lhsr_raid5_data_endio(struct bio *bio);
+static void lhsr_raid5_parity_endio(struct bio *bio);
+
+static struct bio_set lhsr_bioset;
+
+/* RAID5 write context - tracks in-flight data writes and parity write */
+struct lhsr_raid5_write_ctx {
+	struct bio *orig_bio;		/* Original bio to complete */
+	struct lhsr_array *arr;	/* Array context */
+	atomic_t pending;		/* Count of pending data writes + parity */
+	int status;			/* Final status */
+	void *parity_buf;		/* Parity buffer */
+	struct bio *parity_bio;		/* Parity write bio */
+	unsigned int data_disks;	/* Number of data disks */
+	unsigned int working_disks;	/* Number of working data disks */
+	sector_t offset;		/* Sector offset for writes */
+};
+
 static void lhsr_bio_complete(struct bio *bio)
 {
 	struct lhsr_bio_ctx *ctx = bio->bi_private;
@@ -358,17 +378,11 @@ struct lhsr_array {
 	/* RAID5 write completion tracking */
 	atomic_t inflight_writes;
 	struct bio *orig_bio;        /* Original bio for completion */
-	void *parity_buf;             /* Parity buffer */
-	void **data_bufs;             /* Array of data buffers */
 	unsigned int data_disks_written; /* Count of data disks written */
 };
 
 static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx, u32 new_state);
 static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
-static void *lhsr_alloc_parity_buf(size_t size);
-static void lhsr_free_parity_buf(void *buf);
-static int lhsr_alloc_data_bufs(struct lhsr_array *arr, size_t size);
-static void lhsr_free_data_bufs(struct lhsr_array *arr);
 
 /* I/O context to save original completion */
 struct lhsr_io_ctx {
@@ -963,8 +977,6 @@ if (strcmp(argv[0], "single") == 0) {
 	/* Initialize RAID5 write completion tracking */
 	atomic_set(&arr->inflight_writes, 0);
 	arr->orig_bio = NULL;
-	arr->parity_buf = NULL;
-	arr->data_bufs = NULL;
 	arr->data_disks_written = 0;
 
 	/* Initialize concurrency primitives */
@@ -1204,10 +1216,6 @@ static void lhsr_dtr(struct dm_target *ti)
 
 	DMINFO("dtr: Destroying mutex");
 
-	/* Free RAID5 write tracking buffers */
-	lhsr_free_parity_buf(arr->parity_buf);
-	lhsr_free_data_bufs(arr);
-
 	/* Destroy concurrency primitives */
 	mutex_destroy(&arr->io_mutex);
 
@@ -1247,51 +1255,83 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 	}
 }
 
-/* RAID5 parity helpers */
-static void *lhsr_alloc_parity_buf(size_t size)
+/* RAID5 write completion callbacks */
+static void lhsr_raid5_data_endio(struct bio *bio)
 {
-	return kzalloc(size, GFP_NOIO);
-}
+	struct lhsr_raid5_write_ctx *ctx = bio->bi_private;
 
-static void lhsr_free_parity_buf(void *buf)
-{
-	kfree(buf);
-}
+	if (bio->bi_status)
+		ctx->status = bio->bi_status;
 
-static int lhsr_alloc_data_bufs(struct lhsr_array *arr, size_t size)
-{
-	unsigned int data_disks = arr->disks - 1;
-	int i;
+	if (atomic_dec_and_test(&ctx->pending)) {
+		/* All data writes done - compute parity and write it */
+		struct lhsr_array *arr = ctx->arr;
+		struct bio *parity_bio;
+		struct bio_vec bv;
+		struct bvec_iter iter;
+		void *data_buf;
 
-	arr->data_bufs = kcalloc(data_disks, sizeof(void *), GFP_NOIO);
-	if (!arr->data_bufs)
-		return -ENOMEM;
+		/* Get data buffer from original bio */
+		bio_for_each_segment(bv, ctx->orig_bio, iter) {
+			data_buf = kmap(bv.bv_page) + bv.bv_offset;
+			break; /* Single segment for now */
+		}
 
-	for (i = 0; i < data_disks; i++) {
-		arr->data_bufs[i] = kzalloc(size, GFP_NOIO);
-		if (!arr->data_bufs[i]) {
-			while (--i >= 0)
-				kfree(arr->data_bufs[i]);
-			kfree(arr->data_bufs);
-			arr->data_bufs = NULL;
-			return -ENOMEM;
+		/* Compute parity - for single data write, parity = data */
+		lhsr_xor_parity(ctx->parity_buf, &data_buf, 1,
+				ctx->orig_bio->bi_iter.bi_size);
+
+		kunmap(bv.bv_page);
+
+		/* Write parity if parity disk is working */
+		if (!(arr->failed_disks & (1 << ctx->data_disks))) {
+			parity_bio = bio_alloc_bioset(arr->disk[ctx->data_disks], 0,
+						      REQ_OP_WRITE, GFP_NOIO, &lhsr_bioset);
+			if (parity_bio) {
+				if (bio_add_page(parity_bio,
+						 virt_to_page(ctx->parity_buf),
+						 ctx->orig_bio->bi_iter.bi_size,
+						 offset_in_page(ctx->parity_buf)) > 0) {
+					parity_bio->bi_iter.bi_sector = ctx->offset;
+					parity_bio->bi_end_io = lhsr_raid5_parity_endio;
+					parity_bio->bi_private = ctx;
+					atomic_inc(&ctx->pending);
+					ctx->parity_bio = parity_bio;
+					submit_bio(parity_bio);
+				} else {
+					bio_put(parity_bio);
+					ctx->status = BLK_STS_RESOURCE;
+				}
+			} else {
+				ctx->status = BLK_STS_RESOURCE;
+			}
+		}
+
+		/* If no parity write needed, complete original bio */
+		if ((arr->failed_disks & (1 << ctx->data_disks)) ||
+		    !ctx->parity_bio) {
+			ctx->orig_bio->bi_status = ctx->status;
+			bio_endio(ctx->orig_bio);
+			kfree(ctx->parity_buf);
+			kfree(ctx);
 		}
 	}
-	return 0;
+
+	bio_put(bio);
 }
 
-static void lhsr_free_data_bufs(struct lhsr_array *arr)
+static void lhsr_raid5_parity_endio(struct bio *bio)
 {
-	unsigned int data_disks = arr->disks - 1;
-	int i;
+	struct lhsr_raid5_write_ctx *ctx = bio->bi_private;
 
-	if (!arr->data_bufs)
-		return;
+	if (bio->bi_status)
+		ctx->status = bio->bi_status;
 
-	for (i = 0; i < data_disks; i++)
-		kfree(arr->data_bufs[i]);
-	kfree(arr->data_bufs);
-	arr->data_bufs = NULL;
+	ctx->orig_bio->bi_status = ctx->status;
+	bio_endio(ctx->orig_bio);
+	kfree(ctx->parity_buf);
+	kfree(ctx);
+	bio_put(bio);
 }
 
 /* Map function - with error tracking */
@@ -1372,10 +1412,11 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 
 		if (is_write) {
 			unsigned int working_disks = 0;
-			unsigned int i;
-			int parity_disk = data_disks; /* Parity is after data disks */
+			struct lhsr_raid5_write_ctx *ctx;
+			struct bio *clone;
+			size_t bio_size = bio->bi_iter.bi_size;
 
-			DMINFO("RAID5/6 write: %u data disks, %u parity disks",
+			DMDEBUG("RAID5/6 write: %u data disks, %u parity disks",
 			       data_disks, parity_disks);
 
 			/* Count working data disks */
@@ -1385,32 +1426,75 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 			}
 
 			if (working_disks == 0) {
-				/* No working data disk */
 				bio->bi_status = BLK_STS_IOERR;
 				bio_endio(bio);
 				return DM_MAPIO_SUBMITTED;
 			}
 
+			/* Allocate write context */
+			ctx = kzalloc(sizeof(*ctx), GFP_NOIO);
+			if (!ctx) {
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+
+			ctx->orig_bio = bio;
+			ctx->arr = arr;
+			ctx->data_disks = data_disks;
+			ctx->working_disks = working_disks;
+			ctx->offset = offset;
+			atomic_set(&ctx->pending, 0);
+			ctx->status = 0;
+
+			/* Allocate parity buffer */
+			ctx->parity_buf = kzalloc(bio_size, GFP_NOIO);
+			if (!ctx->parity_buf) {
+				kfree(ctx);
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+
 			/*
-			 * Clone bio for each working data disk,
-			 * submit all writes, compute parity, write parity.
+			 * Clone bio for each working data disk and submit.
+			 * Track pending writes with atomic counter.
 			 */
 			for (i = 0; i < data_disks; i++) {
 				if (arr->failed_disks & (1 << i))
 					continue;
 
-				/* Clone bio for this data disk */
-				/* TODO: Implement bio cloning */
-				bio_set_dev(bio, arr->disk[i]);
-				bio->bi_iter.bi_sector = offset;
-				if (lhsr_setup_io_tracking(bio, ti) < 0) {
-					bio->bi_status = BLK_STS_IOERR;
-					bio_endio(bio);
-					return DM_MAPIO_SUBMITTED;
+				clone = bio_alloc_clone(arr->disk[i], bio,
+							GFP_NOIO, &lhsr_bioset);
+				if (!clone) {
+					ctx->status = BLK_STS_RESOURCE;
+					continue;
 				}
-				submit_bio(bio);
+
+				clone->bi_iter.bi_sector = offset;
+				clone->bi_end_io = lhsr_raid5_data_endio;
+				clone->bi_private = ctx;
+
+				if (lhsr_setup_io_tracking(clone, ti) < 0) {
+					bio_put(clone);
+					ctx->status = BLK_STS_IOERR;
+					continue;
+				}
+
+				atomic_inc(&ctx->pending);
+				submit_bio(clone);
+			}
+
+			/* If no writes were submitted, fail */
+			if (atomic_read(&ctx->pending) == 0) {
+				bio->bi_status = ctx->status ?: BLK_STS_IOERR;
+				bio_endio(bio);
+				kfree(ctx->parity_buf);
+				kfree(ctx);
 				return DM_MAPIO_SUBMITTED;
 			}
+
+			return DM_MAPIO_SUBMITTED;
 		}
 
 		/* RAID5/6 READ: use first working data disk */
@@ -1809,9 +1893,16 @@ static int __init lhsr_init(void)
 {
 	int r;
 
+	r = bioset_init(&lhsr_bioset, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
+	if (r) {
+		DMERR("Failed to initialize bioset: %d", r);
+		return r;
+	}
+
 	r = dm_register_target(&lhsr_target);
 	if (r) {
 		DMERR("Failed to register target: %d", r);
+		bioset_exit(&lhsr_bioset);
 		return r;
 	}
 
@@ -1823,6 +1914,7 @@ static int __init lhsr_init(void)
 static void __exit lhsr_exit(void)
 {
 	dm_unregister_target(&lhsr_target);
+	bioset_exit(&lhsr_bioset);
 	DMINFO("Module unloaded");
 }
 
