@@ -512,7 +512,7 @@ static int disk_check_accessible(struct block_device *bdev)
 }
 
 /* Periodic disk health check */
-static void disk_check_work(struct work_struct *work)
+static void __used disk_check_work(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct lhsr_array *arr = container_of(dwork, struct lhsr_array, check_work);
