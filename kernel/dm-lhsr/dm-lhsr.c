@@ -36,9 +36,12 @@ struct lhsr_bio_ctx {
 
 /* Forward declarations for RAID5/6 write */
 struct lhsr_raid_5_write_ctx;
+struct lhsr_raid_5_read_ctx;
+struct lhsr_array;
 static void lhsr_raid_5_data_endio(struct bio *bio);
 static void lhsr_raid_5_parity_endio(struct bio *bio);
 static void lhsr_raid_5_read_endio(struct bio *bio);
+static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
 static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
                            unsigned int data_disks, size_t len);
 
@@ -402,6 +405,71 @@ struct lhsr_array {
 	struct bio *orig_bio;        /* Original bio for completion */
 	unsigned int data_disks_written; /* Count of data disks written */
 };
+
+/* RAID5/6 READ reconstruction completion */
+static void lhsr_raid_5_read_endio(struct bio *bio)
+{
+	struct lhsr_raid_5_read_ctx *ctx = bio->bi_private;
+	struct lhsr_array *arr = ctx->arr;
+	int is_raid6 = (arr->raid_type == 3);
+	size_t bio_size = ctx->orig_bio->bi_iter.bi_size;
+
+	if (bio->bi_status)
+		ctx->status = bio->bi_status;
+
+	if (atomic_dec_and_test(&ctx->pending)) {
+		/* All reads done - reconstruct missing data */
+		if (ctx->status == 0 && ctx->recon_buf) {
+			unsigned int failed_count = 0;
+			unsigned int failed[2];
+			unsigned int i;
+
+			/* Find which disks failed */
+			for (i = 0; i < ctx->num_disks; i++) {
+				if (arr->failed_disks & (1 << i)) {
+					failed[failed_count] = i;
+					failed_count++;
+				}
+			}
+
+			if (failed_count == 1 || (failed_count == 2 && !is_raid6)) {
+				/* RAID5 single failure OR RAID6 single failure */
+				lhsr_xor_parity(ctx->recon_buf,
+						 (void **)ctx->data_bufs,
+						 ctx->working, bio_size);
+			} else if (failed_count == 2 && is_raid6) {
+				/* RAID6 double failure: use Reed-Solomon */
+				lhsr_rs_parity(ctx->recon_buf, NULL,
+					       (void **)ctx->data_bufs,
+					       ctx->working, bio_size);
+			}
+
+			/* Copy reconstructed data to original bio */
+			{
+				struct bio_vec bv;
+				struct bvec_iter iter;
+				bio_for_each_segment(bv, ctx->orig_bio, iter) {
+					void *dst = kmap(bv.bv_page) + bv.bv_offset;
+					memcpy(dst, ctx->recon_buf, bv.bv_len);
+					kunmap(bv.bv_page);
+					break; /* Single segment for now */
+				}
+			}
+		}
+
+		/* Complete original bio */
+		ctx->orig_bio->bi_status = ctx->status;
+		bio_endio(ctx->orig_bio);
+
+		/* Cleanup */
+		kfree(ctx->recon_buf);
+		if (ctx->data_bufs)
+			kfree(ctx->data_bufs);
+		kfree(ctx);
+	}
+
+	bio_put(bio);
+}
 
 static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx, u32 new_state);
 static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
@@ -1623,25 +1691,121 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 			return DM_MAPIO_SUBMITTED;
 		}
 
-		/* RAID5/6 READ: use first working data disk */
+	/* RAID5/6 READ: check for failed disk, set up reconstruction if needed */
+	{
+		unsigned int target_disk = 0;
+		int target_failed = 0;
+		
+		/* Find first working disk */
 		for (i = 0; i < data_disks; i++) {
 			if (!(arr->failed_disks & (1 << i))) {
-				bio_set_dev(bio, arr->disk[i]);
-				bio->bi_iter.bi_sector = offset;
-				if (lhsr_setup_io_tracking(bio, ti) < 0) {
-					bio->bi_status = BLK_STS_IOERR;
-					bio_endio(bio);
-					return DM_MAPIO_SUBMITTED;
-				}
-				submit_bio(bio);
-				return DM_MAPIO_SUBMITTED;
+				target_disk = i;
+				break;
 			}
 		}
-
-		/* No working data disk */
-		bio->bi_status = BLK_STS_IOERR;
-		bio_endio(bio);
-		return DM_MAPIO_SUBMITTED;
+		
+		/* Check if target disk failed */
+		target_failed = (arr->failed_disks & (1 << target_disk));
+		
+		if (target_failed) {
+			/* Degraded mode - set up reconstruction */
+			struct lhsr_raid_5_read_ctx *ctx;
+			unsigned int working_disks = 0;
+			unsigned int j;
+			
+			/* Count working disks */
+			for (i = 0; i < data_disks; i++) {
+				if (!(arr->failed_disks & (1 << i)))
+					working_disks++;
+			}
+			
+			if (working_disks == 0) {
+				bio->bi_status = BLK_STS_IOERR;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+			
+			/* Allocate read context */
+			ctx = kzalloc(sizeof(*ctx) + (sizeof(unsigned int) * working_disks), GFP_NOIO);
+			if (!ctx) {
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+			
+			ctx->orig_bio = bio;
+			ctx->arr = arr;
+			ctx->target_disk = target_disk;
+			ctx->num_disks = data_disks;
+			ctx->working = working_disks;
+			ctx->offset = offset;
+			atomic_set(&ctx->pending, 0);
+			ctx->status = 0;
+			
+			/* Allocate reconstruction buffer */
+			ctx->recon_buf = kzalloc(bio->bi_iter.bi_size, GFP_NOIO);
+			if (!ctx->recon_buf) {
+				kfree(ctx);
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+			
+			/* Allocate data buffers array */
+			ctx->data_bufs = kzalloc(sizeof(void *) * working_disks, GFP_NOIO);
+			if (!ctx->data_bufs) {
+				kfree(ctx->recon_buf);
+				kfree(ctx);
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+			
+			/* Build disk_map: working_idx -> disk_idx */
+			j = 0;
+			for (i = 0; i < data_disks; i++) {
+				if (!(arr->failed_disks & (1 << i))) {
+					ctx->disk_map[j] = i;
+					j++;
+				}
+			}
+			
+			/* Submit reads to working disks */
+			atomic_set(&ctx->pending, working_disks);
+			for (i = 0; i < working_disks; i++) {
+				struct bio *clone = bio_alloc_clone(arr->disk[ctx->disk_map[i]], 
+								 bio, GFP_NOIO, &lhsr_bioset);
+				if (!clone) {
+					ctx->status = BLK_STS_RESOURCE;
+					continue;
+				}
+				ctx->data_bufs[i] = kzalloc(bio->bi_iter.bi_size, GFP_NOIO);
+				if (!ctx->data_bufs[i]) {
+					bio_put(clone);
+					ctx->status = BLK_STS_RESOURCE;
+					continue;
+				}
+				clone->bi_iter.bi_sector = offset;
+				clone->bi_end_io = lhsr_raid_5_read_endio;
+				clone->bi_private = ctx;
+				submit_bio(clone);
+			}
+			
+			return DM_MAPIO_SUBMITTED;
+		} else {
+			/* Normal read from working disk */
+			bio_set_dev(bio, arr->disk[target_disk]);
+			bio->bi_iter.bi_sector = offset;
+			if (lhsr_setup_io_tracking(bio, ti) < 0) {
+				bio->bi_status = BLK_STS_IOERR;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+			bio->bi_end_io = lhsr_raid_5_read_endio;
+			submit_bio(bio);
+			return DM_MAPIO_SUBMITTED;
+		}
+	}
 	}
 
 	/* Read: try primary, failover to any working disk */
