@@ -1791,6 +1791,27 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				submit_bio(clone);
 			}
 			
+			/* Submit parity reads */
+			for (i = 0; i < parity_disks; i++) {
+				struct bio *parity_bio;
+				unsigned int parity_disk = data_disks + i;
+				
+				if (arr->failed_disks & (1 << parity_disk))
+					continue; /* Parity disk also failed */
+				
+				parity_bio = bio_alloc_clone(arr->disk[parity_disk], 
+								   bio, GFP_NOIO, &lhsr_bioset);
+				if (!parity_bio) {
+					ctx->status = BLK_STS_RESOURCE;
+					continue;
+				}
+				
+				parity_bio->bi_iter.bi_sector = offset;
+				parity_bio->bi_end_io = lhsr_raid_5_read_endio;
+				parity_bio->bi_private = ctx;
+				submit_bio(parity_bio);
+			}
+
 			return DM_MAPIO_SUBMITTED;
 		} else {
 			/* Normal read from working disk */
