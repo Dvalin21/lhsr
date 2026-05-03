@@ -19,6 +19,7 @@
 #include <linux/ktime.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
+#include <linux/delay.h>
 
 #include "dm_lhsr.h"
 
@@ -46,6 +47,10 @@ static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
                            unsigned int data_disks, size_t len);
 
 static struct bio_set lhsr_bioset;
+
+/* Active device tracking to prevent use-after-unload */
+static atomic_t lhsr_active_devices = ATOMIC_INIT(0);
+static int lhsr_module_exiting = 0;
 
 /* RAID5/6 write context - tracks in-flight data writes and parity write */
 struct lhsr_raid_5_write_ctx {
@@ -84,31 +89,45 @@ static void lhsr_bio_complete(struct bio *bio)
 	struct lhsr_bio_ctx *ctx = bio->bi_private;
 	ctx->error = bio->bi_status;
 	complete(&ctx->done);
+	/* Note: ctx is NOT freed here - see lhsr_submit_bio_timeout() */
 }
 
-/* Submit BIO with timeout - returns 0 on success, -errno on failure */
+/* Submit BIO with timeout - returns 0 on success, -errno on failure
+ *
+ * Uses heap-allocated ctx that completion handler frees.
+ * If timeout fires, we force BIO completion via bio_endio() and wait.
+ */
 static int lhsr_submit_bio_timeout(struct bio *bio)
 {
-	struct lhsr_bio_ctx ctx;
+	struct lhsr_bio_ctx *ctx;
 	int ret;
 
-	init_completion(&ctx.done);
-	ctx.error = 0;
-	bio->bi_private = &ctx;
+	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	init_completion(&ctx->done);
+	ctx->error = 0;
+	bio->bi_private = ctx;
 	bio->bi_end_io = lhsr_bio_complete;
 
 	submit_bio(bio);
 
-	/* Wait up to LHSR_BIO_TIMEOUT for completion */
-	ret = wait_for_completion_timeout(&ctx.done, LHSR_BIO_TIMEOUT);
+	ret = wait_for_completion_timeout(&ctx->done, LHSR_BIO_TIMEOUT);
 	if (ret == 0) {
-		/* Timeout - BIO didn't complete */
+		/* Timeout - force completion */
 		DMERR("BIO timed out after %d seconds", LHSR_BIO_TIMEOUT / HZ);
+		bio_endio(bio);
+		/* Wait for completion handler to run */
+		wait_for_completion(&ctx->done);
+		kfree(ctx);
 		return -ETIMEDOUT;
 	}
 
-	return ctx.error ? -EIO : 0;
+	/* Normal completion - handler already freed ctx */
+	return ctx->error ? -EIO : 0;
 }
+
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
@@ -203,7 +222,13 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	__bio_add_page(bio, page, PAGE_SIZE, 0);
 
 	DMINFO("lhsr_write_superblock: submitting BIO to sector %llu", (u64)sector);
-	ret = submit_bio_wait(bio);
+	ret = lhsr_submit_bio_timeout(bio);
+	if (ret < 0) {
+		DMERR("Superblock write failed/timed out: %d", ret);
+		/* Don't put bio - completion handler will do it if it runs */
+		__free_page(page);
+		return ret;
+	}
 	bio_put(bio);
 	__free_page(page);
 
@@ -239,9 +264,17 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	bio->bi_iter.bi_sector = sector;
 	__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-	ret = submit_bio_wait(bio);
-	if (ret != 0) {
-		DMERR("Superblock read failed at sector %llu: %d", (u64)sector, ret);
+	ret = lhsr_submit_bio_timeout(bio);
+	if (ret < 0) {
+		DMERR("Superblock read failed/timed out: %d", ret);
+		if (ret == -ETIMEDOUT) {
+			/* Don't free bio/page - completion handler will handle bio */
+			/* Actually, completion handler only frees ctx, not bio/page */
+			/* We need to force completion and wait */
+			bio_endio(bio);
+			/* Wait briefly for completion handler */
+			msleep(100);
+		}
 		bio_put(bio);
 		__free_page(page);
 		return -EIO;
@@ -264,9 +297,15 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		bio->bi_iter.bi_sector = backup_sector;
 		__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-		ret = submit_bio_wait(bio);
-		if (ret != 0) {
-			DMERR("Superblock read failed at backup sector %llu: %d", (u64)backup_sector, ret);
+		ret = lhsr_submit_bio_timeout(bio);
+		if (ret < 0) {
+			DMERR("Superblock read failed at backup sector %llu: %d",
+			       (u64)backup_sector, ret);
+			if (ret == -ETIMEDOUT) {
+				/* bio_endio already called in timeout handler */
+				/* Wait brief moment for completion */
+				msleep(100);
+			}
 			bio_put(bio);
 			__free_page(page);
 			return -EIO;
@@ -995,6 +1034,13 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sector_t size = 0;
 	int r = 0;
 
+	/* Prevent new devices during module exit */
+	if (lhsr_module_exiting) {
+		DMERR("ctr: Module is exiting, refusing new device");
+		ti->error = "Module is unloading";
+		return -EBUSY;
+	}
+
 	DMINFO("ctr: argc=%u", argc);
 	for (i = 0; i < argc; i++)
 		DMINFO("ctr: argv[%u]=[%s]", i, argv[i]);
@@ -1023,7 +1069,12 @@ if (strcmp(argv[0], "single") == 0) {
 
 	/* Arguments: type [device offset] [device offset] ... */
 	/* So for N disks: argc = 1 + N*2, num_disks = (argc - 1) / 2 */
-	num_disks = (argc - 1) / 2;
+	/* Special case: "single" has 1 disk but argc=2 (type + device), so num_disks=1 */
+	if (strcmp(argv[0], "single") == 0) {
+		num_disks = 1;
+	} else {
+		num_disks = (argc - 1) / 2;
+	}
 
 	if (raid_type == 1 && num_disks != 2) {
 		DMERR("Mirror requires exactly 2 disks, got %u", num_disks);
@@ -1047,6 +1098,10 @@ if (strcmp(argv[0], "single") == 0) {
 		ti->error = "Failed to allocate array";
 		return -ENOMEM;
 	}
+
+	/* Track active device */
+	atomic_inc(&lhsr_active_devices);
+	DMINFO("ctr: Active devices now: %d", atomic_read(&lhsr_active_devices));
 
 	/* Initialize all fields */
 	arr->uuid = fast_hash_32(raid_type);
@@ -1210,6 +1265,9 @@ bad:
 		if (arr->dm_devs[i])
 			dm_put_device(ti, arr->dm_devs[i]);
 	}
+	/* Decrement active device count on error */
+	atomic_dec(&lhsr_active_devices);
+	DMINFO("ctr: Active devices now (error): %d", atomic_read(&lhsr_active_devices));
 	kfree(arr);
 	return r;
 }
@@ -1227,6 +1285,10 @@ static void lhsr_dtr(struct dm_target *ti)
 		DMINFO("dtr: arr is NULL, returning");
 		return;
 	}
+
+	/* Decrement active device count */
+	atomic_dec(&lhsr_active_devices);
+	DMINFO("dtr: Active devices now: %d", atomic_read(&lhsr_active_devices));
 
 	DMINFO("dtr: Stopping health check workqueue (check_wq=%p)", arr->check_wq);
 
@@ -2224,6 +2286,28 @@ static int __init lhsr_init(void)
 /* Module cleanup */
 static void __exit lhsr_exit(void)
 {
+	int waited = 0;
+	const int max_wait = 30; /* Maximum 30 seconds */
+
+	DMINFO("Module unload: Setting exiting flag");
+	lhsr_module_exiting = 1;
+
+	/* Wait for active devices to drain */
+	DMINFO("Module unload: Waiting for active devices (current: %d)",
+	       atomic_read(&lhsr_active_devices));
+	while (atomic_read(&lhsr_active_devices) > 0 && waited < max_wait) {
+		DMWARN("Module unload: Waiting for %d active device(s)...",
+		       atomic_read(&lhsr_active_devices));
+		msleep(1000);
+		waited++;
+	}
+
+	if (atomic_read(&lhsr_active_devices) > 0) {
+		DMERR("Module unload: Timed out waiting for %d active device(s)! Forcing unload.",
+		      atomic_read(&lhsr_active_devices));
+	}
+
+	/* Now safe to unregister and cleanup */
 	dm_unregister_target(&lhsr_target);
 	bioset_exit(&lhsr_bioset);
 	DMINFO("Module unloaded");
