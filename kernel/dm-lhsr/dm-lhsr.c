@@ -35,11 +35,12 @@ struct lhsr_bio_ctx {
 };
 
 /* Forward declarations for RAID5/6 write */
-struct lhsr_raid5_write_ctx;
-static void lhsr_raid5_data_endio(struct bio *bio);
-static void lhsr_raid5_parity_endio(struct bio *bio);
+struct lhsr_raid_5_write_ctx;
+static void lhsr_raid_5_data_endio(struct bio *bio);
+static void lhsr_raid_5_parity_endio(struct bio *bio);
+static void lhsr_raid_5_read_endio(struct bio *bio);
 static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
-                          unsigned int data_disks, size_t len);
+                           unsigned int data_disks, size_t len);
 
 static struct bio_set lhsr_bioset;
 
@@ -57,6 +58,21 @@ struct lhsr_raid5_write_ctx {
 	unsigned int working;		/* Number of working data disks */
 	sector_t offset;		/* Sector offset for writes */
 	void **data_bufs;		/* Array of data buffers (working only) */
+	unsigned int disk_map[0];	/* Flex array: working_idx -> disk_idx */
+};
+
+/* RAID5/6 read reconstruction context */
+struct lhsr_raid_5_read_ctx {
+	struct bio *orig_bio;		/* Original bio to complete */
+	struct lhsr_array *arr;		/* Array context */
+	atomic_t pending;			/* Count of pending reads */
+	int status;			/* Final status */
+	void *recon_buf;			/* Reconstructed data buffer */
+	unsigned int target_disk;	/* Which disk we're reconstructing for */
+	unsigned int num_disks;	/* Total data disks */
+	unsigned int working;		/* Number of working data disks */
+	sector_t offset;			/* Sector offset */
+	void **data_bufs;			/* Array of data buffers (working only) */
 	unsigned int disk_map[0];	/* Flex array: working_idx -> disk_idx */
 };
 
