@@ -45,7 +45,7 @@ static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
 static struct bio_set lhsr_bioset;
 
 /* RAID5/6 write context - tracks in-flight data writes and parity write */
-struct lhsr_raid5_write_ctx {
+struct lhsr_raid_5_write_ctx {
 	struct bio *orig_bio;		/* Original bio to complete */
 	struct lhsr_array *arr;	/* Array context */
 	atomic_t pending;		/* Count of pending data writes + parity */
@@ -1280,9 +1280,9 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 }
 
 /* RAID5/6 write completion callbacks */
-static void lhsr_raid5_data_endio(struct bio *bio)
+static void lhsr_raid_5_data_endio(struct bio *bio)
 {
-	struct lhsr_raid5_write_ctx *ctx = bio->bi_private;
+	struct lhsr_raid_5_write_ctx *ctx = bio->bi_private;
 	struct lhsr_array *arr = ctx->arr;
 	struct bio_vec bv;
 	struct bvec_iter iter;
@@ -1345,7 +1345,7 @@ static void lhsr_raid5_data_endio(struct bio *bio)
 						 bio_size,
 						 offset_in_page(ctx->parity_buf)) > 0) {
 					parity_bio->bi_iter.bi_sector = ctx->offset;
-					parity_bio->bi_end_io = lhsr_raid5_parity_endio;
+					parity_bio->bi_end_io = lhsr_raid_5_parity_endio;
 					parity_bio->bi_private = ctx;
 					atomic_inc(&ctx->pending);
 					ctx->parity_bio = parity_bio;
@@ -1371,7 +1371,7 @@ static void lhsr_raid5_data_endio(struct bio *bio)
 						 bio_size,
 						 offset_in_page(ctx->parity_q_buf)) > 0) {
 					q_parity_bio->bi_iter.bi_sector = ctx->offset;
-					q_parity_bio->bi_end_io = lhsr_raid5_parity_endio;
+					q_parity_bio->bi_end_io = lhsr_raid_5_parity_endio;
 					q_parity_bio->bi_private = ctx;
 					atomic_inc(&ctx->pending);
 					ctx->parity_q_bio = q_parity_bio;
@@ -1402,9 +1402,9 @@ static void lhsr_raid5_data_endio(struct bio *bio)
 	bio_put(bio);
 }
 
-static void lhsr_raid5_parity_endio(struct bio *bio)
+static void lhsr_raid_5_parity_endio(struct bio *bio)
 {
-	struct lhsr_raid5_write_ctx *ctx = bio->bi_private;
+	struct lhsr_raid_5_write_ctx *ctx = bio->bi_private;
 
 	if (bio->bi_status)
 		ctx->status = bio->bi_status;
@@ -1503,7 +1503,7 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 
 		if (is_write) {
 			unsigned int working_disks = 0;
-			struct lhsr_raid5_write_ctx *ctx;
+			struct lhsr_raid_5_write_ctx *ctx;
 			struct bio *clone;
 			size_t bio_size = bio->bi_iter.bi_size;
 
@@ -1598,7 +1598,7 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				}
 
 				clone->bi_iter.bi_sector = offset;
-				clone->bi_end_io = lhsr_raid5_data_endio;
+				clone->bi_end_io = lhsr_raid_5_data_endio;
 				clone->bi_private = ctx;
 
 				if (lhsr_setup_io_tracking(clone, ti) < 0) {
