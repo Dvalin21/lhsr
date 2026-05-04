@@ -71,7 +71,7 @@ log_info "Disk sizes: $DISK0=$SIZE0, $DISK1=$SIZE1, usable=$MIN_SIZE sectors"
 # ============================================================
 log_test "Test 1: Creating mirror device"
 # Format: 0 <size> lhsr <type> <device> <offset> [<device> <offset>...]
-dmsetup create "$DEVICE_NAME" --table "0 $MIN_SIZE lhsr mirror $DISK0 0 $DISK1 0"
+dmsetup create "$DEVICE_NAME" --table "0 $MIN_SIZE lhsr mirror $DISK0 0 $DISK1 0" --noudevsync
 
 if dmsetup ls | grep -q "$DEVICE_NAME"; then
     log_info "Mirror device created"
@@ -225,7 +225,7 @@ log_info "Removing device (state should be saved)..."
 dmsetup remove "$DEVICE_NAME"
 
 log_info "Recreating device (state should be restored)..."
-dmsetup create "$DEVICE_NAME" --table "0 $MIN_SIZE lhsr mirror $DISK0 $DISK1"
+dmsetup create "$DEVICE_NAME" --table "0 $MIN_SIZE lhsr mirror $DISK0 0 $DISK1 0" --noudevsync
 
 log_info "Checking restored state..."
 dmsetup status "$DEVICE_NAME"
