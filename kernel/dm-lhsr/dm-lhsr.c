@@ -117,6 +117,12 @@ static int lhsr_submit_bio_timeout(struct bio *bio)
 	if (ret == 0) {
 		/* Timeout - force completion */
 		DMERR("BIO timed out after %d seconds", LHSR_BIO_TIMEOUT / HZ);
+		/*
+		 * bio_endio() will call lhsr_bio_complete() which calls complete()
+		 * We need to wait for that, then free ctx.
+		 * Set error before bio_endio() so completion handler gets it.
+		 */
+		ctx->error = BLK_STS_IOERR;
 		bio_endio(bio);
 		/* Wait for completion handler to run */
 		wait_for_completion(&ctx->done);
@@ -124,7 +130,8 @@ static int lhsr_submit_bio_timeout(struct bio *bio)
 		return -ETIMEDOUT;
 	}
 
-	/* Normal completion - handler already freed ctx */
+	/* Normal completion - free ctx and return status */
+	kfree(ctx);
 	return ctx->error ? -EIO : 0;
 }
 
@@ -134,50 +141,13 @@ MODULE_AUTHOR("LHSR Team");
 MODULE_DESCRIPTION("Linux Hybrid Self-Healing RAID");
 MODULE_VERSION(LHSR_VERSION);
 
-/* CRC32c lookup table for fast checksum */
-static u32 lhsr_crc_table[256];
-
-/* CRC table initialization - static to ensure only initialized once */
-static int lhsr_crc_table_initialized = 0;
-
-static void lhsr_init_crc_table(void)
-{
-	u32 crc;
-	int i, j;
-
-	if (lhsr_crc_table_initialized)
-		return;
-
-	for (i = 0; i < 256; i++) {
-		crc = i;
-		for (j = 0; j < 8; j++) {
-			if (crc & 1)
-				crc = (crc >> 1) ^ 0x82F63B78;
-			else
-				crc >>= 1;
-		}
-		lhsr_crc_table[i] = crc;
-	}
-
-	lhsr_crc_table_initialized = 1;
-	DMDEBUG("CRC table initialized");
-}
-
-static u32 lhsr_crc32c(const void *buf, size_t len)
-{
-	const u8 *p = buf;
-	u32 crc = 0xFFFFFFFF;
-
-	while (len--) {
-		crc = crc ^ *p++;
-		crc = (crc >> 8) ^ lhsr_crc_table[crc & 0xFF];
-		crc = (crc >> 8) ^ lhsr_crc_table[crc & 0xFF];
-		crc = (crc >> 8) ^ lhsr_crc_table[crc & 0xFF];
-		crc = (crc >> 8) ^ lhsr_crc_table[crc & 0xFF];
-	}
-
-	return crc ^ 0xFFFFFFFF;
-}
+/*
+ * CRC32c checksum using kernel API
+ * Kernel's crc32c() computes CRC32c (Castagnoli) with:
+ *   - Initial value: 0xFFFFFFFF
+ *   - Final XOR: 0xFFFFFFFF
+ *   - Polynomial: 0x1EDC6F41 (same as 0x82F63B78 reflected)
+ */
 
 /* Atomic superblock write - write-hole protection
  * Strategy: Write new superblock to backup first, then primary.
@@ -187,45 +157,91 @@ static u32 lhsr_crc32c(const void *buf, size_t len)
  * NVMe SAFETY: Uses REQ_FUA to ensure data is persisted to media
  * before returning. This prevents data loss on hard power-off.
  */
+/*
+ * Atomic superblock write - write-hole protection
+ * Strategy: Write new superblock to backup first, then primary.
+ * On crash, either old primary+new backup or new primary+new backup.
+ * Never old primary+old backup (regress), never new primary+old backup (inconsistent).
+ *
+ * NVMe SAFETY: Uses REQ_FUA to ensure data is persisted to media
+ * before returning. This prevents data loss on hard power-off.
+ */
 static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblock *sb, sector_t array_size)
 {
 	struct bio *bio;
 	struct page *page;
 	void *buf;
-	sector_t sector;
+	sector_t primary_sector, backup_sector;
+	u64 backup_off;
 	int ret;
 
-	/* Calculate sector (primary superblock at 4MB offset) */
-	sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
-	DMINFO("lhsr_write_superblock: sector=%llu (0x%llx)", (u64)sector, (u64)sector);
+	/* Calculate sectors */
+	primary_sector = LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT;
+	backup_off = LHSR_SB_BACKUP_OFF(array_size << SECTOR_SHIFT);
+	backup_sector = backup_off >> SECTOR_SHIFT;
 
 	/* Allocate page for I/O */
 	page = alloc_page(GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
 
-	/* Copy superblock to page */
 	buf = page_address(page);
-	memset(buf, 0, PAGE_SIZE);
+
+	/* Calculate checksum using kernel CRC32c API */
+	memcpy(buf, sb, LHSR_SB_SIZE);
+	/* Zero checksum field for CRC calculation */
+	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
+	sb->checksum = crc32c(0xFFFFFFFF, buf, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
+	/* Copy final superblock with valid checksum */
 	memcpy(buf, sb, LHSR_SB_SIZE);
 
-	/* Calculate checksum */
-	sb->checksum = 0;
-	sb->checksum = lhsr_crc32c(buf, LHSR_SB_SIZE);
-	/* Re-copy with checksum */
-	memcpy(buf, sb, LHSR_SB_SIZE);
+	/*
+	 * Step 1: Write to BACKUP location first
+	 * This ensures we always have at least one valid superblock
+	 */
+	bio = bio_alloc(bdev, PAGE_SIZE >> SECTOR_SHIFT, REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
+	if (!bio) {
+		__free_page(page);
+		return -ENOMEM;
+	}
+	bio->bi_iter.bi_sector = backup_sector;
+	/* bio_alloc with nr_sectors > 0 automatically adds pages for the size */
 
-	/* Create BIO for write */
-	bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_SYNC, GFP_KERNEL);
-	/* Note: bio_alloc with bdev already sets bio->bi_bdev for kernel 6.12+ */
-	bio->bi_iter.bi_sector = sector;
-	__bio_add_page(bio, page, PAGE_SIZE, 0);
-
-	DMINFO("lhsr_write_superblock: submitting BIO to sector %llu", (u64)sector);
+	DMINFO("lhsr_write_superblock: writing backup to sector %llu", (u64)backup_sector);
 	ret = lhsr_submit_bio_timeout(bio);
 	if (ret < 0) {
-		DMERR("Superblock write failed/timed out: %d", ret);
-		/* Don't put bio - completion handler will do it if it runs */
+		DMERR("Backup superblock write failed: %d", ret);
+		bio_put(bio);
+		__free_page(page);
+		return ret;
+	}
+	bio_put(bio);
+
+	if (ret != 0) {
+		DMERR("Backup superblock write failed at sector %llu: %d",
+		       (u64)backup_sector, ret);
+		__free_page(page);
+		return -EIO;
+	}
+
+	/*
+	 * Step 2: Write to PRIMARY location
+	 * Now we have new backup + old primary (crash-safe)
+	 * After this, we have new backup + new primary
+	 */
+	bio = bio_alloc(bdev, PAGE_SIZE >> SECTOR_SHIFT, REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
+	if (!bio) {
+		__free_page(page);
+		return -ENOMEM;
+	}
+	bio->bi_iter.bi_sector = primary_sector;
+	/* bio_alloc with nr_sectors > 0 automatically adds pages for the size */
+
+	DMINFO("lhsr_write_superblock: writing primary to sector %llu", (u64)primary_sector);
+	ret = lhsr_submit_bio_timeout(bio);
+	if (ret < 0) {
+		DMERR("Primary superblock write failed: %d", ret);
+		bio_put(bio);
 		__free_page(page);
 		return ret;
 	}
@@ -233,12 +249,12 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	__free_page(page);
 
 	if (ret != 0) {
-		DMERR("Superblock write failed at sector %llu: %d (0x%x)",
-		       (u64)sector, ret, ret);
+		DMERR("Primary superblock write failed at sector %llu: %d",
+		       (u64)primary_sector, ret);
 		return -EIO;
 	}
 
-	DMINFO("Superblock write successful");
+	DMINFO("Superblock write successful (backup + primary)");
 	return 0;
 }
 
@@ -259,10 +275,16 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		return -ENOMEM;
 
 	DMINFO("lhsr_read_superblock: allocating bio");
-	bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
+	/* PAGE_SIZE (4096) = 8 sectors. Allocate BIO with enough room */
+	bio = bio_alloc(bdev, PAGE_SIZE >> SECTOR_SHIFT, REQ_OP_READ, GFP_KERNEL);
+	if (!bio) {
+		__free_page(page);
+		return -ENOMEM;
+	}
 	bio_set_dev(bio, bdev);
 	bio->bi_iter.bi_sector = sector;
-	__bio_add_page(bio, page, PAGE_SIZE, 0);
+	/* bio_alloc with nr_sectors > 0 automatically adds pages for the size */
+	/* No need for bio_add_page() - bio_alloc pre-adds them */
 
 	ret = lhsr_submit_bio_timeout(bio);
 	if (ret < 0) {
@@ -284,7 +306,7 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	buf = page_address(page);
 	stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
 	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
-	calc_csum = lhsr_crc32c(buf, LHSR_SB_SIZE);
+	calc_csum = crc32c(0xFFFFFFFF, buf, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
 
 	if (stored_csum != calc_csum) {
 		u64 backup_off = LHSR_SB_BACKUP_OFF(bdev_nr_sectors(bdev) << SECTOR_SHIFT);
@@ -314,7 +336,7 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 
 		stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
 		*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
-		calc_csum = lhsr_crc32c(buf, LHSR_SB_SIZE);
+		calc_csum = crc32c(0xFFFFFFFF, buf, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
 
 		if (stored_csum != calc_csum) {
 			DMERR("Both primary and backup superblock checksums invalid");
@@ -361,7 +383,7 @@ static void lhsr_init_superblock(struct lhsr_superblock *sb, u64 array_uuid,
 	sb->disk_count = disk_count;
 	sb->total_sectors = total_sectors;
 	sb->generation = 1;
-	sb->checksum = lhsr_crc32c((void *)sb, LHSR_SB_SIZE);
+	sb->checksum = crc32c(0xFFFFFFFF, (void *)sb, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
 }
 
 /* Array structure */
@@ -570,13 +592,14 @@ static void lhsr_io_complete(struct bio *bio)
 
 	arr = ti->private;
 
-	if (bio->bi_status != BLK_STS_OK) {
+		if (bio->bi_status != BLK_STS_OK) {
 		DMERR("I/O error: status=%d", bio->bi_status);
 		atomic_inc(&arr->io_errors);
 
 		/* Find which disk */
 		if (bio->bi_bdev) {
 			unsigned int i;
+			int should_fail = 0;
 			for (i = 0; i < arr->disks; i++) {
 				if (arr->disk[i] == bio->bi_bdev) {
 					arr->disk_errors[i]++;
@@ -584,19 +607,28 @@ static void lhsr_io_complete(struct bio *bio)
 					arr->last_error_jiffies = jiffies;
 
 					if (arr->disk_errors[i] >= arr->error_threshold) {
-						if (!(arr->failed_disks & (1 << i))) {
-							DMERR("Disk %u failed due to I/O errors", i);
-							arr->failed_disks |= (1 << i);
-							lhsr_update_disk_state(arr, i, LHSR_DISK_DEGRADED);
-							if (arr->primary_disk == i) {
-								arr->primary_disk = i == 0 ? 1 : 0;
-								DMINFO("Failover to disk %u", arr->primary_disk);
-							}
-							arr->state = LHSR_STATE_DEGRADED;
-							atomic_inc(&arr->failovers);
-						}
+						should_fail = 1;
 					}
 					break;
+				}
+			}
+
+			/* Update failed_disks with lock protection */
+			if (should_fail) {
+				down_write(&arr->sb_sem);
+				if (!(arr->failed_disks & (1 << i))) {
+					DMERR("Disk %u failed due to I/O errors", i);
+					arr->failed_disks |= (1 << i);
+					up_write(&arr->sb_sem);
+					lhsr_update_disk_state(arr, i, LHSR_DISK_DEGRADED);
+					if (arr->primary_disk == i) {
+						arr->primary_disk = i == 0 ? 1 : 0;
+						DMINFO("Failover to disk %u", arr->primary_disk);
+					}
+					arr->state = LHSR_STATE_DEGRADED;
+					atomic_inc(&arr->failovers);
+				} else {
+					up_write(&arr->sb_sem);
 				}
 			}
 		}
@@ -613,9 +645,10 @@ out:
 }
 
 /* Fast hash for UUID generation */
+/* Fast hash using 64-bit arithmetic to avoid overflow */
 static inline u64 fast_hash_32(u32 val)
 {
-	u32 hash = val * 0x9e370001UL;
+	u64 hash = (u64)val * 0x9e370001UL;
 	return hash >> 16;
 }
 
@@ -681,7 +714,10 @@ static void __used disk_check_work(struct work_struct *work)
 	}
 
 	if (new_failed) {
+		/* Update failed_disks with lock protection */
+		down_write(&arr->sb_sem);
 		arr->failed_disks |= new_failed;
+		up_write(&arr->sb_sem);
 		arr->state = LHSR_STATE_DEGRADED;
 		DMWARN("Failed disks mask: 0x%x", arr->failed_disks);
 
@@ -704,7 +740,6 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 {
 	struct lhsr_cksum_entry *entry = NULL;
 	struct bio *bio;
-	struct page *page;
 	void *buf;
 	u32 stored_csum = 0;
 	u32 calc_csum;
@@ -723,32 +758,50 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 		}
 	}
 
-	page = alloc_page(GFP_KERNEL);
-	if (!page)
+	/* LHSR_SCRUB_BLOCK_SIZE (128KB) requires multiple pages */
+	buf = kvmalloc(LHSR_SCRUB_BLOCK_SIZE, GFP_KERNEL);
+	if (!buf)
 		return -ENOMEM;
 
-	buf = page_address(page);
-
 	/* Read the block using bio */
-	bio = bio_alloc(arr->disk[disk_idx], 1, REQ_OP_READ, GFP_KERNEL);
+	bio = bio_alloc(arr->disk[disk_idx], 0, REQ_OP_READ, GFP_KERNEL);
 	if (!bio) {
-		__free_page(page);
+		kvfree(buf);
 		return -ENOMEM;
 	}
 	bio->bi_iter.bi_sector = offset;
-	__bio_add_page(bio, page, LHSR_SCRUB_BLOCK_SIZE, 0);
+	/* Add pages to bio to cover full scrub block size */
+	{
+		size_t bytes_remaining = LHSR_SCRUB_BLOCK_SIZE;
+		void *buf_ptr = buf;
+		while (bytes_remaining > 0) {
+			size_t page_bytes = min_t(size_t, bytes_remaining, PAGE_SIZE);
+			struct page *pg = vmalloc_to_page(buf_ptr);
+			if (!pg || !bio_add_page(bio, pg, page_bytes, offset_in_page(buf_ptr))) {
+				bio_put(bio);
+				bio = NULL;
+				break;
+			}
+			buf_ptr += page_bytes;
+			bytes_remaining -= page_bytes;
+		}
+	}
+	if (!bio) {
+		kvfree(buf);
+		return -ENOMEM;
+	}
 
 	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
 
 	if (ret != 0) {
 		DMERR("Scrub read failed at offset 0x%llx: %d", offset, ret);
-		__free_page(page);
+		kvfree(buf);
 		return ret;
 	}
 
 	/* Calculate checksum of read data */
-	calc_csum = lhsr_crc32c(buf, LHSR_SCRUB_BLOCK_SIZE);
+	calc_csum = crc32c(0xFFFFFFFF, buf, LHSR_SCRUB_BLOCK_SIZE) ^ 0xFFFFFFFF;
 
 	if (stored_csum == 0) {
 		/* No stored checksum - this is a new block, store the checksum */
@@ -762,7 +815,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 		} else {
 			DMWARN("Scrub: Checksum cache full, cannot store checksum for offset 0x%llx", offset);
 		}
-		__free_page(page);
+		kvfree(buf);
 		return 0;
 	}
 
@@ -774,7 +827,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 			entry->flags |= LHSR_BLOCK_CORRUPT;
 			atomic_inc(&arr->corruptions_detected);
 		}
-		__free_page(page);
+		kvfree(buf);
 		return -EIO;
 	}
 
@@ -782,7 +835,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	if (entry) {
 		entry->flags |= LHSR_BLOCK_VERIFIED;
 	}
-	__free_page(page);
+	kvfree(buf);
 	return 0;
 }
 
@@ -1045,10 +1098,12 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	for (i = 0; i < argc; i++)
 		DMINFO("ctr: argv[%u]=[%s]", i, argv[i]);
 
-	/* Need at least 2 args: type device */
-	if (argc < 2) {
-		DMERR("Need at least 2 args, got %u", argc);
-		ti->error = "Invalid arguments (need: type device)";
+	/* Validate argument count based on raid type */
+	/* Format: type [device offset] [device offset] ... */
+	/* Minimum: type + 1 device + 1 offset = 3 args */
+	if (argc < 3) {
+		DMERR("Need at least 3 args (type device offset), got %u", argc);
+		ti->error = "Invalid arguments (need: type device offset [device offset] ...)";
 		return -EINVAL;
 	}
 
@@ -1126,7 +1181,7 @@ if (strcmp(argv[0], "single") == 0) {
 	init_rwsem(&arr->sb_sem);
 
 	/* Initialize CRC table if not already done */
-	lhsr_init_crc_table();
+	/* CRC32c uses kernel crypto API - no initialization needed */
 
 	/* Get devices - arguments are "device offset" pairs */
 	/* argv[0] = type, then argv[1], argv[2] = dev1, offset1, etc. */
@@ -2041,13 +2096,13 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		err = kstrtouint(argv[1], 10, &disk_idx);
 		if (err || disk_idx >= arr->disks)
 			return -EINVAL;
-		err = kstrtouint(argv[1], 10, &disk_idx);
-		if (err || disk_idx >= arr->disks)
-			return -EINVAL;
 
 		DMINFO("Userspace marking disk %u as failed", disk_idx);
+		/* Use write semaphore for atomic update of failed_disks */
+		down_write(&arr->sb_sem);
 		arr->failed_disks |= (1 << disk_idx);
 		arr->disk_errors[disk_idx] = arr->error_threshold;
+		up_write(&arr->sb_sem);
 		lhsr_update_disk_state(arr, disk_idx, LHSR_DISK_DEGRADED);
 
 		if (arr->primary_disk == disk_idx) {
@@ -2068,8 +2123,11 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			return -EINVAL;
 
 		DMINFO("Userspace marking disk %u as online", disk_idx);
+		/* Use write semaphore for atomic update of failed_disks */
+		down_write(&arr->sb_sem);
 		arr->failed_disks &= ~(1 << disk_idx);
 		arr->disk_errors[disk_idx] = 0;
+		up_write(&arr->sb_sem);
 		lhsr_update_disk_state(arr, disk_idx, LHSR_DISK_HEALTHY);
 
 		if (arr->failed_disks == 0)
@@ -2272,14 +2330,10 @@ static int __init lhsr_init(void)
 		return r;
 	}
 
-	r = dm_register_target(&lhsr_target);
-	if (r) {
-		DMERR("Failed to register target: %d", r);
-		bioset_exit(&lhsr_bioset);
-		return r;
-	}
+	/* In kernel 6.12+, dm_register_target() returns void and uses BUG() on failure */
+	dm_register_target(&lhsr_target);
 
-	DMINFO("Module loaded: %s", LHSR_VERSION);
+	DMINFO("Module loaded: %s (target registered)", LHSR_VERSION);
 	return 0;
 }
 
@@ -2308,6 +2362,10 @@ static void __exit lhsr_exit(void)
 	}
 
 	/* Now safe to unregister and cleanup */
+	/* rcu_barrier() required before dm_unregister_target() in 6.12+ kernels
+	 * to ensure any pending RCU callbacks (from DM/block layer) complete */
+	rcu_barrier();
+	/* In kernel 6.12+, dm_unregister_target() returns void and uses BUG() on failure */
 	dm_unregister_target(&lhsr_target);
 	bioset_exit(&lhsr_bioset);
 	DMINFO("Module unloaded");
