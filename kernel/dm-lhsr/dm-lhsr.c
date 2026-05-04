@@ -851,6 +851,12 @@ static void scrub_work(struct work_struct *work)
 	if (arr->scrub_state != LHSR_SCRUB_RUNNING)
 		return;
 
+	/* Bail if array is being destroyed - prevent use-after-free */
+	if (atomic_read(&arr->destroying)) {
+		DMDEBUG("scrub_work: array being destroyed, skipping");
+		return;
+	}
+
 	/* Skip superblock area */
 	if (arr->scrub_offset < (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8)
 		arr->scrub_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
@@ -925,8 +931,9 @@ static void rebuild_work(struct work_struct *work)
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct lhsr_array *arr = container_of(dwork, struct lhsr_array, rebuild_work);
 	struct bio *bio;
-	struct page *page;
-	void *buf;
+	struct page **pages;
+	unsigned int nr_pages;
+	unsigned int i;  /* Iterator for page loops */
 	unsigned int source_disk;
 	u64 block_size = 128 * 1024;  /* 128KB chunks */
 	sector_t offset;
@@ -934,6 +941,12 @@ static void rebuild_work(struct work_struct *work)
 
 	if (!arr || arr->rebuild_state != LHSR_REBUILD_RUNNING)
 		return;
+
+	/* Bail if array is being destroyed - prevent use-after-free */
+	if (atomic_read(&arr->destroying)) {
+		DMDEBUG("rebuild_work: array being destroyed, skipping");
+		return;
+	}
 
 	if (!arr->rebuild_wq) {
 		DMERR("Rebuild workqueue not initialized");
@@ -981,53 +994,82 @@ static void rebuild_work(struct work_struct *work)
 	if (offset + (block_size >> SECTOR_SHIFT) > arr->size)
 		block_size = (arr->size - offset) << SECTOR_SHIFT;
 
-	/* Allocate page for I/O */
-	page = alloc_page(GFP_KERNEL);
-	if (!page) {
+	/* Allocate pages for I/O - block_size may be > PAGE_SIZE */
+	nr_pages = (block_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	pages = kcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
+	if (!pages) {
 		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
 		return;
 	}
 
-	buf = page_address(page);
+	for (i = 0; i < nr_pages; i++) {
+		pages[i] = alloc_page(GFP_KERNEL);
+		if (!pages[i]) {
+			unsigned int j;
+			for (j = 0; j < i; j++)
+				__free_page(pages[j]);
+			kfree(pages);
+			queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
+			return;
+		}
+	}
 
 	/* Read from source disk */
-	bio = bio_alloc(arr->disk[source_disk], 1, REQ_OP_READ, GFP_KERNEL);
+	bio = bio_alloc(arr->disk[source_disk], nr_pages, REQ_OP_READ, GFP_KERNEL);
 	if (!bio) {
 		DMERR("Rebuild: failed to allocate read bio");
-		__free_page(page);
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
 		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
 		return;
 	}
 	bio_set_dev(bio, arr->disk[source_disk]);
 	bio->bi_iter.bi_sector = offset;
-	__bio_add_page(bio, page, block_size,0);
+	for (i = 0; i < nr_pages; i++) {
+		unsigned int page_bytes = (i == nr_pages - 1) ?
+			block_size - (i << PAGE_SHIFT) : PAGE_SIZE;
+		__bio_add_page(bio, pages[i], page_bytes, 0);
+	}
 
 	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
 
 	if (ret != 0) {
 		DMERR("Rebuild read failed at offset 0x%llx", (u64)offset << SECTOR_SHIFT);
-		__free_page(page);
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
 		arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
 		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
 		return;
 	}
 
 	/* Write to rebuild disk */
-	bio = bio_alloc(arr->disk[arr->rebuild_disk], 1, REQ_OP_WRITE, GFP_KERNEL);
+	bio = bio_alloc(arr->disk[arr->rebuild_disk], nr_pages, REQ_OP_WRITE, GFP_KERNEL);
 	if (!bio) {
 		DMERR("Rebuild: failed to allocate write bio");
-		__free_page(page);
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
 		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
 		return;
 	}
 	bio_set_dev(bio, arr->disk[arr->rebuild_disk]);
 	bio->bi_iter.bi_sector = offset;
-	__bio_add_page(bio, page, block_size,0);
+	for (i = 0; i < nr_pages; i++) {
+		unsigned int page_bytes = (i == nr_pages - 1) ?
+			block_size - (i << PAGE_SHIFT) : PAGE_SIZE;
+		__bio_add_page(bio, pages[i], page_bytes, 0);
+	}
 
 	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
-	__free_page(page);
+
+	/* Free pages */
+	for (i = 0; i < nr_pages; i++)
+		__free_page(pages[i]);
+	kfree(pages);
 
 	if (ret != 0) {
 		DMERR("Rebuild write failed at offset 0x%llx", (u64)offset << SECTOR_SHIFT);
@@ -1345,6 +1387,10 @@ static void lhsr_dtr(struct dm_target *ti)
 	atomic_dec(&lhsr_active_devices);
 	DMINFO("dtr: Active devices now: %d", atomic_read(&lhsr_active_devices));
 
+	/* Mark array as destroying FIRST to prevent workqueue races */
+	DMINFO("dtr: Setting destroying flag");
+	atomic_set(&arr->destroying, 1);
+
 	DMINFO("dtr: Stopping health check workqueue (check_wq=%p)", arr->check_wq);
 
 	/* Stop the health check workqueue with timeout */
@@ -1358,10 +1404,6 @@ static void lhsr_dtr(struct dm_target *ti)
 		arr->check_wq = NULL;
 		DMINFO("dtr: check workqueue destroyed");
 	}
-
-	/* Mark array as destroying FIRST to prevent workqueue races */
-	DMINFO("dtr: Setting destroying flag");
-	atomic_set(&arr->destroying, 1);
 
 	DMINFO("dtr: Writing superblocks for %u disks", arr->disks);
 
