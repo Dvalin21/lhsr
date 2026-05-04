@@ -73,8 +73,8 @@ log_test "Test 6: Create single disk device"
 SIZE=$(blockdev --getsize "$DEVICE")
 log_info "Device size: $SIZE sectors"
 
-# Note: dmsetup table format is: start size type device [device...]
-dmsetup create "$DEVICE_NAME" --table "0 $SIZE lhsr single $DEVICE" 2>/dev/null && {
+# Note: dmsetup table format is: start size type device offset [device offset...]
+dmsetup create "$DEVICE_NAME" --table "0 $SIZE lhsr single $DEVICE 0" --noudevsync && {
     log_info "Device created: $DEVICE_NAME"
 } || {
     log_error "Failed to create device"
