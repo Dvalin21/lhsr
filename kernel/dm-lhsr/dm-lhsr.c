@@ -1015,6 +1015,8 @@ static void rebuild_work(struct work_struct *work)
 	}
 
 	/* Read from source disk */
+	DMDEBUG("rebuild: reading from disk %u at sector %llu (offset=0x%llx)",
+		source_disk, (u64)offset, (u64)offset << SECTOR_SHIFT);
 	bio = bio_alloc(arr->disk[source_disk], nr_pages, REQ_OP_READ, GFP_KERNEL);
 	if (!bio) {
 		DMERR("Rebuild: failed to allocate read bio");
@@ -1026,6 +1028,7 @@ static void rebuild_work(struct work_struct *work)
 	}
 	bio_set_dev(bio, arr->disk[source_disk]);
 	bio->bi_iter.bi_sector = offset;
+	DMDEBUG("rebuild: bio sector=%llu", (u64)bio->bi_iter.bi_sector);
 	for (i = 0; i < nr_pages; i++) {
 		unsigned int page_bytes = (i == nr_pages - 1) ?
 			block_size - (i << PAGE_SHIFT) : PAGE_SIZE;
@@ -1036,7 +1039,7 @@ static void rebuild_work(struct work_struct *work)
 	bio_put(bio);
 
 	if (ret != 0) {
-		DMERR("Rebuild read failed at offset 0x%llx", (u64)offset << SECTOR_SHIFT);
+		DMERR("Rebuild read failed at offset 0x%llx, ret=%d", (u64)offset << SECTOR_SHIFT, ret);
 		for (i = 0; i < nr_pages; i++)
 			__free_page(pages[i]);
 		kfree(pages);
