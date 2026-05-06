@@ -302,44 +302,6 @@ static void check_disk_health(struct disk_health_state *state, const char *dm_de
     state->last_check = time(NULL);
 }
 
-static void monitor_array(struct lhsr_array *arr)
-{
-    struct lhsr_status status;
-    struct lhsr_smart_data smart;
-    unsigned int i;
-    int ret;
-
-    ret = lhsr_array_status(arr, &status);
-    if (ret < 0) {
-        syslog(LOG_WARNING, "Failed to get status for array %s", arr->uuid);
-        return;
-    }
-
-    if (status.state != LHSR_STATE_HEALTHY) {
-        syslog(LOG_WARNING, "Array %s in degraded state: %u",
-              arr->uuid, status.state);
-    }
-
-    for (i = 0; i < status.disk_count; i++) {
-        if (status.disk_health[i] < 50) {
-            syslog(LOG_WARNING, "Disk %u in array %s has low health: %u",
-                  i, arr->uuid, status.disk_health[i]);
-        }
-
-        if (arr->disks[i]) {
-            ret = lhsr_disk_get_smart(arr->disks[i], &smart);
-            if (ret == 0) {
-                if (smart.reallocated > 100)
-                    syslog(LOG_WARNING, "Disk %u has high reallocated sectors: %d",
-                          i, smart.reallocated);
-                if (smart.temperature > 50)
-                    syslog(LOG_WARNING, "Disk %u temperature high: %d",
-                          i, smart.temperature);
-            }
-        }
-    }
-}
-
 static void *monitor_thread(void *arg)
 {
     struct lhsr_context *ctx = arg;
