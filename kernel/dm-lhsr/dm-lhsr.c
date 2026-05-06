@@ -22,6 +22,7 @@
 #include <linux/delay.h>
 
 #include "dm_lhsr.h"
+#include "dm-lhsr-utils.h"
 
 extern void xor_blocks(void *dest, const void *src, size_t len);
 
@@ -776,36 +777,36 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	}
 
 	/* LHSR_SCRUB_BLOCK_SIZE (128KB) requires multiple pages */
-	buf = kvmalloc(LHSR_SCRUB_BLOCK_SIZE, GFP_KERNEL);
-	if (!buf)
-		return -ENOMEM;
+	/* Use page vector for scrub block */
+	pages = lhsr_alloc_page_vec(LHSR_SCRUB_BLOCK_SIZE, GFP_KERNEL);
+	if (IS_ERR(pages)) {
+		return PTR_ERR(pages);
+	}
 
 	/* Read the block using bio */
-	bio = bio_alloc(arr->disk[disk_idx], 0, REQ_OP_READ, GFP_KERNEL);
+	bio = bio_alloc_bioset(arr->disk[disk_idx], 0, REQ_OP_READ, GFP_KERNEL, &lhsr_bioset);
 	if (!bio) {
-		kvfree(buf);
+		lhsr_free_page_vec(pages, LHSR_SCRUB_BLOCK_SIZE);
 		return -ENOMEM;
 	}
 	bio->bi_iter.bi_sector = offset;
-	/* Add pages to bio to cover full scrub block size */
+
+	/* Add pages to bio */
 	{
 		size_t bytes_remaining = LHSR_SCRUB_BLOCK_SIZE;
 		void *buf_ptr = buf;
+		unsigned int pg_idx = 0;
 		while (bytes_remaining > 0) {
 			size_t page_bytes = min_t(size_t, bytes_remaining, PAGE_SIZE);
-			struct page *pg = vmalloc_to_page(buf_ptr);
-			if (!pg || !bio_add_page(bio, pg, page_bytes, offset_in_page(buf_ptr))) {
+			if (!bio_add_page(bio, pages[pg_idx], page_bytes, 0)) {
 				bio_put(bio);
-				bio = NULL;
-				break;
+				lhsr_free_page_vec(pages, LHSR_SCRUB_BLOCK_SIZE);
+				return -ENOMEM;
 			}
 			buf_ptr += page_bytes;
 			bytes_remaining -= page_bytes;
+			pg_idx++;
 		}
-	}
-	if (!bio) {
-		kvfree(buf);
-		return -ENOMEM;
 	}
 
 	ret = lhsr_submit_bio_timeout(bio);
@@ -1012,23 +1013,10 @@ static void rebuild_work(struct work_struct *work)
 		block_size = (arr->size - offset) << SECTOR_SHIFT;
 
 	/* Allocate pages for I/O - block_size may be > PAGE_SIZE */
-	nr_pages = (block_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	pages = kcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
-	if (!pages) {
-		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
+	pages = lhsr_alloc_page_vec(block_size, GFP_KERNEL);
+	if (IS_ERR(pages)) {
+		queue_delayed_work(arr->rebuild_work, HZ);
 		return;
-	}
-
-	for (i = 0; i < nr_pages; i++) {
-		pages[i] = alloc_page(GFP_KERNEL);
-		if (!pages[i]) {
-			unsigned int j;
-			for (j = 0; j < i; j++)
-				__free_page(pages[j]);
-			kfree(pages);
-			queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
-			return;
-		}
 	}
 
 	/* Read from source disk */
@@ -1087,10 +1075,7 @@ static void rebuild_work(struct work_struct *work)
 	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
 
-	/* Free pages */
-	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
-	kfree(pages);
+	lhsr_free_page_vec(pages, block_size);
 
 	if (ret != 0) {
 		DMERR("Rebuild write failed at offset 0x%llx", (u64)offset << SECTOR_SHIFT);
