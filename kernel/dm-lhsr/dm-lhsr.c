@@ -23,6 +23,8 @@
 
 #include "dm_lhsr.h"
 
+extern void xor_blocks(void *dest, const void *src, size_t len);
+
 #define DM_MSG_PREFIX "lhsr"
 #define LHSR_VERSION "1.3.0"
 
@@ -309,14 +311,9 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	ret = lhsr_submit_bio_timeout(bio);
 	if (ret < 0) {
 		DMERR("Superblock read failed/timed out: %d", ret);
-		if (ret == -ETIMEDOUT) {
-			/* Don't free bio/page - completion handler will handle bio */
-			/* Actually, completion handler only frees ctx, not bio/page */
-			/* We need to force completion and wait */
-			bio_endio(bio);
-			/* Wait briefly for completion handler */
-			msleep(100);
-		}
+		/* Note: On timeout, lhsr_submit_bio_timeout() already waited
+		 * for real completion. Bio is already completed by block layer.
+		 * Just clean up resources here. */
 		bio_put(bio);
 		__free_page(page);
 		return -EIO;
@@ -1509,10 +1506,8 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 	size_t long_words = len / sizeof(long);
 	size_t rem_bytes = len % sizeof(long);
 
-	/* Initialize parity with first data block */
 	memcpy(p, src[0], len);
 
-	/* XOR remaining data blocks using long words */
 	for (i = 1; i < data_disks; i++) {
 		long *p_long = (long *)p;
 		long *s_long = (long *)src[i];
@@ -1520,7 +1515,6 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 			p_long[j] ^= s_long[j];
 	}
 
-	/* Handle remaining bytes */
 	if (rem_bytes) {
 		size_t offset = long_words * sizeof(long);
 		for (i = 1; i < data_disks; i++) {
@@ -2441,46 +2435,60 @@ static void __exit lhsr_exit(void)
 	DMINFO("Module unloaded");
 }
 
+/* Precomputed 2^i in GF(2^8) for RAID6 Reed-Solomon */
+static u8 rs_power_table[256];
+
+static void __init lhsr_rs_table_init(void)
+{
+	unsigned int i;
+	rs_power_table[0] = 1;
+	for (i = 1; i < 256; i++)
+		rs_power_table[i] = (rs_power_table[i-1] << 1) ^
+			(rs_power_table[i-1] & 0x80 ? 0x1d : 0);
+}
+
+static inline u8 gf256_multiply(u8 a, u8 b)
+{
+	u8 result = 0;
+	u8 high_bit;
+	while (b) {
+		if (b & 1)
+			result ^= a;
+		high_bit = a & 0x80;
+		a = (a << 1) ^ (high_bit ? 0x1d : 0);
+		b >>= 1;
+	}
+	return result;
+}
+
 /*
  * Reed-Solomon P+Q parity for RAID6
  * P = XOR of all data blocks (same as RAID5)
  * Q = sum of (2^i * data[i]) where coefficient is 2^i in GF(2^8)
  */
 static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
-                         unsigned int data_disks, size_t len)
+                           unsigned int data_disks, size_t len)
 {
 	u8 *p = parity_p;
 	u8 *q = parity_q;
 	u8 **src = (u8 **)data;
 	unsigned int i, j;
 
-	/* Initialize P and Q with first data block */
-	memcpy(p, src[0], len);
-	memcpy(q, src[0], len);
+	memset(p, 0, len);
+	memset(q, 0, len);
 
-	/* For each remaining data block, compute P and Q */
-	for (i = 1; i < data_disks; i++) {
+	/* For each data block, compute P and Q */
+	for (i = 0; i < data_disks; i++) {
+		u8 coeff = rs_power_table[i];  /* 2^i precomputed */
 		u8 *s = src[i];
 
 		/* P = XOR (same as RAID5) */
 		for (j = 0; j < len; j++)
 			p[j] ^= s[j];
 
-		/*
-		 * Q = sum of (2^i * data[i]) in GF(2^8)
-		 * For RAID6: Q_i = 2^i * D_i (multiplication in GF(2^8))
-		 * Simplified: multiply by 2^i using primitive polynomial 0x11d
-		 */
-		for (j = 0; j < len; j++) {
-			/* Multiply by 2^i in GF(2^8) */
-			u8 val = s[j];
-			unsigned int k;
-			for (k = 0; k < i; k++) {
-				/* Multiply by 2 in GF(2^8) with primitive polynomial 0x11d */
-				val = (val << 1) ^ (val & 0x80 ? 0x1d : 0);
-			}
-			q[j] ^= val;
-		}
+		/* Q = sum of (coeff * data[i]) in GF(2^8) */
+		for (j = 0; j < len; j++)
+			q[j] ^= gf256_multiply(coeff, s[j]);
 	}
 }
 
