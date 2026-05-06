@@ -101,20 +101,6 @@ static uint32_t crc32c(uint8_t *buf, size_t len)
     return crc ^ 0xFFFFFFFF;
 }
 
-static void hexdump(uint8_t *buf, size_t len)
-{
-    size_t i;
-    for (i = 0; i < len; i++) {
-        printf("%02x", buf[i]);
-        if ((i + 1) % 32 == 0)
-            printf("\n");
-        else if ((i + 1) % 8 == 0)
-            printf(" ");
-    }
-    if (len % 32 != 0)
-        printf("\n");
-}
-
 static int read_superblock(int fd, off_t offset, struct lhsr_sb *sb, int verify)
 {
     ssize_t ret;
