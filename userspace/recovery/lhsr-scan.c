@@ -193,8 +193,11 @@ static int scan_disk(const char *device, int verbose, int do_recovery)
                (unsigned long long)sb_primary.total_sectors,
                (double)sb_primary.total_sectors / 2048 / 1024);
         printf("Generation: %llu\n", (unsigned long long)sb_primary.generation);
-        printf("Created: %s", ctime((time_t *)&sb_primary.creation_time));
-        printf("Updated: %s", ctime((time_t *)&sb_primary.last_update));
+        /* Copy packed members to aligned local variables */
+        time_t creation_time = (time_t)sb_primary.creation_time;
+        time_t last_update = (time_t)sb_primary.last_update;
+        printf("Created: %s", ctime(&creation_time));
+        printf("Updated: %s", ctime(&last_update));
         printf("Checksum: 0x%08x [VALID]\n", sb_primary.checksum);
         found = 1;
     }
