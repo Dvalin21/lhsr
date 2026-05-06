@@ -179,7 +179,6 @@ static int run_command(const char *cmd, char *output, size_t out_size)
 /* Poll SMART data from a disk - supports both SATA and NVMe */
 static int poll_smart_data(const char *device, struct lhsr_smart_data *smart)
 {
-    char line[256];
     char output[4096];
     int ret = -1;
 
