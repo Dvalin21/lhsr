@@ -216,8 +216,6 @@ static int cmd_bitrot_log(int argc, char **argv)
 /* Message command - send message to kernel via dmsetup */
 static int cmd_message(int argc, char **argv)
 {
-	int ret;
-
 	if (argc < 4) {
 		fprintf(stderr, "Usage: %s message <device> <message> [args]\n",
 			PROGNAME);
