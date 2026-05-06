@@ -32,6 +32,8 @@
 /* Completion-based BIO submission with timeout */
 struct lhsr_bio_ctx {
 	struct completion done;
+	atomic_t completed;	/* Flag to prevent double completion */
+	int timed_out;		/* Flag set on timeout - bio still in-flight */
 	int error;
 };
 
@@ -60,12 +62,14 @@ struct lhsr_raid_5_write_ctx {
 	int status;			/* Final status */
 	void *parity_buf;		/* P parity buffer (RAID5/6) */
 	void *parity_q_buf;		/* Q parity buffer (RAID6 only) */
-	struct bio *parity_bio;		/* P parity write bio */
+	struct bio *parity_bio;	/* P parity write bio */
 	struct bio *parity_q_bio;	/* Q parity write bio (RAID6) */
-	unsigned int num_disks;		/* Total data disks in array */
-	unsigned int working;		/* Number of working data disks */
+	unsigned int num_disks;	/* Total data disks in array */
+	unsigned int working;	/* Number of working data disks */
 	sector_t offset;		/* Sector offset for writes */
+	size_t bio_size;			/* Byte count stored at write start (safe from completion) */
 	void **data_bufs;		/* Array of data buffers (working only) */
+	struct page **data_pages;	/* Array of pages for kunmap (working only) */
 	unsigned int disk_map[0];	/* Flex array: working_idx -> disk_idx */
 };
 
@@ -80,6 +84,7 @@ struct lhsr_raid_5_read_ctx {
 	unsigned int num_disks;	/* Total data disks */
 	unsigned int working;		/* Number of working data disks */
 	sector_t offset;			/* Sector offset */
+	size_t bio_size;			/* Byte count stored at read start (safe from completion) */
 	void **data_bufs;			/* Array of data buffers (working only) */
 	unsigned int disk_map[0];	/* Flex array: working_idx -> disk_idx */
 };
@@ -87,6 +92,11 @@ struct lhsr_raid_5_read_ctx {
 static void lhsr_bio_complete(struct bio *bio)
 {
 	struct lhsr_bio_ctx *ctx = bio->bi_private;
+
+	/* Prevent double completion (race between timeout and normal completion) */
+	if (atomic_cmpxchg(&ctx->completed, 0, 1) != 0)
+		return; /* Already completed */
+
 	ctx->error = bio->bi_status;
 	complete(&ctx->done);
 	/* Note: ctx is NOT freed here - see lhsr_submit_bio_timeout() */
@@ -101,13 +111,16 @@ static int lhsr_submit_bio_timeout(struct bio *bio)
 {
 	struct lhsr_bio_ctx *ctx;
 	int ret;
+	int error;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
 
 	init_completion(&ctx->done);
+	atomic_set(&ctx->completed, 0); /* Initialize completion flag */
 	ctx->error = 0;
+	ctx->timed_out = 0;
 	bio->bi_private = ctx;
 	bio->bi_end_io = lhsr_bio_complete;
 
@@ -115,24 +128,31 @@ static int lhsr_submit_bio_timeout(struct bio *bio)
 
 	ret = wait_for_completion_timeout(&ctx->done, LHSR_BIO_TIMEOUT);
 	if (ret == 0) {
-		/* Timeout - force completion */
+		/* Timeout - mark ctx as timed out, do NOT touch in-flight bio */
 		DMERR("BIO timed out after %d seconds", LHSR_BIO_TIMEOUT / HZ);
 		/*
-		 * bio_endio() will call lhsr_bio_complete() which calls complete()
-		 * We need to wait for that, then free ctx.
-		 * Set error before bio_endio() so completion handler gets it.
+		 * CRITICAL: Cannot call bio_endio() on in-flight bio!
+		 * The bio is still in the block layer's queue.
+		 * Instead, mark timed out and let real completion handle it.
+		 * The atomic_cmpxchg in lhsr_bio_complete protects
+		 * against race between timeout and normal completion.
 		 */
+		ctx->timed_out = 1;
 		ctx->error = BLK_STS_IOERR;
-		bio_endio(bio);
-		/* Wait for completion handler to run */
+
+		/* Wait for the real completion to arrive */
 		wait_for_completion(&ctx->done);
+
+		/* Now bio is done, safe to free ctx */
+		error = -ETIMEDOUT;
 		kfree(ctx);
-		return -ETIMEDOUT;
+		return error;
 	}
 
-	/* Normal completion - free ctx and return status */
+	/* Normal completion - save error then free ctx */
+	error = ctx->error ? -EIO : 0;
 	kfree(ctx);
-	return ctx->error ? -EIO : 0;
+	return error;
 }
 
 
@@ -473,7 +493,7 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 	struct lhsr_raid_5_read_ctx *ctx = bio->bi_private;
 	struct lhsr_array *arr = ctx->arr;
 	int is_raid6 = (arr->raid_type == 3);
-	size_t bio_size = ctx->orig_bio->bi_iter.bi_size;
+	size_t bio_size = ctx->bio_size; /* Use stored size, NOT orig_bio->bi_iter after completion */
 
 	if (bio->bi_status)
 		ctx->status = bio->bi_status;
@@ -1017,7 +1037,8 @@ static void rebuild_work(struct work_struct *work)
 	/* Read from source disk */
 	DMDEBUG("rebuild: reading from disk %u at sector %llu (offset=0x%llx)",
 		source_disk, (u64)offset, (u64)offset << SECTOR_SHIFT);
-	bio = bio_alloc(arr->disk[source_disk], nr_pages, REQ_OP_READ, GFP_KERNEL);
+	bio = bio_alloc_bioset(arr->disk[source_disk], nr_pages,
+			     REQ_OP_READ, GFP_KERNEL, &lhsr_bioset);
 	if (!bio) {
 		DMERR("Rebuild: failed to allocate read bio");
 		for (i = 0; i < nr_pages; i++)
@@ -1519,6 +1540,9 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 	void *data_buf;
 	unsigned int i, working_idx = 0;
 	int is_raid6 = (arr->raid_type == 3);
+	int parity_disks = is_raid6 ? 2 : 1;
+	unsigned int p_parity_idx = arr->disks - parity_disks;
+	unsigned int q_parity_idx = arr->disks - 1; /* Last disk for Q parity */
 
 	if (bio->bi_status)
 		ctx->status = bio->bi_status;
@@ -1545,7 +1569,7 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 	if (atomic_dec_and_test(&ctx->pending)) {
 		/* All data writes done - compute parity and write it */
 		struct bio *parity_bio;
-		size_t bio_size = ctx->orig_bio->bi_iter.bi_size;
+		size_t bio_size = ctx->bio_size; /* Use stored size, NOT orig_bio->bi_iter after completion */
 
 		/* Compute P parity (XOR for both RAID5 and RAID6) */
 		lhsr_xor_parity(ctx->parity_buf, (void **)ctx->data_bufs,
@@ -1566,8 +1590,8 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 		}
 
 		/* Write P parity if parity disk is working */
-		if (!(arr->failed_disks & (1 << ctx->num_disks))) {
-			parity_bio = bio_alloc_bioset(arr->disk[ctx->num_disks], 0,
+		if (!(arr->failed_disks & (1 << p_parity_idx))) {
+			parity_bio = bio_alloc_bioset(arr->disk[p_parity_idx], 0,
 						      REQ_OP_WRITE, GFP_NOIO, &lhsr_bioset);
 			if (parity_bio) {
 				if (bio_add_page(parity_bio,
@@ -1591,9 +1615,9 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 
 		/* For RAID6, also write Q parity to second parity disk */
 		if (is_raid6 && ctx->parity_q_buf &&
-		    !(arr->failed_disks & (1 << (ctx->num_disks + 1)))) {
+		    !(arr->failed_disks & (1 << q_parity_idx))) {
 			struct bio *q_parity_bio;
-			q_parity_bio = bio_alloc_bioset(arr->disk[ctx->num_disks + 1], 0,
+			q_parity_bio = bio_alloc_bioset(arr->disk[q_parity_idx], 0,
 							REQ_OP_WRITE, GFP_NOIO, &lhsr_bioset);
 			if (q_parity_bio) {
 				if (bio_add_page(q_parity_bio,
@@ -1613,11 +1637,11 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 			}
 		}
 
-		/* If no parity write needed, complete original bio */
-		if (((arr->failed_disks & (1 << ctx->num_disks)) ||
-		    !ctx->parity_bio) &&
-		    (!is_raid6 || (arr->failed_disks & (1 << (ctx->num_disks + 1))) ||
-		     !ctx->parity_q_bio)) {
+	/* If no parity write needed, complete original bio */
+	if (((arr->failed_disks & (1 << p_parity_idx)) ||
+	    !ctx->parity_bio) &&
+	    (!is_raid6 || (arr->failed_disks & (1 << q_parity_idx)) ||
+	     !ctx->parity_q_bio)) {
 			ctx->orig_bio->bi_status = ctx->status;
 			bio_endio(ctx->orig_bio);
 			kfree(ctx->parity_buf);
@@ -1765,6 +1789,7 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 		ctx->num_disks = data_disks;
 		ctx->working = working_disks;
 		ctx->offset = offset;
+		ctx->bio_size = bio_size;	/* Store byte count at write start, safe from completion */
 		atomic_set(&ctx->pending, 0);
 		ctx->status = 0;
 
