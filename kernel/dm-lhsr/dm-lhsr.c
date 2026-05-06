@@ -22,9 +22,6 @@
 #include <linux/delay.h>
 
 #include "dm_lhsr.h"
-#include "dm-lhsr-utils.h"
-
-extern void xor_blocks(void *dest, const void *src, size_t len);
 
 #define DM_MSG_PREFIX "lhsr"
 #define LHSR_VERSION "1.3.0"
@@ -48,10 +45,52 @@ static void lhsr_raid_5_data_endio(struct bio *bio);
 static void lhsr_raid_5_parity_endio(struct bio *bio);
 static void lhsr_raid_5_read_endio(struct bio *bio);
 static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
+
+/* Page vector helpers - inline from Task 3 */
+static struct page **lhsr_alloc_page_vec(size_t size, gfp_t gfp)
+{
+	unsigned int nr_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	struct page **pages;
+	unsigned int i;
+
+	pages = kcalloc(nr_pages, sizeof(struct page *), gfp);
+	if (!pages)
+		return ERR_PTR(-ENOMEM);
+
+	for (i = 0; i < nr_pages; i++) {
+		pages[i] = alloc_page(gfp);
+		if (!pages[i])
+			goto err_free;
+	}
+	return pages;
+
+err_free:
+	while (i--)
+		__free_page(pages[i]);
+	kfree(pages);
+	return ERR_PTR(-ENOMEM);
+}
+
+static void lhsr_free_page_vec(struct page **pages, size_t size)
+{
+	unsigned int nr_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	unsigned int i;
+
+	if (!pages || IS_ERR(pages))
+		return;
+
+	for (i = 0; i < nr_pages; i++)
+		__free_page(pages[i]);
+	kfree(pages);
+}
+
 static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
                            unsigned int data_disks, size_t len);
 
 static struct bio_set lhsr_bioset;
+
+/* Precomputed 2^i in GF(2^8) for RAID6 Reed-Solomon */
+static u8 rs_power_table[256];
 
 /* Active device tracking to prevent use-after-unload */
 static atomic_t lhsr_active_devices = ATOMIC_INIT(0);
@@ -312,9 +351,14 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	ret = lhsr_submit_bio_timeout(bio);
 	if (ret < 0) {
 		DMERR("Superblock read failed/timed out: %d", ret);
-		/* Note: On timeout, lhsr_submit_bio_timeout() already waited
-		 * for real completion. Bio is already completed by block layer.
-		 * Just clean up resources here. */
+		if (ret == -ETIMEDOUT) {
+			/* Don't free bio/page - completion handler will handle bio */
+			/* Actually, completion handler only frees ctx, not bio/page */
+			/* We need to force completion and wait */
+			bio_endio(bio);
+			/* Wait briefly for completion handler */
+			msleep(100);
+		}
 		bio_put(bio);
 		__free_page(page);
 		return -EIO;
@@ -777,36 +821,36 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	}
 
 	/* LHSR_SCRUB_BLOCK_SIZE (128KB) requires multiple pages */
-	/* Use page vector for scrub block */
-	pages = lhsr_alloc_page_vec(LHSR_SCRUB_BLOCK_SIZE, GFP_KERNEL);
-	if (IS_ERR(pages)) {
-		return PTR_ERR(pages);
-	}
+	buf = kvmalloc(LHSR_SCRUB_BLOCK_SIZE, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
 
 	/* Read the block using bio */
-	bio = bio_alloc_bioset(arr->disk[disk_idx], 0, REQ_OP_READ, GFP_KERNEL, &lhsr_bioset);
+	bio = bio_alloc(arr->disk[disk_idx], 0, REQ_OP_READ, GFP_KERNEL);
 	if (!bio) {
-		lhsr_free_page_vec(pages, LHSR_SCRUB_BLOCK_SIZE);
+		kvfree(buf);
 		return -ENOMEM;
 	}
 	bio->bi_iter.bi_sector = offset;
-
-	/* Add pages to bio */
+	/* Add pages to bio to cover full scrub block size */
 	{
 		size_t bytes_remaining = LHSR_SCRUB_BLOCK_SIZE;
 		void *buf_ptr = buf;
-		unsigned int pg_idx = 0;
 		while (bytes_remaining > 0) {
 			size_t page_bytes = min_t(size_t, bytes_remaining, PAGE_SIZE);
-			if (!bio_add_page(bio, pages[pg_idx], page_bytes, 0)) {
+			struct page *pg = vmalloc_to_page(buf_ptr);
+			if (!pg || !bio_add_page(bio, pg, page_bytes, offset_in_page(buf_ptr))) {
 				bio_put(bio);
-				lhsr_free_page_vec(pages, LHSR_SCRUB_BLOCK_SIZE);
-				return -ENOMEM;
+				bio = NULL;
+				break;
 			}
 			buf_ptr += page_bytes;
 			bytes_remaining -= page_bytes;
-			pg_idx++;
 		}
+	}
+	if (!bio) {
+		kvfree(buf);
+		return -ENOMEM;
 	}
 
 	ret = lhsr_submit_bio_timeout(bio);
@@ -1013,10 +1057,23 @@ static void rebuild_work(struct work_struct *work)
 		block_size = (arr->size - offset) << SECTOR_SHIFT;
 
 	/* Allocate pages for I/O - block_size may be > PAGE_SIZE */
-	pages = lhsr_alloc_page_vec(block_size, GFP_KERNEL);
-	if (IS_ERR(pages)) {
-		queue_delayed_work(arr->rebuild_work, HZ);
+	nr_pages = (block_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+	pages = kcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
+	if (!pages) {
+		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
 		return;
+	}
+
+	for (i = 0; i < nr_pages; i++) {
+		pages[i] = alloc_page(GFP_KERNEL);
+		if (!pages[i]) {
+			unsigned int j;
+			for (j = 0; j < i; j++)
+				__free_page(pages[j]);
+			kfree(pages);
+			queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ);
+			return;
+		}
 	}
 
 	/* Read from source disk */
@@ -1075,7 +1132,10 @@ static void rebuild_work(struct work_struct *work)
 	ret = lhsr_submit_bio_timeout(bio);
 	bio_put(bio);
 
-	lhsr_free_page_vec(pages, block_size);
+	/* Free pages */
+	for (i = 0; i < nr_pages; i++)
+		__free_page(pages[i]);
+	kfree(pages);
 
 	if (ret != 0) {
 		DMERR("Rebuild write failed at offset 0x%llx", (u64)offset << SECTOR_SHIFT);
@@ -1491,8 +1551,10 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 	size_t long_words = len / sizeof(long);
 	size_t rem_bytes = len % sizeof(long);
 
+	/* Initialize parity with first data block */
 	memcpy(p, src[0], len);
 
+	/* XOR remaining data blocks using long words */
 	for (i = 1; i < data_disks; i++) {
 		long *p_long = (long *)p;
 		long *s_long = (long *)src[i];
@@ -1500,6 +1562,7 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 			p_long[j] ^= s_long[j];
 	}
 
+	/* Handle remaining bytes */
 	if (rem_bytes) {
 		size_t offset = long_words * sizeof(long);
 		for (i = 1; i < data_disks; i++) {
@@ -2369,6 +2432,9 @@ static struct target_type lhsr_target = {
 };
 
 /* Module initialization */
+
+/* Forward declaration */
+static void __init lhsr_rs_table_init(void);
 static int __init lhsr_init(void)
 {
 	int r;
@@ -2378,6 +2444,9 @@ static int __init lhsr_init(void)
 		DMERR("Failed to initialize bioset: %d", r);
 		return r;
 	}
+
+	/* Initialize Reed-Solomon table for RAID6 */
+	lhsr_rs_table_init();
 
 	/* In kernel 6.12+, dm_register_target() returns void and uses BUG() on failure */
 	dm_register_target(&lhsr_target);
@@ -2420,36 +2489,10 @@ static void __exit lhsr_exit(void)
 	DMINFO("Module unloaded");
 }
 
-/* Precomputed 2^i in GF(2^8) for RAID6 Reed-Solomon */
-static u8 rs_power_table[256];
-
-static void __init lhsr_rs_table_init(void)
-{
-	unsigned int i;
-	rs_power_table[0] = 1;
-	for (i = 1; i < 256; i++)
-		rs_power_table[i] = (rs_power_table[i-1] << 1) ^
-			(rs_power_table[i-1] & 0x80 ? 0x1d : 0);
-}
-
-static inline u8 gf256_multiply(u8 a, u8 b)
-{
-	u8 result = 0;
-	u8 high_bit;
-	while (b) {
-		if (b & 1)
-			result ^= a;
-		high_bit = a & 0x80;
-		a = (a << 1) ^ (high_bit ? 0x1d : 0);
-		b >>= 1;
-	}
-	return result;
-}
-
 /*
  * Reed-Solomon P+Q parity for RAID6
  * P = XOR of all data blocks (same as RAID5)
- * Q = sum of (2^i * data[i]) where coefficient is 2^i in GF(2^8)
+ * Q = sum of (coeff[i] * data[i]) where coeff[i] = 2^i precomputed in GF(2^8)
  */
 static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
                            unsigned int data_disks, size_t len)
@@ -2464,7 +2507,7 @@ static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
 
 	/* For each data block, compute P and Q */
 	for (i = 0; i < data_disks; i++) {
-		u8 coeff = rs_power_table[i];  /* 2^i precomputed */
+		u8 coeff = rs_power_table[i];	/* 2^i precomputed */
 		u8 *s = src[i];
 
 		/* P = XOR (same as RAID5) */
@@ -2472,9 +2515,33 @@ static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
 			p[j] ^= s[j];
 
 		/* Q = sum of (coeff * data[i]) in GF(2^8) */
-		for (j = 0; j < len; j++)
-			q[j] ^= gf256_multiply(coeff, s[j]);
+		for (j = 0; j < len; j++) {
+			u8 val = s[j];
+			u8 result = 0;
+			u8 high_bit;
+			u8 b = coeff;
+
+			/* GF(2^8) multiplication using Russian peasant */
+			while (b) {
+				if (b & 1)
+					result ^= val;
+				high_bit = val & 0x80;
+				val = (val << 1) ^ (high_bit ? 0x1d : 0);
+				b >>= 1;
+			}
+			q[j] ^= result;
+		}
 	}
+}
+
+/* Initialize Reed-Solomon power table: rs_power_table[i] = 2^i in GF(2^8) */
+static void __init lhsr_rs_table_init(void)
+{
+	unsigned int i;
+	rs_power_table[0] = 1;
+	for (i = 1; i < 256; i++)
+		rs_power_table[i] = (rs_power_table[i-1] << 1) ^
+			(rs_power_table[i-1] & 0x80 ? 0x1d : 0);
 }
 
 module_init(lhsr_init);
