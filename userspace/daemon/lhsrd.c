@@ -110,11 +110,6 @@ static int daemonize(void)
     return 0;
 }
 
-static void log_status(const char *msg)
-{
-    if (verbose)
-        syslog(LOG_DEBUG, "%s", msg);
-}
 
 /* Execute command and get output - safe version using fork+exec+pipe */
 static int run_command(const char *cmd, char *output, size_t out_size)
