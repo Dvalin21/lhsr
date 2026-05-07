@@ -4,6 +4,15 @@
  *
  * Copyright (C) 2026 LHSR Team
  * License: GPLv3
+ *
+ * DATA STRUCTURE DESIGN:
+ *   The core data structure is struct lhsr_array, which models a RAID array
+ *   as a set of block devices, a raid type (single/mirror/raid5/raid6), and
+ *   associated metadata (superblocks, checksum cache, scrub/rebuild state).
+ *
+ *   I/O model: All synchronous I/O uses submit_bio_wait() — the kernel's
+ *   standard synchronous bio submission API.  There is NO ad-hoc timeout
+ *   mechanism.  If a device is dead the block layer's own timeouts will fire.
  */
 
 #include <linux/module.h>
@@ -25,17 +34,6 @@
 
 #define DM_MSG_PREFIX "lhsr"
 #define LHSR_VERSION "1.3.0"
-
-/* Timeout for BIO operations (5 seconds) */
-#define LHSR_BIO_TIMEOUT (5 * HZ)
-
-/* Completion-based BIO submission with timeout */
-struct lhsr_bio_ctx {
-	struct completion done;
-	atomic_t completed;	/* Flag to prevent double completion */
-	int timed_out;		/* Flag set on timeout - bio still in-flight */
-	int error;
-};
 
 /* Forward declarations for RAID5/6 write */
 struct lhsr_raid_5_write_ctx;
@@ -92,73 +90,6 @@ struct lhsr_raid_5_read_ctx {
 	unsigned int disk_map[0];	/* Flex array: working_idx -> disk_idx */
 };
 
-static void lhsr_bio_complete(struct bio *bio)
-{
-	struct lhsr_bio_ctx *ctx = bio->bi_private;
-
-	/* Prevent double completion (race between timeout and normal completion) */
-	if (atomic_cmpxchg(&ctx->completed, 0, 1) != 0)
-		return; /* Already completed */
-
-	ctx->error = bio->bi_status;
-	complete(&ctx->done);
-	kfree(ctx);
-}
-
-/* Submit BIO with timeout - returns 0 on success, -errno on failure
- *
- * Uses heap-allocated ctx that completion handler frees.
- * If timeout fires, we force BIO completion via bio_endio() and wait.
- */
-static int lhsr_submit_bio_timeout(struct bio *bio)
-{
-	struct lhsr_bio_ctx *ctx;
-	int ret;
-	int error;
-
-	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
-	if (!ctx)
-		return -ENOMEM;
-
-	init_completion(&ctx->done);
-	atomic_set(&ctx->completed, 0); /* Initialize completion flag */
-	ctx->error = 0;
-	ctx->timed_out = 0;
-	bio->bi_private = ctx;
-	bio->bi_end_io = lhsr_bio_complete;
-
-	submit_bio(bio);
-
-	ret = wait_for_completion_timeout(&ctx->done, LHSR_BIO_TIMEOUT);
-	if (ret == 0) {
-		/* Timeout - mark ctx as timed out, do NOT touch in-flight bio */
-		DMERR("BIO timed out after %d seconds", LHSR_BIO_TIMEOUT / HZ);
-		/*
-		 * CRITICAL: Cannot call bio_endio() on in-flight bio!
-		 * The bio is still in the block layer's queue.
-		 * Instead, mark timed out and let real completion handle it.
-		 * The atomic_cmpxchg in lhsr_bio_complete protects
-		 * against race between timeout and normal completion.
-		 *
-		 * DO NOT free ctx here - the completion handler (lhsr_bio_complete)
-		 * owns ctx and will free it when the bio actually completes.
-		 * Freeing ctx here would cause use-after-free when the bio
-		 * finally completes and the completion handler accesses ctx.
-		 */
-		ctx->timed_out = 1;
-		ctx->error = BLK_STS_IOERR;
-
-		/* Return immediately - completion handler owns ctx */
-		error = -ETIMEDOUT;
-		return error;
-	}
-
-	/* Normal completion - save error then free ctx */
-	error = ctx->error ? -EIO : 0;
-	kfree(ctx);
-	return error;
-}
-
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
@@ -171,18 +102,15 @@ MODULE_VERSION(LHSR_VERSION);
  *   - Initial value: 0xFFFFFFFF
  *   - Final XOR: 0xFFFFFFFF
  *   - Polynomial: 0x1EDC6F41 (same as 0x82F63B78 reflected)
+ *
+ * Synchronous I/O: All sync BIO operations use submit_bio_wait(), the kernel's
+ * standard single-page synchronous I/O API.  No ad-hoc timeouts — the block
+ * layer handles timeout and error reporting internally.  This eliminates an
+ * entire class of races (calling bio_endio on in-flight BIOs, freeing pages
+ * while the device is still DMA'ing, etc).
  */
 
 /* Atomic superblock write - write-hole protection
- * Strategy: Write new superblock to backup first, then primary.
- * On crash, either old primary+new backup or new primary+new backup.
- * Never old primary+old backup (regress), never new primary+old backup (inconsistent).
- * 
- * NVMe SAFETY: Uses REQ_FUA to ensure data is persisted to media
- * before returning. This prevents data loss on hard power-off.
- */
-/*
- * Atomic superblock write - write-hole protection
  * Strategy: Write new superblock to backup first, then primary.
  * On crash, either old primary+new backup or new primary+new backup.
  * Never old primary+old backup (regress), never new primary+old backup (inconsistent).
@@ -220,8 +148,8 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	memcpy(buf, sb, LHSR_SB_SIZE);
 
 	/*
-	 * Step 1: Write to BACKUP location first
-	 * This ensures we always have at least one valid superblock
+	 * Step 1: Write to BACKUP location first.
+	 * Uses submit_bio_wait() — the kernel's standard synchronous BIO API.
 	 */
 	bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
 	if (!bio) {
@@ -229,7 +157,6 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 		return -ENOMEM;
 	}
 	bio->bi_iter.bi_sector = backup_sector;
-	/* Add the page to the bio -- bio_alloc does NOT auto-add pages */
 	if (!bio_add_page(bio, page, PAGE_SIZE, 0)) {
 		DMERR("Failed to add page to backup write bio");
 		bio_put(bio);
@@ -238,26 +165,20 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	}
 
 	DMINFO("lhsr_write_superblock: writing backup to sector %llu", (u64)backup_sector);
-	ret = lhsr_submit_bio_timeout(bio);
-	if (ret < 0) {
-		DMERR("Backup superblock write failed: %d", ret);
-		bio_put(bio);
-		__free_page(page);
-		return ret;
-	}
+	ret = submit_bio_wait(bio);
 	bio_put(bio);
 
 	if (ret != 0) {
 		DMERR("Backup superblock write failed at sector %llu: %d",
 		       (u64)backup_sector, ret);
 		__free_page(page);
-		return -EIO;
+		return ret;
 	}
 
 	/*
-	 * Step 2: Write to PRIMARY location
-	 * Now we have new backup + old primary (crash-safe)
-	 * After this, we have new backup + new primary
+	 * Step 2: Write to PRIMARY location.
+	 * Now we have new backup + old primary (crash-safe).
+	 * After this: new backup + new primary.
 	 */
 	bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
 	if (!bio) {
@@ -265,7 +186,6 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 		return -ENOMEM;
 	}
 	bio->bi_iter.bi_sector = primary_sector;
-	/* Add the page to the bio -- bio_alloc does NOT auto-add pages */
 	if (!bio_add_page(bio, page, PAGE_SIZE, 0)) {
 		DMERR("Failed to add page to primary write bio");
 		bio_put(bio);
@@ -274,20 +194,14 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	}
 
 	DMINFO("lhsr_write_superblock: writing primary to sector %llu", (u64)primary_sector);
-	ret = lhsr_submit_bio_timeout(bio);
-	if (ret < 0) {
-		DMERR("Primary superblock write failed: %d", ret);
-		bio_put(bio);
-		__free_page(page);
-		return ret;
-	}
+	ret = submit_bio_wait(bio);
 	bio_put(bio);
 	__free_page(page);
 
 	if (ret != 0) {
 		DMERR("Primary superblock write failed at sector %llu: %d",
 		       (u64)primary_sector, ret);
-		return -EIO;
+		return ret;
 	}
 
 	DMINFO("Superblock write successful (backup + primary)");
@@ -311,7 +225,6 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		return -ENOMEM;
 
 	DMINFO("lhsr_read_superblock: allocating bio");
-	/* Allocate BIO with 1 vector slot, then add the page manually */
 	bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
 	if (!bio) {
 		__free_page(page);
@@ -319,7 +232,6 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	}
 	bio_set_dev(bio, bdev);
 	bio->bi_iter.bi_sector = sector;
-	/* bio_alloc does NOT auto-add pages -- add it manually */
 	if (!bio_add_page(bio, page, PAGE_SIZE, 0)) {
 		DMERR("Failed to add page to primary read bio");
 		bio_put(bio);
@@ -327,22 +239,14 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		return -ENOMEM;
 	}
 
-	ret = lhsr_submit_bio_timeout(bio);
-	if (ret < 0) {
-		DMERR("Superblock read failed/timed out: %d", ret);
-		if (ret == -ETIMEDOUT) {
-			/* Don't free bio/page - completion handler will handle bio */
-			/* Actually, completion handler only frees ctx, not bio/page */
-			/* We need to force completion and wait */
-			bio_endio(bio);
-			/* Wait briefly for completion handler */
-			msleep(100);
-		}
-		bio_put(bio);
+	ret = submit_bio_wait(bio);
+	bio_put(bio);
+
+	if (ret != 0) {
+		DMERR("Superblock read failed at sector %llu: %d", (u64)sector, ret);
 		__free_page(page);
 		return -EIO;
 	}
-	bio_put(bio);
 
 	buf = page_address(page);
 	stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
@@ -356,24 +260,23 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		       stored_csum, calc_csum);
 
 		bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
+		if (!bio) {
+			__free_page(page);
+			return -ENOMEM;
+		}
 		bio_set_dev(bio, bdev);
 		bio->bi_iter.bi_sector = backup_sector;
 		__bio_add_page(bio, page, PAGE_SIZE, 0);
 
-		ret = lhsr_submit_bio_timeout(bio);
-		if (ret < 0) {
+		ret = submit_bio_wait(bio);
+		bio_put(bio);
+
+		if (ret != 0) {
 			DMERR("Superblock read failed at backup sector %llu: %d",
 			       (u64)backup_sector, ret);
-			if (ret == -ETIMEDOUT) {
-				/* bio_endio already called in timeout handler */
-				/* Wait brief moment for completion */
-				msleep(100);
-			}
-			bio_put(bio);
 			__free_page(page);
 			return -EIO;
 		}
-		bio_put(bio);
 
 		stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
 		*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
@@ -776,14 +679,21 @@ static void __used disk_check_work(struct work_struct *work)
 	}
 }
 
-/* Scrub a block - reads and verifies checksums */
+/* Scrub a block - reads and verifies checksums
+ *
+ * Uses proper page cache pages for BIO I/O instead of vmalloc'd memory.
+ * vmalloc_to_page() is unreliable for I/O because kvmalloc may return
+ * kmalloc memory, and block layer BIOs require struct page backing.
+ */
 static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 offset)
 {
 	struct lhsr_cksum_entry *entry = NULL;
 	struct bio *bio;
+	struct page **pages;
 	void *buf;
 	u32 stored_csum = 0;
 	u32 calc_csum;
+	unsigned int nr_pages;
 	int ret = 0;
 	int i;
 
@@ -799,47 +709,77 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 		}
 	}
 
-	/* LHSR_SCRUB_BLOCK_SIZE (128KB) requires multiple pages */
-	buf = kvmalloc(LHSR_SCRUB_BLOCK_SIZE, GFP_KERNEL);
-	if (!buf)
+	nr_pages = (LHSR_SCRUB_BLOCK_SIZE + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+	/* Allocate pages for I/O — proper struct page backing */
+	pages = kcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+	if (!pages)
 		return -ENOMEM;
 
-	/* Read the block using bio */
-	bio = bio_alloc(arr->disk[disk_idx], 0, REQ_OP_READ, GFP_KERNEL);
+	for (i = 0; i < nr_pages; i++) {
+		pages[i] = alloc_page(GFP_KERNEL);
+		if (!pages[i]) {
+			while (i--)
+				__free_page(pages[i]);
+			kfree(pages);
+			return -ENOMEM;
+		}
+	}
+
+	/* Read the block using bio — use the bioset */
+	bio = bio_alloc_bioset(arr->disk[disk_idx], nr_pages,
+			       REQ_OP_READ, GFP_KERNEL, &lhsr_bioset);
 	if (!bio) {
-		kvfree(buf);
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
 		return -ENOMEM;
 	}
 	bio->bi_iter.bi_sector = offset;
-	/* Add pages to bio to cover full scrub block size */
-	{
-		size_t bytes_remaining = LHSR_SCRUB_BLOCK_SIZE;
-		void *buf_ptr = buf;
-		while (bytes_remaining > 0) {
-			size_t page_bytes = min_t(size_t, bytes_remaining, PAGE_SIZE);
-			struct page *pg = vmalloc_to_page(buf_ptr);
-			if (!pg || !bio_add_page(bio, pg, page_bytes, offset_in_page(buf_ptr))) {
-				bio_put(bio);
-				bio = NULL;
-				break;
-			}
-			buf_ptr += page_bytes;
-			bytes_remaining -= page_bytes;
-		}
-	}
-	if (!bio) {
-		kvfree(buf);
-		return -ENOMEM;
+	for (i = 0; i < nr_pages; i++) {
+		unsigned int page_off = i << PAGE_SHIFT;
+		unsigned int page_bytes = min_t(unsigned int,
+			LHSR_SCRUB_BLOCK_SIZE - page_off, PAGE_SIZE);
+		__bio_add_page(bio, pages[i], page_bytes, 0);
 	}
 
-	ret = lhsr_submit_bio_timeout(bio);
+	ret = submit_bio_wait(bio);
 	bio_put(bio);
 
 	if (ret != 0) {
 		DMERR("Scrub read failed at offset 0x%llx: %d", offset, ret);
-		kvfree(buf);
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
 		return ret;
 	}
+
+	/* Copy to linear buffer for checksum calculation,
+	 * then free the I/O pages immediately */
+	buf = kmalloc(LHSR_SCRUB_BLOCK_SIZE, GFP_KERNEL);
+	if (!buf) {
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
+		return -ENOMEM;
+	}
+
+	{
+		void *buf_ptr = buf;
+		for (i = 0; i < nr_pages; i++) {
+			unsigned int page_off = i << PAGE_SHIFT;
+			unsigned int page_bytes = min_t(unsigned int,
+				LHSR_SCRUB_BLOCK_SIZE - page_off, PAGE_SIZE);
+			void *kaddr = kmap(pages[i]);
+			memcpy(buf_ptr, kaddr, page_bytes);
+			kunmap(pages[i]);
+			buf_ptr += page_bytes;
+		}
+	}
+
+	for (i = 0; i < nr_pages; i++)
+		__free_page(pages[i]);
+	kfree(pages);
 
 	/* Calculate checksum of read data */
 	calc_csum = crc32c(0xFFFFFFFF, buf, LHSR_SCRUB_BLOCK_SIZE) ^ 0xFFFFFFFF;
@@ -856,7 +796,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 		} else {
 			DMWARN("Scrub: Checksum cache full, cannot store checksum for offset 0x%llx", offset);
 		}
-		kvfree(buf);
+		kfree(buf);
 		return 0;
 	}
 
@@ -868,7 +808,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 			entry->flags |= LHSR_BLOCK_CORRUPT;
 			atomic_inc(&arr->corruptions_detected);
 		}
-		kvfree(buf);
+		kfree(buf);
 		return -EIO;
 	}
 
@@ -876,7 +816,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	if (entry) {
 		entry->flags |= LHSR_BLOCK_VERIFIED;
 	}
-	kvfree(buf);
+	kfree(buf);
 	return 0;
 }
 
@@ -1077,7 +1017,7 @@ static void rebuild_work(struct work_struct *work)
 		__bio_add_page(bio, pages[i], page_bytes, 0);
 	}
 
-	ret = lhsr_submit_bio_timeout(bio);
+	ret = submit_bio_wait(bio);
 	bio_put(bio);
 
 	if (ret != 0) {
@@ -1108,7 +1048,7 @@ static void rebuild_work(struct work_struct *work)
 		__bio_add_page(bio, pages[i], page_bytes, 0);
 	}
 
-	ret = lhsr_submit_bio_timeout(bio);
+	ret = submit_bio_wait(bio);
 	bio_put(bio);
 
 	/* Free pages */
