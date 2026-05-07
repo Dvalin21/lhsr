@@ -102,7 +102,7 @@ static void lhsr_bio_complete(struct bio *bio)
 
 	ctx->error = bio->bi_status;
 	complete(&ctx->done);
-	/* Note: ctx is NOT freed here - see lhsr_submit_bio_timeout() */
+	kfree(ctx);
 }
 
 /* Submit BIO with timeout - returns 0 on success, -errno on failure
