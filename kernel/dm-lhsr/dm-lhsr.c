@@ -45,45 +45,6 @@ static void lhsr_raid_5_data_endio(struct bio *bio);
 static void lhsr_raid_5_parity_endio(struct bio *bio);
 static void lhsr_raid_5_read_endio(struct bio *bio);
 static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
-
-/* Page vector helpers - inline from Task 3 */
-static struct page **lhsr_alloc_page_vec(size_t size, gfp_t gfp)
-{
-	unsigned int nr_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	struct page **pages;
-	unsigned int i;
-
-	pages = kcalloc(nr_pages, sizeof(struct page *), gfp);
-	if (!pages)
-		return ERR_PTR(-ENOMEM);
-
-	for (i = 0; i < nr_pages; i++) {
-		pages[i] = alloc_page(gfp);
-		if (!pages[i])
-			goto err_free;
-	}
-	return pages;
-
-err_free:
-	while (i--)
-		__free_page(pages[i]);
-	kfree(pages);
-	return ERR_PTR(-ENOMEM);
-}
-
-static void lhsr_free_page_vec(struct page **pages, size_t size)
-{
-	unsigned int nr_pages = (size + PAGE_SIZE - 1) >> PAGE_SHIFT;
-	unsigned int i;
-
-	if (!pages || IS_ERR(pages))
-		return;
-
-	for (i = 0; i < nr_pages; i++)
-		__free_page(pages[i]);
-	kfree(pages);
-}
-
 static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
                            unsigned int data_disks, size_t len);
 
@@ -178,16 +139,17 @@ static int lhsr_submit_bio_timeout(struct bio *bio)
 		 * Instead, mark timed out and let real completion handle it.
 		 * The atomic_cmpxchg in lhsr_bio_complete protects
 		 * against race between timeout and normal completion.
+		 *
+		 * DO NOT free ctx here - the completion handler (lhsr_bio_complete)
+		 * owns ctx and will free it when the bio actually completes.
+		 * Freeing ctx here would cause use-after-free when the bio
+		 * finally completes and the completion handler accesses ctx.
 		 */
 		ctx->timed_out = 1;
 		ctx->error = BLK_STS_IOERR;
 
-		/* Wait for the real completion to arrive */
-		wait_for_completion(&ctx->done);
-
-		/* Now bio is done, safe to free ctx */
+		/* Return immediately - completion handler owns ctx */
 		error = -ETIMEDOUT;
-		kfree(ctx);
 		return error;
 	}
 
