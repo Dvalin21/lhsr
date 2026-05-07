@@ -616,7 +616,7 @@ static void lhsr_io_complete(struct bio *bio)
 
 	arr = ti->private;
 
-		if (bio->bi_status != BLK_STS_OK) {
+	if (bio->bi_status != BLK_STS_OK) {
 		DMERR("I/O error: status=%d", bio->bi_status);
 		atomic_inc(&arr->io_errors);
 
