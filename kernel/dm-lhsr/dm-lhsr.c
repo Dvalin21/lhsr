@@ -223,13 +223,19 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	 * Step 1: Write to BACKUP location first
 	 * This ensures we always have at least one valid superblock
 	 */
-	bio = bio_alloc(bdev, PAGE_SIZE >> SECTOR_SHIFT, REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
+	bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
 	if (!bio) {
 		__free_page(page);
 		return -ENOMEM;
 	}
 	bio->bi_iter.bi_sector = backup_sector;
-	/* bio_alloc with nr_sectors > 0 automatically adds pages for the size */
+	/* Add the page to the bio -- bio_alloc does NOT auto-add pages */
+	if (!bio_add_page(bio, page, PAGE_SIZE, 0)) {
+		DMERR("Failed to add page to backup write bio");
+		bio_put(bio);
+		__free_page(page);
+		return -ENOMEM;
+	}
 
 	DMINFO("lhsr_write_superblock: writing backup to sector %llu", (u64)backup_sector);
 	ret = lhsr_submit_bio_timeout(bio);
@@ -253,13 +259,19 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	 * Now we have new backup + old primary (crash-safe)
 	 * After this, we have new backup + new primary
 	 */
-	bio = bio_alloc(bdev, PAGE_SIZE >> SECTOR_SHIFT, REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
+	bio = bio_alloc(bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
 	if (!bio) {
 		__free_page(page);
 		return -ENOMEM;
 	}
 	bio->bi_iter.bi_sector = primary_sector;
-	/* bio_alloc with nr_sectors > 0 automatically adds pages for the size */
+	/* Add the page to the bio -- bio_alloc does NOT auto-add pages */
+	if (!bio_add_page(bio, page, PAGE_SIZE, 0)) {
+		DMERR("Failed to add page to primary write bio");
+		bio_put(bio);
+		__free_page(page);
+		return -ENOMEM;
+	}
 
 	DMINFO("lhsr_write_superblock: writing primary to sector %llu", (u64)primary_sector);
 	ret = lhsr_submit_bio_timeout(bio);
@@ -299,16 +311,21 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 		return -ENOMEM;
 
 	DMINFO("lhsr_read_superblock: allocating bio");
-	/* PAGE_SIZE (4096) = 8 sectors. Allocate BIO with enough room */
-	bio = bio_alloc(bdev, PAGE_SIZE >> SECTOR_SHIFT, REQ_OP_READ, GFP_KERNEL);
+	/* Allocate BIO with 1 vector slot, then add the page manually */
+	bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
 	if (!bio) {
 		__free_page(page);
 		return -ENOMEM;
 	}
 	bio_set_dev(bio, bdev);
 	bio->bi_iter.bi_sector = sector;
-	/* bio_alloc with nr_sectors > 0 automatically adds pages for the size */
-	/* No need for bio_add_page() - bio_alloc pre-adds them */
+	/* bio_alloc does NOT auto-add pages -- add it manually */
+	if (!bio_add_page(bio, page, PAGE_SIZE, 0)) {
+		DMERR("Failed to add page to primary read bio");
+		bio_put(bio);
+		__free_page(page);
+		return -ENOMEM;
+	}
 
 	ret = lhsr_submit_bio_timeout(bio);
 	if (ret < 0) {
@@ -1567,6 +1584,7 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 	bio_for_each_segment(bv, bio, iter) {
 		data_buf = kmap(bv.bv_page) + bv.bv_offset;
 		ctx->data_bufs[working_idx] = data_buf;
+		ctx->data_pages[working_idx] = bv.bv_page;
 		break; /* Single segment for now */
 	}
 
@@ -1587,9 +1605,9 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 
 		/* Unmap all data buffers */
 		for (i = 0; i < ctx->working; i++) {
-			if (ctx->data_bufs[i]) {
-				/* Find the page to unmap - we need bv_page */
-				/* For now, we'll skip unmap as kmap is per-cpu */
+			if (ctx->data_bufs[i] && ctx->data_pages[i]) {
+				kunmap(ctx->data_pages[i]);
+				ctx->data_bufs[i] = NULL;
 			}
 		}
 
@@ -1870,14 +1888,16 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				submit_bio(clone);
 			}
 
-			/* If no writes were submitted, fail */
-			if (atomic_read(&ctx->pending) == 0) {
-				bio->bi_status = ctx->status ?: BLK_STS_IOERR;
-				bio_endio(bio);
-				kfree(ctx->parity_buf);
-				kfree(ctx);
-				return DM_MAPIO_SUBMITTED;
-			}
+		/* If no writes were submitted, fail */
+		if (atomic_read(&ctx->pending) == 0) {
+			bio->bi_status = ctx->status ? ctx->status : BLK_STS_IOERR;
+			bio_endio(bio);
+			kfree(ctx->parity_buf);
+			if (ctx->parity_q_buf)
+				kfree(ctx->parity_q_buf);
+			kfree(ctx);
+			return DM_MAPIO_SUBMITTED;
+		}
 
 			return DM_MAPIO_SUBMITTED;
 		}
@@ -2401,7 +2421,7 @@ static int __init lhsr_init(void)
 {
 	int r;
 
-	r = bioset_init(&lhsr_bioset, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
+	r = bioset_init(&lhsr_bioset, 4, 0, BIOSET_NEED_BVECS);
 	if (r) {
 		DMERR("Failed to initialize bioset: %d", r);
 		return r;
