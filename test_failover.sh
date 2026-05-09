@@ -55,7 +55,7 @@ log_info "Disk size: $SIZE sectors"
 
 # Create mirror device
 log_info "Creating mirror device..."
-dmsetup create "$DEVICE_NAME" --table "0 $SIZE lhsr mirror $DISK0 $DISK1"
+dmsetup create "$DEVICE_NAME" --table "0 $SIZE lhsr mirror $DISK0 0 $DISK1 0"
 
 # Verify creation
 if ! dmsetup ls | grep -q "$DEVICE_NAME"; then
