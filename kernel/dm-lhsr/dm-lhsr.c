@@ -1657,6 +1657,35 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 	}
 }
 
+/*
+ * Compute RAID5/6 parity after all data writes have populated ctx->data_bufs[].
+ * Builds a compacted buffer array on the stack (skipping NULL entries from
+ * failed disks or failed clone allocations), then computes P parity (XOR)
+ * and, for RAID6, Q parity (Reed-Solomon).
+ */
+static void lhsr_raid_5_compute_parity(struct lhsr_raid_5_write_ctx *ctx)
+{
+	size_t bio_size = ctx->bio_size;
+	void *xor_inputs[32];
+	unsigned int xor_count = 0;
+	unsigned int i;
+
+	for (i = 0; i < ctx->num_disks; i++) {
+		if (ctx->data_bufs[i])
+			xor_inputs[xor_count++] = ctx->data_bufs[i];
+	}
+
+	/* Compute P parity (XOR for both RAID5 and RAID6) */
+	if (xor_count > 0)
+		lhsr_xor_parity(ctx->parity_buf, xor_inputs,
+				xor_count, bio_size);
+
+	/* For RAID6, also compute Q parity */
+	if (ctx->arr->raid_type == 3 && ctx->parity_q_buf && xor_count > 0)
+		lhsr_rs_parity(ctx->parity_buf, ctx->parity_q_buf,
+			       xor_inputs, xor_count, bio_size);
+}
+
 /* RAID5/6 write completion callbacks */
 static void lhsr_raid_5_data_endio(struct bio *bio)
 {
@@ -1714,31 +1743,10 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 	if (atomic_dec_and_test(&ctx->pending)) {
 		/* All data writes done — compute parity */
 		size_t bio_size = ctx->bio_size;
-		void *xor_inputs[32];
-		unsigned int xor_count = 0;
 		int parity_slots = 0;
 		bool p_can_write, q_can_write;
 
-		/*
-		 * Build compacted array of non-NULL data buffers for XOR.
-		 * data_bufs[] is indexed by raw disk index; entries for
-		 * disks whose clone allocation failed remain NULL.
-		 * We skip those to avoid Oops in lhsr_xor_parity().
-		 */
-		for (i = 0; i < ctx->num_disks; i++) {
-			if (ctx->data_bufs[i])
-				xor_inputs[xor_count++] = ctx->data_bufs[i];
-		}
-
-		/* Compute P parity (XOR for both RAID5 and RAID6) */
-		if (xor_count > 0)
-			lhsr_xor_parity(ctx->parity_buf, xor_inputs,
-					xor_count, bio_size);
-
-		/* For RAID6, also compute Q parity */
-		if (is_raid6 && ctx->parity_q_buf && xor_count > 0)
-			lhsr_rs_parity(ctx->parity_buf, ctx->parity_q_buf,
-				       xor_inputs, xor_count, bio_size);
+		lhsr_raid_5_compute_parity(ctx);
 
 		/* Unmap all data buffers */
 		for (i = 0; i < ctx->num_disks; i++) {
@@ -2204,32 +2212,11 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				 * parity).
 				 */
 				if (atomic_read(&ctx->pending) == 0) {
-					void *xor_inputs[32];
-					unsigned int xor_count = 0;
 					unsigned int k;
 					unsigned int p_parity = arr->disks - parity_disks;
 					unsigned int q_parity = arr->disks - 1;
 
-					/* Build compacted array of non-NULL buffers */
-					for (k = 0; k < data_disks; k++) {
-						if (ctx->data_bufs[k])
-							xor_inputs[xor_count++] =
-								ctx->data_bufs[k];
-					}
-
-					/* Compute P parity */
-					if (xor_count > 0)
-						lhsr_xor_parity(ctx->parity_buf,
-								xor_inputs,
-								xor_count, bio_size);
-
-					/* Compute Q parity for RAID6 */
-					if (arr->raid_type == 3 && ctx->parity_q_buf
-					    && xor_count > 0)
-						lhsr_rs_parity(ctx->parity_buf,
-							       ctx->parity_q_buf,
-							       xor_inputs,
-							       xor_count, bio_size);
+					lhsr_raid_5_compute_parity(ctx);
 
 				/* Write P parity synchronously */
 				if (!(arr->failed_disks & (1 << p_parity))
