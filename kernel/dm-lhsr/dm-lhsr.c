@@ -151,13 +151,15 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	struct page *page;
 	void *buf;
 	sector_t primary_sector, backup_sector;
-	u64 backup_off;
 	int ret;
 
-	/* Calculate sectors */
-	primary_sector = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + disk_offset;
-	backup_off = LHSR_SB_BACKUP_OFF(array_size << SECTOR_SHIFT);
-	backup_sector = backup_off >> SECTOR_SHIFT;
+	/*
+	 * Superblock lives at the END of the user data area, outside the
+	 * user-visible range (ti->len = array_size, SB is at array_size + offset).
+	 * Primary at the boundary, backup 8 sectors further in the reserved zone.
+	 */
+	primary_sector = disk_offset + array_size;
+	backup_sector = disk_offset + array_size + (LHSR_SB_SECTORS / 2);
 
 	/* Allocate page for I/O */
 	page = alloc_page(GFP_KERNEL);
@@ -236,17 +238,24 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 }
 
 static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superblock *sb,
-				sector_t disk_offset)
+				sector_t array_size, sector_t disk_offset)
 {
 	struct bio *bio;
 	struct page *page;
 	void *buf;
 	sector_t sector;
+	sector_t backup_sector;
 	u32 stored_csum, calc_csum;
 	int ret;
 
-	sector = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + disk_offset;
-	DMINFO("lhsr_read_superblock: sector=0x%llx", sector);
+	/*
+	 * Superblock is at the END of the user data area.
+	 * Primary at the boundary, backup 8 sectors further.
+	 */
+	sector = disk_offset + array_size;
+	backup_sector = disk_offset + array_size + (LHSR_SB_SECTORS / 2);
+	DMINFO("lhsr_read_superblock: primary sector=%llu, backup sector=%llu",
+	       (u64)sector, (u64)backup_sector);
 
 	page = alloc_page(GFP_KERNEL);
 	if (!page)
@@ -282,10 +291,8 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	calc_csum = crc32c(0xFFFFFFFF, buf, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
 
 	if (stored_csum != calc_csum) {
-		u64 backup_off = LHSR_SB_BACKUP_OFF(bdev_nr_sectors(bdev) << SECTOR_SHIFT);
-		sector_t backup_sector = backup_off >> SECTOR_SHIFT;
-		DMWARN("Primary superblock checksum mismatch (0x%08x vs 0x%08x), trying backup",
-		       stored_csum, calc_csum);
+		DMWARN("Primary superblock checksum mismatch (0x%08x vs 0x%08x), trying backup at sector %llu",
+		       stored_csum, calc_csum, (u64)backup_sector);
 
 		bio = bio_alloc(bdev, 1, REQ_OP_READ, GFP_KERNEL);
 		if (!bio) {
@@ -961,10 +968,6 @@ static void scrub_work(struct work_struct *work)
 		return;
 	}
 
-	/* Skip superblock area */
-	if (arr->scrub_offset < (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8)
-		arr->scrub_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
-
 	/* Check if we're done with current disk */
 	if (arr->scrub_offset >= arr->size) {
 		/* Move to next disk */
@@ -981,7 +984,7 @@ static void scrub_work(struct work_struct *work)
 		}
 
 		arr->scrub_disk = disk_idx;
-		arr->scrub_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+		arr->scrub_offset = 0;
 		DMINFO("Scrub advancing to disk %u", disk_idx);
 	}
 
@@ -1016,7 +1019,7 @@ static int lhsr_scrub_start(struct lhsr_array *arr)
 
 	arr->scrub_state = LHSR_SCRUB_RUNNING;
 	arr->scrub_disk = 0;
-	arr->scrub_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+	arr->scrub_offset = 0;
 	arr->scrub_verified = 0;
 	arr->scrub_corrupted = 0;
 	arr->scrub_last_offset = 0;
@@ -1089,10 +1092,6 @@ static void rebuild_work(struct work_struct *work)
 	}
 
 	offset = arr->rebuild_offset;
-
-	/* Skip superblock area */
-	if (offset < (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8)
-		offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
 
 	/* Check if done */
 	if (offset >= arr->size) {
@@ -1251,7 +1250,7 @@ static int lhsr_rebuild_start(struct lhsr_array *arr, unsigned int disk_idx)
 
 	arr->rebuild_state = LHSR_REBUILD_RUNNING;
 	arr->rebuild_disk = disk_idx;
-	arr->rebuild_offset = (LHSR_SB_PRIMARY_OFF >> SECTOR_SHIFT) + 8;
+	arr->rebuild_offset = 0;
 	arr->rebuild_total = arr->size;
 	arr->rebuild_verified = 0;
 
@@ -1392,6 +1391,16 @@ if (strcmp(argv[0], "single") == 0) {
 			size = s;
 	}
 
+	/* Reserve space at end of device for superblock metadata (outside user data) */
+	if (size > LHSR_SB_SECTORS * 2) {
+		size -= LHSR_SB_SECTORS;
+	} else {
+		DMERR("Device too small for superblock: %llu sectors", (u64)size);
+		ti->error = "Device too small for superblock";
+		r = -EINVAL;
+		goto bad;
+	}
+
 	if (size < 2048) {
 		DMERR("Device too small: %llu sectors", size);
 		ti->error = "Device too small";
@@ -1421,7 +1430,7 @@ if (strcmp(argv[0], "single") == 0) {
 		struct lhsr_superblock *sb = &arr->sbs[i];
 
 		DMINFO("About to read superblock for disk %u", i);
-		r = lhsr_read_superblock(arr->disk[i], sb, arr->disk_offset[i]);
+		r = lhsr_read_superblock(arr->disk[i], sb, size, arr->disk_offset[i]);
 		DMINFO("Read superblock returned: %d", r);
 		if (r == 0 && lhsr_validate_superblock(sb) == 0) {
 			DMINFO("Disk %u: Found valid superblock (gen=%llu)", i, sb->generation);

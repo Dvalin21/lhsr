@@ -27,8 +27,8 @@
 #define LHSR_SB_MAGIC         "LHSRDISK"
 #define LHSR_SB_MAGIC_LEN     8
 #define LHSR_SB_VERSION       1
-#define LHSR_SB_PRIMARY_OFF   (4 * 1024 * 1024)   /* 4MB from start */
-#define LHSR_SB_BACKUP_OFF(disk_size) ((disk_size) - (8 * 1024 * 1024))  /* 8MB from end */
+/* Superblock lives in reserved space at END of device, outside user data area */
+#define LHSR_SB_SECTORS      16   /* 16 sectors (8KB) reserved at end for superblock metadata */
 
 /* Superblock on-disk structure */
 struct lhsr_superblock {
