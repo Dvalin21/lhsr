@@ -39,6 +39,7 @@
 struct lhsr_raid_5_write_ctx;
 struct lhsr_raid_5_read_ctx;
 struct lhsr_array;
+static void lhsr_mirror_endio(struct bio *bio);
 static void lhsr_raid_5_data_endio(struct bio *bio);
 static void lhsr_raid_5_parity_endio(struct bio *bio);
 static void lhsr_raid_5_read_endio(struct bio *bio);
@@ -109,6 +110,12 @@ struct lhsr_raid_5_read_ctx {
 	unsigned int disk_map[0];	/* Flex array: slot_idx -> disk_idx */
 };
 
+/* Mirror write context - tracks completions across all mirror members */
+struct lhsr_mirror_ctx {
+	struct bio *orig_bio;	/* Original bio to complete */
+	atomic_t pending;	/* Count of pending writes */
+	int status;		/* Final status */
+};
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
@@ -1882,6 +1889,30 @@ static void lhsr_raid_5_parity_endio(struct bio *bio)
 	bio_put(bio);
 }
 
+/* Mirror write completion - called when one mirror member's write finishes */
+static void lhsr_mirror_endio(struct bio *bio)
+{
+	struct lhsr_mirror_ctx *mctx = bio->bi_private;
+
+	if (!mctx) {
+		DMERR("mirror_endio: mctx is NULL");
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return;
+	}
+
+	if (bio->bi_status)
+		mctx->status = bio->bi_status;
+
+	if (atomic_dec_and_test(&mctx->pending)) {
+		mctx->orig_bio->bi_status = mctx->status;
+		bio_endio(mctx->orig_bio);
+		kfree(mctx);
+	}
+
+	bio_put(bio);
+}
+
 /* Map function - with error tracking */
 static int lhsr_map(struct dm_target *ti, struct bio *bio)
 {
@@ -1914,37 +1945,76 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
-	/* RAID1 Mirror - write to primary only */
+	/* RAID1 Mirror - write to ALL working members */
 	if (arr->raid_type == 1) {
 		if (bio_op(bio) != REQ_OP_READ) {
-			unsigned int target_disk = arr->primary_disk;
-		
-			if (!(arr->failed_disks & (1 << target_disk))) {
-				bio_set_dev(bio, arr->disk[target_disk]);
-				bio->bi_iter.bi_sector = offset + arr->disk_offset[target_disk];
-				if (lhsr_setup_io_tracking(bio, ti) < 0) {
-					bio->bi_status = BLK_STS_IOERR;
-					bio_endio(bio);
-					return DM_MAPIO_SUBMITTED;
-				}
-				submit_bio(bio);
-			} else {
-				/* Primary failed, try other */
-				unsigned int other = (target_disk == 0) ? 1 : 0;
-				if (!(arr->failed_disks & (1 << other))) {
-					bio_set_dev(bio, arr->disk[other]);
-					bio->bi_iter.bi_sector = offset + arr->disk_offset[other];
-					if (lhsr_setup_io_tracking(bio, ti) < 0) {
-						bio->bi_status = BLK_STS_IOERR;
-						bio_endio(bio);
-						return DM_MAPIO_SUBMITTED;
-					}
-					submit_bio(bio);
-				} else {
-					bio->bi_status = BLK_STS_IOERR;
-					bio_endio(bio);
-				}
+			struct lhsr_mirror_ctx *mctx;
+			struct bio *clone;
+			unsigned int working = 0;
+			unsigned int i;
+
+			/* Count working mirror members */
+			for (i = 0; i < arr->disks; i++) {
+				if (!(arr->failed_disks & (1 << i)) && arr->disk[i])
+					working++;
 			}
+
+			if (working == 0) {
+				bio->bi_status = BLK_STS_IOERR;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+
+			mctx = kzalloc(sizeof(*mctx), GFP_NOIO);
+			if (!mctx) {
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
+			}
+
+			mctx->orig_bio = bio;
+			mctx->status = 0;
+			atomic_set(&mctx->pending, working);
+
+			for (i = 0; i < arr->disks; i++) {
+				if (arr->failed_disks & (1 << i) || !arr->disk[i])
+					continue;
+
+				clone = bio_alloc_clone(arr->disk[i], bio,
+							GFP_NOIO, &lhsr_bioset);
+				if (!clone) {
+					mctx->status = BLK_STS_RESOURCE;
+					atomic_dec(&mctx->pending);
+					continue;
+				}
+
+				clone->bi_iter.bi_sector = offset + arr->disk_offset[i];
+				clone->bi_end_io = lhsr_mirror_endio;
+				clone->bi_private = mctx;
+
+				if (lhsr_setup_io_tracking(clone, ti) < 0) {
+					bio_put(clone);
+					mctx->status = BLK_STS_IOERR;
+					atomic_dec(&mctx->pending);
+					continue;
+				}
+
+				submit_bio(clone);
+			}
+
+			/*
+			 * If all clones completed synchronously, pending is 0
+			 * and mirror_endio already freed mctx.  If zero clones
+			 * were submitted, complete here.
+			 */
+			if (atomic_read(&mctx->pending) == 0) {
+				/* Count of working was > 0 but all submits failed? */
+				bio->bi_status = mctx->status ? mctx->status : BLK_STS_RESOURCE;
+				bio_endio(bio);
+				kfree(mctx);
+			}
+			/* Otherwise, mirror_endio handles completion */
+
 			return DM_MAPIO_SUBMITTED;
 		}
 	}
