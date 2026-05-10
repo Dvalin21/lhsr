@@ -427,10 +427,6 @@ struct lhsr_array {
 	} cksum_cache[LHSR_CKSUM_BUCKETS];
 	u32 cksum_count;  /* Number of valid entries */
 
-	/* RAID5 write completion tracking */
-	atomic_t inflight_writes;
-	struct bio *orig_bio;        /* Original bio for completion */
-	unsigned int data_disks_written; /* Count of data disks written */
 };
 
 /* RAID5/6 READ reconstruction completion */
@@ -1353,11 +1349,6 @@ if (strcmp(argv[0], "single") == 0) {
 	arr->last_check = jiffies;
 	arr->write_verify_enabled = 0;
 	atomic_set(&arr->destroying, 0);
-
-	/* Initialize RAID5 write completion tracking */
-	atomic_set(&arr->inflight_writes, 0);
-	arr->orig_bio = NULL;
-	arr->data_disks_written = 0;
 
 	/* Initialize concurrency primitives */
 	mutex_init(&arr->io_mutex);
