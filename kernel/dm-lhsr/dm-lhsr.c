@@ -437,8 +437,18 @@ struct lhsr_array {
 static void lhsr_raid_5_read_endio(struct bio *bio)
 {
 	struct lhsr_raid_5_read_ctx *ctx = bio->bi_private;
-	struct lhsr_array *arr = ctx->arr;
-	int is_raid6 = (arr->raid_type == 3);
+	struct lhsr_array *arr;
+	int is_raid6;
+
+	if (!ctx) {
+		DMERR("read_endio: ctx is NULL");
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return;
+	}
+
+	arr = ctx->arr;
+	is_raid6 = (arr->raid_type == 3);
 	size_t bio_size = ctx->bio_size; /* Use stored size, NOT orig_bio->bi_iter after completion */
 	unsigned int slot;
 	unsigned int i;
@@ -807,6 +817,9 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	if (arr->failed_disks & (1 << disk_idx))
 		return -EINVAL;
 
+	if (!arr->disk[disk_idx])
+		return -EINVAL;
+
 	/* Check if we have a stored checksum for this offset */
 	for (i = 0; i < arr->cksum_count; i++) {
 		if (arr->cksum_cache[i].offset == offset) {
@@ -1113,6 +1126,14 @@ static void rebuild_work(struct work_struct *work)
 	/* Read from source disk */
 	DMDEBUG("rebuild: reading from disk %u at sector %llu (offset=0x%llx)",
 		source_disk, (u64)offset, (u64)offset << SECTOR_SHIFT);
+	if (!arr->disk[source_disk]) {
+		DMERR("Rebuild: source disk %u is NULL", source_disk);
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
+		arr->rebuild_state = LHSR_REBUILD_NONE;
+		return;
+	}
 	bio = bio_alloc_bioset(arr->disk[source_disk], nr_pages,
 			     REQ_OP_READ, GFP_KERNEL, &lhsr_bioset);
 	if (!bio) {
@@ -1146,6 +1167,14 @@ static void rebuild_work(struct work_struct *work)
 	}
 
 	/* Write to rebuild disk */
+	if (!arr->disk[arr->rebuild_disk]) {
+		DMERR("Rebuild: target disk %u is NULL", arr->rebuild_disk);
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
+		arr->rebuild_state = LHSR_REBUILD_NONE;
+		return;
+	}
 	bio = bio_alloc(arr->disk[arr->rebuild_disk], nr_pages, REQ_OP_WRITE, GFP_KERNEL);
 	if (!bio) {
 		DMERR("Rebuild: failed to allocate write bio");
@@ -1588,8 +1617,9 @@ static void lhsr_dtr(struct dm_target *ti)
 	mutex_destroy(&arr->io_mutex);
 
 	DMINFO("dtr: Freeing arr %p", arr);
-	kfree(arr);
 	ti->private = NULL;
+	/* ti->private is NULL now — no race window with dangling pointer */
+	kfree(arr);
 	DMINFO("dtr: END - Destroyed LHSR target");
 }
 
@@ -1601,6 +1631,12 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 	unsigned int i, j;
 	size_t long_words = len / sizeof(long);
 	size_t rem_bytes = len % sizeof(long);
+
+	if (!parity || !data || data_disks == 0 || !src[0]) {
+		DMERR("xor_parity: NULL parameter (parity=%p data=%p disks=%u)",
+		      parity, data, data_disks);
+		return;
+	}
 
 	/* Initialize parity with first data block */
 	memcpy(p, src[0], len);
@@ -1627,15 +1663,28 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
 static void lhsr_raid_5_data_endio(struct bio *bio)
 {
 	struct lhsr_raid_5_write_ctx *ctx = bio->bi_private;
-	struct lhsr_array *arr = ctx->arr;
+	struct lhsr_array *arr;
 	struct bio_vec bv;
 	struct bvec_iter iter;
 	void *data_buf;
 	unsigned int data_idx, i;
-	int is_raid6 = (arr->raid_type == 3);
-	int parity_disks = is_raid6 ? 2 : 1;
-	unsigned int p_parity_idx = arr->disks - parity_disks;
-	unsigned int q_parity_idx = arr->disks - 1;
+	int is_raid6;
+	int parity_disks;
+	unsigned int p_parity_idx;
+	unsigned int q_parity_idx;
+
+	if (!ctx) {
+		DMERR("data_endio: ctx is NULL");
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return;
+	}
+
+	arr = ctx->arr;
+	is_raid6 = (arr->raid_type == 3);
+	parity_disks = is_raid6 ? 2 : 1;
+	p_parity_idx = arr->disks - parity_disks;
+	q_parity_idx = arr->disks - 1;
 
 	if (bio->bi_status)
 		ctx->status = bio->bi_status;
@@ -1705,9 +1754,11 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 		 * Determine which parity disks are available (single read of
 		 * failed_disks — snapshot for the entire submit section).
 		 */
-		p_can_write = !(arr->failed_disks & (1 << p_parity_idx));
+		p_can_write = !(arr->failed_disks & (1 << p_parity_idx)) &&
+			      arr->disk[p_parity_idx] != NULL;
 		q_can_write = is_raid6 && ctx->parity_q_buf &&
-			      !(arr->failed_disks & (1 << q_parity_idx));
+			      !(arr->failed_disks & (1 << q_parity_idx)) &&
+			      arr->disk[q_parity_idx] != NULL;
 
 		/*
 		 * Pre-increment pending counter for ALL parity writes BEFORE
@@ -1729,7 +1780,7 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 			struct bio *parity_bio;
 
 			parity_bio = bio_alloc_bioset(arr->disk[p_parity_idx], 1,
-						      REQ_OP_WRITE, GFP_NOIO, &lhsr_bioset);
+						      REQ_OP_WRITE, GFP_NOWAIT, &lhsr_bioset);
 			if (!parity_bio) {
 				ctx->status = BLK_STS_RESOURCE;
 				atomic_dec(&ctx->pending);
@@ -1763,7 +1814,7 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 			struct bio *q_parity_bio;
 
 			q_parity_bio = bio_alloc_bioset(arr->disk[q_parity_idx], 1,
-							REQ_OP_WRITE, GFP_NOIO, &lhsr_bioset);
+							REQ_OP_WRITE, GFP_NOWAIT, &lhsr_bioset);
 			if (!q_parity_bio) {
 				atomic_dec(&ctx->pending);
 				parity_slots--;
@@ -1789,6 +1840,11 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 		 * it is safe to touch ctx.
 		 */
 		if (parity_slots == 0) {
+			/* Unmap any kmap'd data buffers before cleanup */
+			for (i = 0; i < ctx->num_disks; i++) {
+				if (ctx->data_bufs[i] && ctx->data_pages[i])
+					kunmap(ctx->data_pages[i]);
+			}
 			ctx->orig_bio->bi_status = ctx->status;
 			bio_endio(ctx->orig_bio);
 			if (ctx->parity_q_page)
@@ -1806,6 +1862,13 @@ static void lhsr_raid_5_data_endio(struct bio *bio)
 static void lhsr_raid_5_parity_endio(struct bio *bio)
 {
 	struct lhsr_raid_5_write_ctx *ctx = bio->bi_private;
+
+	if (!ctx) {
+		DMERR("parity_endio: ctx is NULL");
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return;
+	}
 
 	if (bio->bi_status)
 		ctx->status = bio->bi_status;
@@ -2015,6 +2078,11 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				for (i = 0; i < data_disks; i++) {
 					if (arr->failed_disks & (1 << i))
 						continue;
+					if (!arr->disk[i]) {
+						ctx->status = BLK_STS_IOERR;
+						atomic_dec(&ctx->pending);
+						continue;
+					}
 
 					clone = bio_alloc_clone(arr->disk[i], bio,
 								GFP_NOIO, &lhsr_bioset);
@@ -2102,13 +2170,14 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 							       xor_inputs,
 							       xor_count, bio_size);
 
-					/* Write P parity synchronously */
-					if (!(arr->failed_disks & (1 << p_parity))
-					    && ctx->parity_page) {
-						struct bio *pbio = bio_alloc_bioset(
-							arr->disk[p_parity], 1,
-							REQ_OP_WRITE, GFP_NOIO,
-							&lhsr_bioset);
+				/* Write P parity synchronously */
+				if (!(arr->failed_disks & (1 << p_parity))
+				    && ctx->parity_page
+				    && arr->disk[p_parity]) {
+					struct bio *pbio = bio_alloc_bioset(
+						arr->disk[p_parity], 1,
+						REQ_OP_WRITE, GFP_NOIO,
+						&lhsr_bioset);
 						if (pbio) {
 							if (bio_add_page(pbio,
 							    ctx->parity_page,
@@ -2121,12 +2190,13 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 						}
 					}
 
-					/* Write Q parity synchronously (RAID6) */
-					if (arr->raid_type == 3
-					    && !(arr->failed_disks & (1 << q_parity))
-					    && ctx->parity_q_page) {
-						struct bio *qbio = bio_alloc_bioset(
-							arr->disk[q_parity], 1,
+				/* Write Q parity synchronously (RAID6) */
+				if (arr->raid_type == 3
+				    && !(arr->failed_disks & (1 << q_parity))
+				    && ctx->parity_q_page
+				    && arr->disk[q_parity]) {
+					struct bio *qbio = bio_alloc_bioset(
+						arr->disk[q_parity], 1,
 							REQ_OP_WRITE, GFP_NOIO,
 							&lhsr_bioset);
 						if (qbio) {
@@ -2267,6 +2337,11 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				struct bio *clone;
 				unsigned int disk_idx = ctx->disk_map[i];
 				
+				if (!arr->disk[disk_idx]) {
+					ctx->status = BLK_STS_IOERR;
+					atomic_dec(&ctx->pending);
+					continue;
+				}
 				clone = bio_alloc_clone(arr->disk[disk_idx], 
 							bio, GFP_NOIO, &lhsr_bioset);
 				if (!clone) {
@@ -2711,7 +2786,7 @@ static int __init lhsr_init(void)
 {
 	int r;
 
-	r = bioset_init(&lhsr_bioset, 4, 0, BIOSET_NEED_BVECS);
+	r = bioset_init(&lhsr_bioset, 256, 0, BIOSET_NEED_BVECS);
 	if (r) {
 		DMERR("Failed to initialize bioset: %d", r);
 		return r;
@@ -2781,14 +2856,25 @@ static void lhsr_rs_parity(void *parity_p, void *parity_q, void **data,
 	u8 **src = (u8 **)data;
 	unsigned int i, j;
 
+	if (!parity_p || !data || data_disks == 0) {
+		DMERR("rs_parity: NULL parameter (parity_p=%p data=%p disks=%u)",
+		      parity_p, data, data_disks);
+		return;
+	}
+
 	memset(p, 0, len);
 	if (q)
 		memset(q, 0, len);
 
 	/* For each data block, compute P and Q */
 	for (i = 0; i < data_disks; i++) {
-		u8 coeff = rs_power_table[i];	/* 2^i precomputed */
+		u8 coeff = rs_power_table[i];
 		u8 *s = src[i];
+
+		if (!s) {
+			DMERR("rs_parity: src[%u] is NULL, skipping", i);
+			continue;
+		}
 
 		/* P = XOR (same as RAID5) */
 		for (j = 0; j < len; j++)
