@@ -67,14 +67,15 @@ static int lhsr_module_exiting = 0;
  * RAID5/6 RMW write context — sequential phase state machine.
  * Each phase submits one I/O; the endio callback advances to the next phase.
  *
- * Data flow:
- *   phase=1 Read old data chunk
- *   phase=2 Read old P parity (or skip if failed)
- *   phase=3 Read old Q parity (RAID6, or skip)
- *   phase=4 Compute XOR + Merge bio data + Write new data
- *   phase=5 Write new P parity
- *   phase=6 Write new Q parity (RAID6)
- *   phase=7 Done — complete orig_bio + cleanup
+ * Phase tracking:
+ *   0 = PHASE_INIT (before any I/O)
+ *   1 = PHASE_OLD_DATA_READ  (read old data chunk)
+ *   2 = PHASE_P_READ         (read old P parity)
+ *   3 = PHASE_Q_READ         (read old Q parity, RAID6 only)
+ *   4 = PHASE_DATA_WRITE     (compute XOR + merge + write new data)
+ *   5 = PHASE_P_WRITE        (write new P parity)
+ *   6 = PHASE_Q_WRITE        (write new Q parity, RAID6 only)
+ *   7 = PHASE_DONE           (complete orig_bio + cleanup)
  */
 struct lhsr_rmw_ctx {
 	struct bio *orig_bio;		/* Original bio to complete */
@@ -93,8 +94,19 @@ struct lhsr_rmw_ctx {
 	size_t chunk_bytes;		/* Chunk size in bytes */
 	unsigned int offset_in_chunk;	/* Sector offset within chunk for bio data */
 
+	unsigned int phase;		/* RMW phase tracking (0-7) */
 	blk_status_t status;		/* Accumulated I/O status */
 };
+
+/* RMW phase identifiers */
+#define RMW_PHASE_INIT          0
+#define RMW_PHASE_OLD_DATA_READ 1
+#define RMW_PHASE_P_READ        2
+#define RMW_PHASE_Q_READ        3
+#define RMW_PHASE_DATA_WRITE    4
+#define RMW_PHASE_P_WRITE       5
+#define RMW_PHASE_Q_WRITE       6
+#define RMW_PHASE_DONE          7
 
 /* RAID5/6 read reconstruction context */
 struct lhsr_raid_5_read_ctx {
@@ -1709,6 +1721,9 @@ static int lhsr_rmw_submit_read(struct lhsr_rmw_ctx *ctx, unsigned int disk,
 {
 	struct bio *bio;
 
+	if (!ctx->arr->disk[disk])
+		return -ENXIO;
+
 	bio = bio_alloc_bioset(ctx->arr->disk[disk], 1, REQ_OP_READ,
 			       GFP_NOIO, &lhsr_bioset);
 	if (!bio)
@@ -1716,7 +1731,10 @@ static int lhsr_rmw_submit_read(struct lhsr_rmw_ctx *ctx, unsigned int disk,
 	bio->bi_iter.bi_sector = ctx->chunk_start + ctx->arr->disk_offset[disk];
 	bio->bi_end_io = endio;
 	bio->bi_private = ctx;
-	__bio_add_page(bio, page, ctx->chunk_bytes, 0);
+	if (!bio_add_page(bio, page, ctx->chunk_bytes, 0)) {
+		bio_put(bio);
+		return -ENOSPC;
+	}
 	submit_bio(bio);
 	return 0;
 }
@@ -1727,6 +1745,9 @@ static int lhsr_rmw_submit_write(struct lhsr_rmw_ctx *ctx, unsigned int disk,
 {
 	struct bio *bio;
 
+	if (!ctx->arr->disk[disk])
+		return -ENXIO;
+
 	bio = bio_alloc_bioset(ctx->arr->disk[disk], 1,
 			       REQ_OP_WRITE | REQ_SYNC,
 			       GFP_NOIO, &lhsr_bioset);
@@ -1735,7 +1756,10 @@ static int lhsr_rmw_submit_write(struct lhsr_rmw_ctx *ctx, unsigned int disk,
 	bio->bi_iter.bi_sector = ctx->chunk_start + ctx->arr->disk_offset[disk];
 	bio->bi_end_io = endio;
 	bio->bi_private = ctx;
-	__bio_add_page(bio, page, ctx->chunk_bytes, 0);
+	if (!bio_add_page(bio, page, ctx->chunk_bytes, 0)) {
+		bio_put(bio);
+		return -ENOSPC;
+	}
 	submit_bio(bio);
 	return 0;
 }
@@ -1753,6 +1777,7 @@ static void lhsr_rmw_read_old_endio(struct bio *bio)
 		return;
 	}
 	bio_put(bio);
+	ctx->phase = RMW_PHASE_P_READ;
 
 	p_disk = ctx->data_disks;	/* P parity is always at index data_disks */
 
@@ -1773,10 +1798,22 @@ static void lhsr_rmw_read_old_endio(struct bio *bio)
 static void lhsr_rmw_read_parity_endio(struct bio *bio)
 {
 	struct lhsr_rmw_ctx *ctx = bio->bi_private;
+	unsigned int p_disk = ctx->data_disks;
 
 	if (bio->bi_status) {
-		/* Parity read failed: continue with zeroed parity (degraded write) */
-		memset(page_address(ctx->parity_page), 0, ctx->chunk_bytes);
+		/*
+		 * Only zero parity if the parity disk is actually marked failed.
+		 * If the disk is healthy but had a transient read error, propagate
+		 * the error rather than silently writing wrong parity to disk.
+		 */
+		if (ctx->arr->failed_disks & (1 << p_disk))
+			memset(page_address(ctx->parity_page), 0, ctx->chunk_bytes);
+		else {
+			ctx->status = bio->bi_status;
+			bio_put(bio);
+			lhsr_rmw_cleanup(ctx);
+			return;
+		}
 	}
 	bio_put(bio);
 
@@ -1803,9 +1840,18 @@ static void lhsr_rmw_read_parity_endio(struct bio *bio)
 static void lhsr_rmw_read_q_endio(struct bio *bio)
 {
 	struct lhsr_rmw_ctx *ctx = bio->bi_private;
+	unsigned int q_disk = ctx->data_disks + 1;
 
 	if (bio->bi_status) {
-		memset(page_address(ctx->q_parity_page), 0, ctx->chunk_bytes);
+		/* Only zero Q if the Q disk is marked failed */
+		if (ctx->arr->failed_disks & (1 << q_disk))
+			memset(page_address(ctx->q_parity_page), 0, ctx->chunk_bytes);
+		else {
+			ctx->status = bio->bi_status;
+			bio_put(bio);
+			lhsr_rmw_cleanup(ctx);
+			return;
+		}
 	}
 	bio_put(bio);
 
@@ -1815,11 +1861,33 @@ static void lhsr_rmw_read_q_endio(struct bio *bio)
 /* Phase 4: Compute parity and submit data write. */
 static void lhsr_rmw_compute_and_write(struct lhsr_rmw_ctx *ctx)
 {
-	void *old_data = page_address(ctx->old_data_page);
-	void *parity = page_address(ctx->parity_page);
-	void *new_data = page_address(ctx->new_data_page);
+	void *old_data, *parity, *new_data;
 	struct bio *orig = ctx->orig_bio;
 	unsigned int i;
+
+	ctx->phase = RMW_PHASE_DATA_WRITE;
+
+	/* Validate data disk is still accessible */
+	if (!ctx->arr->disk[ctx->data_disk]) {
+		ctx->status = BLK_STS_IOERR;
+		lhsr_rmw_cleanup(ctx);
+		return;
+	}
+
+	/* page_address is safe on 64-bit (no highmem); on 32-bit with
+	 * CONFIG_HIGHMEM, alloc_page(GFP_NOIO) may return highmem pages,
+	 * and page_address() returns NULL.  Use kmap_local_page in that
+	 * case.  For now we assert the pages are lowmem-mapped.
+	 */
+	old_data = page_address(ctx->old_data_page);
+	parity = page_address(ctx->parity_page);
+	new_data = page_address(ctx->new_data_page);
+	if (!old_data || !parity || !new_data) {
+		DMERR("RMW: page_address returned NULL (highmem?)");
+		ctx->status = BLK_STS_RESOURCE;
+		lhsr_rmw_cleanup(ctx);
+		return;
+	}
 
 	/* Merge bio data into new_data starting from old_data */
 	memcpy(new_data, old_data, ctx->chunk_bytes);
@@ -1829,11 +1897,11 @@ static void lhsr_rmw_compute_and_write(struct lhsr_rmw_ctx *ctx)
 		size_t dst_off = (size_t)ctx->offset_in_chunk << SECTOR_SHIFT;
 
 		bio_for_each_segment(bv, orig, iter) {
-			void *src = kmap(bv.bv_page) + bv.bv_offset;
+			void *src = kmap_local_page(bv.bv_page) + bv.bv_offset;
 			size_t copy_len = min_t(size_t, bv.bv_len,
 						ctx->chunk_bytes - dst_off);
 			memcpy(new_data + dst_off, src, copy_len);
-			kunmap(bv.bv_page);
+			kunmap_local(src);
 			dst_off += copy_len;
 			if (dst_off >= ctx->chunk_bytes)
 				break;
@@ -1855,6 +1923,12 @@ static void lhsr_rmw_compute_and_write(struct lhsr_rmw_ctx *ctx)
 		u8 *od = old_data;
 		u8 *nd = new_data;
 		u8 coeff = rs_power_table[ctx->data_disk];
+		if (!q) {
+			DMERR("RMW: Q parity page_address returned NULL (highmem?)");
+			ctx->status = BLK_STS_RESOURCE;
+			lhsr_rmw_cleanup(ctx);
+			return;
+		}
 		for (i = 0; i < ctx->chunk_bytes; i++) {
 			u8 delta = od[i] ^ nd[i];
 			u8 prod = 0;
@@ -1892,6 +1966,7 @@ static void lhsr_rmw_write_data_endio(struct bio *bio)
 		return;
 	}
 	bio_put(bio);
+	ctx->phase = RMW_PHASE_P_WRITE;
 
 	p_disk = ctx->data_disks;	/* P parity index */
 
@@ -1920,6 +1995,7 @@ static void lhsr_rmw_write_parity_endio(struct bio *bio)
 		return;
 	}
 	bio_put(bio);
+	ctx->phase = RMW_PHASE_Q_WRITE;
 
 	/* For RAID6, write Q parity */
 	if (ctx->parity_disks > 1) {
@@ -1948,6 +2024,7 @@ static void lhsr_rmw_write_q_endio(struct bio *bio)
 		ctx->status = bio->bi_status;
 	bio_put(bio);
 
+	ctx->phase = RMW_PHASE_DONE;
 	lhsr_rmw_cleanup(ctx);
 }
 
@@ -1956,6 +2033,8 @@ static void lhsr_rmw_cleanup(struct lhsr_rmw_ctx *ctx)
 {
 	if (!ctx)
 		return;
+
+	ctx->phase = RMW_PHASE_DONE;
 
 	if (ctx->old_data_page)
 		__free_page(ctx->old_data_page);
@@ -2180,7 +2259,11 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 			rbio->bi_iter.bi_sector = chunk_start + arr->disk_offset[data_disk];
 			rbio->bi_end_io = lhsr_rmw_read_old_endio;
 			rbio->bi_private = ctx;
-			__bio_add_page(rbio, ctx->old_data_page, chunk_bytes, 0);
+			if (!bio_add_page(rbio, ctx->old_data_page, chunk_bytes, 0)) {
+				bio_put(rbio);
+				DMERR("RAID5/6 write: bio_add_page failed");
+				goto write_alloc_fail;
+			}
 			submit_bio(rbio);
 			return DM_MAPIO_SUBMITTED;
 
