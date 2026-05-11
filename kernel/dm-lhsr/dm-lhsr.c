@@ -1,11 +1,42 @@
 /*
  * LHSR - Linux Hybrid Self-Healing RAID
- * Device Mapper Main Module - Minimal Working Base v1.0.2
+ * Device Mapper Main Module
  *
  * Copyright (C) 2026 LHSR Team
  * License: GPLv3
  *
+ * ==========================================================================
+ * PRODUCTION READINESS (2026-05-11)
+ * ==========================================================================
+ *
+ * WORKING (tested, correct):
+ *   - Single disk passthrough (write+read, large I/O)
+ *   - Mirror writes to all working members (atomic pending, sync-safe)
+ *   - RAID5/6 RMW write state machine (phase tracking, P+Q parity, data integrity)
+ *   - Superblock atomic write (backup-first + REQ_FUA, crash-safe)
+ *   - Memory ownership model (endio chain, dtr NULL-before-free, destroying flag)
+ *   - Scrubber (single-pass block verification, checksum cache)
+ *   - Module load/unload with active device drain + rcu_barrier
+ *
+ * NOT YET PRODUCTION-READY (needs work):
+ *   - Read reconstruction on failure — code exists, NOT tested with failed disk
+ *   - Rebuild — block copy only, no parity reconstruction, no bitmap, EOPNOTSUPP on parity disks
+ *   - Error/failover paths — concurrently unprotected (failed_disks race in hot path)
+ *   - Concurrent stress — only single-threaded testing so far
+ *   - RAID5 double-failure / RAID6 triple-failure — returns IOERR with TODO
+ *   - Power-fail recovery — never tested
+ *   - O_DIRECT/FUA passthrough — RMW path creates its own bios, never propagates REQ_FUA
+ *
+ * MIXED DISK SIZES:
+ *   Array capacity = min(disk_sectors) for mirror, or data_disks × min(disk_sectors)
+ *   for RAID5/6.  Extra space on larger disks is NOT used.  This is a known
+ *   limitation.  Future SHR-style chunk mapping would eliminate the waste.
+ *   For now: partition larger disks to match before creating the array, or
+ *   accept the waste.
+ *
+ * ==========================================================================
  * DATA STRUCTURE DESIGN:
+ * ==========================================================================
  *   The core data structure is struct lhsr_array, which models a RAID array
  *   as a set of block devices, a raid type (single/mirror/raid5/raid6), and
  *   associated metadata (superblocks, checksum cache, scrub/rebuild state).
@@ -1411,7 +1442,21 @@ if (strcmp(argv[0], "single") == 0) {
 		DMINFO("Added device %u: %s (offset %llu)", i, dev_name, (u64)offset);
 	}
 
-	/* Calculate size from smallest device */
+	/*
+	 * Calculate size from smallest device.
+	 *
+	 * LIMITATION: This wastes space on larger disks.  For example,
+	 * a RAID5 of [100GB, 200GB, 300GB] gives 200GB usable and wastes
+	 * 300GB (the extra capacity on the two larger disks is unused).
+	 *
+	 * Future SHR-style chunk mapping (per-chunk stripe offsets) would
+	 * allow using the full capacity of every disk, but that's a
+	 * significant rearchitecture of the stripe map in lhsr_map().
+	 *
+	 * Workaround for now: partition larger disks to match before
+	 * creating the array, or accept the waste.  See header comment
+	 * for full production readiness status.
+	 */
 	size = bdev_nr_sectors(arr->disk[0]);
 	for (i = 1; i < num_disks; i++) {
 		sector_t s = bdev_nr_sectors(arr->disk[i]);
