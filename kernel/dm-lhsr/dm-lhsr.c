@@ -2058,6 +2058,9 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 			mctx->status = 0;
 			atomic_set(&mctx->pending, working);
 
+			{
+			unsigned int submitted = 0;
+
 			for (i = 0; i < arr->disks; i++) {
 				if (arr->failed_disks & (1 << i) || !arr->disk[i])
 					continue;
@@ -2082,20 +2085,22 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				}
 
 				submit_bio(clone);
+				submitted++;
 			}
 
 			/*
-			 * If all clones completed synchronously, pending is 0
-			 * and mirror_endio already freed mctx.  If zero clones
-			 * were submitted, complete here.
+			 * If no clones were submitted, no endio will fire.
+			 * Complete orig_bio and free mctx here.
+			 * If at least one was submitted, endio handles completion.
+			 * mctx may be freed if all completed synchronously.
+			 * DO NOT TOUCH mctx after this check.
 			 */
-			if (atomic_read(&mctx->pending) == 0) {
-				/* Count of working was > 0 but all submits failed? */
+			if (submitted == 0) {
 				bio->bi_status = mctx->status ? mctx->status : BLK_STS_RESOURCE;
 				bio_endio(bio);
 				kfree(mctx);
 			}
-			/* Otherwise, mirror_endio handles completion */
+			}
 
 			return DM_MAPIO_SUBMITTED;
 		}
@@ -2295,6 +2300,9 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 			stripe_sector = chunk_start + (offset % chunk_sects);
 
 			/* Submit reads to ALL survivors */
+			{
+			unsigned int submitted = 0;
+
 			for (i = 0; i < ctx->num_slots; i++) {
 				struct bio *clone;
 				unsigned int di = ctx->disk_map[i];
@@ -2322,14 +2330,22 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				clone->bi_end_io = lhsr_raid_5_read_endio;
 				clone->bi_private = ctx;
 				submit_bio(clone);
+				submitted++;
 			}
 
-			if (atomic_read(&ctx->pending) == 0) {
+			/*
+			 * If no clones were submitted, no endio will fire.
+			 * Complete orig_bio and free ctx here.
+			 * If at least one was submitted, endio handles completion.
+			 * ctx may be freed if all completed synchronously.
+			 * DO NOT TOUCH ctx after this check.
+			 */
+			if (submitted == 0) {
 				bio->bi_status = ctx->status ? ctx->status : BLK_STS_RESOURCE;
 				bio_endio(bio);
 				kfree(ctx->recon_buf);
 				if (ctx->data_bufs) {
-					for (i = 0; i < total_slots; i++) {
+					for (i = 0; i < ctx->num_slots; i++) {
 						if (ctx->data_bufs[i])
 							kfree(ctx->data_bufs[i]);
 					}
@@ -2339,6 +2355,7 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 				return DM_MAPIO_SUBMITTED;
 			}
 			return DM_MAPIO_SUBMITTED;
+			}
 		}
 
 		/*
