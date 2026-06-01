@@ -9,7 +9,7 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
 # Extra compiler flags
-ccflags-y := -I$(PWD)/../include
+ccflags-y := -I$(src)/../include
 
 # Default target
 all:

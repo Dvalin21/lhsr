@@ -30,6 +30,14 @@
 /* Superblock lives in reserved space at END of device, outside user data area */
 #define LHSR_SB_SECTORS      16   /* 16 sectors (8KB) reserved at end for superblock metadata */
 
+/* RAID level identifiers */
+enum lhsr_raid_type {
+	LHSR_RAID0 = 0,
+	LHSR_RAID1,
+	LHSR_RAID5,
+	LHSR_RAID6,
+};
+
 /* Superblock on-disk structure */
 struct lhsr_superblock {
 	__u8     magic[8];
@@ -40,7 +48,7 @@ struct lhsr_superblock {
 	__u64    last_update;
 	__u32    disk_index;
 	__u32    disk_state;
-	__u32    raid_type;
+	__u32    raid_type;	/* enum lhsr_raid_type — on-disk, stays __u32 */
 	__u32    disk_count;
 	__u64    total_sectors;
 	__u64    generation;
@@ -77,16 +85,8 @@ struct lhsr_superblock {
 #define LHSR_WRITE_VERIFY_SIMPLE 1
 #define LHSR_WRITE_VERIFY_FULL   2
 
-/* Checksummed block metadata stored in reserved superblock area */
-struct lhsr_block_meta {
-	__u64 offset;       /* Block offset in sectors */
-	__u32 checksum;     /* CRC32c of block data */
-	__u32 flags;        /* Block flags */
-	__u64 scrub_gen;    /* Last scrub generation */
-} __attribute__((packed));
-
+/* Block verification flags (stored in checksum cache upper 32 bits) */
 #define LHSR_BLOCK_VERIFIED   0x01
 #define LHSR_BLOCK_CORRUPT    0x02
-#define LHSR_BLOCK_DIRTY      0x04
 
 #endif /* DM_LHSR_H */
