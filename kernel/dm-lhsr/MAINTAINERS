@@ -1,0 +1,7 @@
+LHSR - LINUX HYBRID SELF-HEALING RAID
+M:	LHSR Team <lhsr@example.com>
+L:	linux-raid@vger.kernel.org
+S:	Maintained
+F:	Documentation/device-mapper/lhsr.rst
+F:	drivers/md/dm-lhsr/
+F:	include/linux/dm-lhsr.h

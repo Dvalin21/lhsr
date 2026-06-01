@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-3.0-only
+# LHSR - Linux Hybrid Self-Healing RAID
+#
+# For out-of-tree builds, this Kconfig documents the intended
+# kernel configuration entry for upstream inclusion.
+#
+# To use with in-tree build: place in drivers/md/Kconfig
+# as: source "drivers/md/lhsr/Kconfig"
+
+config DM_LHSR
+	tristate "LHSR RAID target support"
+	depends on BLK_DEV_DM
+	select CRC32C
+	help
+	  LHSR (Linux Hybrid Self-Healing RAID) is a device-mapper
+	  target that provides RAID0/1/5/6 with automatic media error
+	  detection and recovery (self-healing).
+
+	  Features:
+	    - RAID levels: 0 (striping), 1 (mirroring), 5, 6
+	    - Online scrub with checksum verification per 4KB block
+	    - Automatic rebuild on disk replacement
+	    - Write-hole mitigation via REQ_FUA on parity updates
+	    - Configurable error thresholds and failover policy
+
+	  If unsure, say N.
