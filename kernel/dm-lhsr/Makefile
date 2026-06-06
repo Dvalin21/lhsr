@@ -9,7 +9,8 @@ KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
 # Extra compiler flags
-ccflags-y := -I$(src)/../include
+# $(src) = kernel/dm-lhsr/; we need project root's include/ for <lhsr.h>
+ccflags-y := -I$(src)/../../include
 
 # Default target
 all:

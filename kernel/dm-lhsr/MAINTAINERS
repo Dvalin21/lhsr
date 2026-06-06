@@ -2,6 +2,37 @@ LHSR - LINUX HYBRID SELF-HEALING RAID
 M:	LHSR Team <lhsr@example.com>
 L:	linux-raid@vger.kernel.org
 S:	Maintained
-F:	Documentation/device-mapper/lhsr.rst
-F:	drivers/md/dm-lhsr/
-F:	include/linux/dm-lhsr.h
+
+KERNEL MODULE
+F:	kernel/dm-lhsr/
+F:	kernel/dm-lhsr/Kconfig
+F:	kernel/dm-lhsr/Makefile
+F:	kernel/dm-lhsr/dm-lhsr.c
+F:	kernel/dm-lhsr/dm_lhsr.h
+F:	kernel/dm-lhsr/MAINTAINERS
+
+ON-DISK FORMAT (shared header)
+F:	include/lhsr.h
+
+USERSPACE LIBRARY
+F:	lib/Makefile
+F:	lib/raid_engine.h
+F:	lib/raid_engine/lhsr_raid.c
+F:	lib/raid_engine/lhsr_raid.h
+
+USERSPACE TOOLS
+F:	userspace/cli/lhsrctl.c
+F:	userspace/cli/Makefile
+F:	userspace/daemon/lhsrd.c
+F:	userspace/daemon/Makefile
+F:	userspace/recovery/lhsr-scan.c
+F:	userspace/recovery/Makefile
+
+TESTS
+F:	tests/smoke-test-raid5.sh
+
+DOCUMENTATION
+F:	README.md
+F:	ROADMAP.md
+F:	CHANGELOG.md
+F:	PRODUCTION_READINESS.md

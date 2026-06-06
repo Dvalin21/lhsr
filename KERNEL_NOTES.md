@@ -93,8 +93,20 @@ rmmod dm-lhsr
 ## dm-lhsr.ko Current State
 
 - **Version**: 1.3.0
-- **Features**: RAID0, RAID1, RAID5, RAID6, SHR, Single, Mirror
-- **Status**: Rebuild execution implemented
+- **Implemented**: RAID0, RAID1, RAID5, RAID6
+- **Not implemented**: SHR, SHR2 (data structures exist but are never populated)
+- **Status**: Rebuild execution implemented (full-disk only, no incremental)
+
+> **⚠️ See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for complete
+> gap analysis of all 8 claimed features vs. actual code.**
+
+### Known Critical Issues
+
+1. **Two diverging superblock structs**: `include/lhsr.h` (96 bytes) vs
+   `kernel/dm-lhsr/dm_lhsr.h` (128 bytes). Different fields, different sizes.
+   Will cause silent corruption. Fix before adding persistent checksums.
+2. **`failed_disks` bitmask race**: Lockless READ_ONCE readers vs. sb_sem writers
+   on u32. Needs atomic_long_t or explicit documentation.
 
 ### Production Safety Features
 - **Concurrency**: Mutex + rwsem for thread-safe array operations
@@ -103,7 +115,7 @@ rmmod dm-lhsr
 - **Configuration**: Query via `config` message handler
 
 ### Rebuilder
-- **Implementation**: Read from source disk, write to rebuild disk
+- **Implementation**: Read from source disk, write to rebuild disk (full copy)
 - **Chunk size**: 128KB with rate limiting
 - **Control**: `rebuild start <disk>`, `rebuild status`, `rebuild stop`
 
@@ -114,8 +126,8 @@ rmmod dm-lhsr
 
 ### Scrubber
 - Background 128KB block verification
-- Corruption detection tracking
+- Corruption detection tracking (ephemeral — lost on module unload)
 - Control: `dmsetup message <dev> scrub start|stop`
 
 ---
-Updated: 2026-04-21
+Updated: 2026-06-03

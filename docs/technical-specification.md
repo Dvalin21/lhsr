@@ -2,24 +2,37 @@
 
 ## Technical Specification v1.0
 
-### Executive Summary
-
-LHSR (Linux Hybrid Self-Healing RAID) is a production-grade software RAID system inspired by Synology Hybrid RAID (SHR/SHR-2) with enterprise features including self-healing, anti-bit-rot protection, predictive failure detection, and firmware failure mitigation.
+> **⚠️ HONESTY NOTICE**: This document was written as a vision document before
+> most features were implemented. For the current implementation status of every
+> claimed feature, see [PRODUCTION_READINESS.md](../PRODUCTION_READINESS.md).
+>
+> Key facts that contradict this document:
+> - Only RAID0/1/5/6 are implemented. SHR/SHR2 data structures exist but are
+>   never populated (zero implementation).
+> - Scrubbing with CRC32c works, but checksums are **not persisted** (lost on
+>   module unload). Anti-bit-rot requires persistent checksums.
+> - No prediction model exists. The `predict` command is a stub.
+> - Full-disk rebuild only. No incremental rebuild implementation.
+> - Live block migration, firmware mitigation not implemented.
+> - Two superblock structs exist (`include/lhsr.h` vs `kernel/dm-lhsr/dm_lhsr.h`)
+>   and they differ in size and fields — this is a latent corruption bug.
 
 **Target Environment:** Linux production servers, Proxmox VE, enterprise storage arrays
 
 ---
 
-## 1. Core Design Goals
+## 1. Core Design Goals (STATUS SUMMARY)
 
-1. **SHR-Style Flexible Disk Sizes** — Mixed disk capacities without waste
-2. **Self-Healing Engine** — Automatic block repair with checksum verification
-3. **Anti-Bit-Rot Protection** — Detection and repair of silent data corruption
-4. **Predictive Failure Engine** — SMART-based disk failure prediction
-5. **Live Block Migration** — Proactive data migration before disk failure
-6. **Instant RAID Recovery** — Partial array mount for disaster recovery
-7. **Incremental Rebuild** — Rebuild only used blocks, not entire disks
-8. **Firmware-Aware Protection** — Mitigation against drive firmware bugs
+| # | Goal | Status | Notes |
+|---|------|--------|-------|
+| 1 | SHR-Style Flexible Disk Sizes | ❌ Vaporware | Segment data structures exist but never populated |
+| 2 | Self-Healing Engine | ⚠️ Partial | Scrub + read-repair work, but checksum cache is ephemeral |
+| 3 | Anti-Bit-Rot Protection | ❌ Vaporware | dm-integrity exists upstream; ephemeral xarray is not production |
+| 4 | Predictive Failure Engine | ⚠️ Basic | SMART polling exists, no prediction model |
+| 5 | Live Block Migration | ❌ Vaporware | mdadm --grow already does this |
+| 6 | Instant RAID Recovery | ⚠️ Basic | Read-side reconstruction works; no partial mount |
+| 7 | Incremental Rebuild | ❌ Vaporware | Full-disk rebuild only; no write-intent bitmap |
+| 8 | Firmware-Aware Protection | ❌ Vaporware | Kernel driver quirks already handle this |
 
 ---
 

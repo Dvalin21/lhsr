@@ -2,7 +2,7 @@
 
 CC ?= clang
 CFLAGS += -Wall -Wextra -O2 -g
-CFLAGS += -I../../include -I.
+CFLAGS += -I../include -I.
 
 all: liblhsr.a
 

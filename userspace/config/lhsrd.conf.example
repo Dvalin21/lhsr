@@ -1,0 +1,27 @@
+# LHSR Daemon Configuration
+#
+# This file is read by lhsrd on startup.
+# Lines starting with # or ; are comments.
+
+# How often to poll disk SMART data (seconds)
+# Default: 300 (5 minutes)
+smart_poll_interval = 300
+
+# Number of consecutive SMART poll failures before auto-failover
+# Default: 3
+error_threshold = 3
+
+# Automatically fail over disks that exceed thresholds
+# Values: 0 = disabled, 1 = enabled
+# Default: 1
+auto_failover = 1
+
+# Log notifications on failure events
+# Values: 0 = disabled, 1 = enabled
+# Default: 1
+notify_on_fail = 1
+
+# Verbose syslog output
+# Values: 0 = disabled, 1 = enabled
+# Default: 0
+verbose = 0

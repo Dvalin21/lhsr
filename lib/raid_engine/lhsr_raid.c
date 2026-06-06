@@ -18,7 +18,7 @@
 #include <sys/random.h>
 #include <time.h>
 
-#include "../lib/raid_engine.h"
+#include "../raid_engine.h"
 
 /* Default values */
 #define LHSR_DEFAULT_BLOCK_SIZE  (128 * 1024)
@@ -326,7 +326,7 @@ int lhsr_disk_get_smart(struct lhsr_disk *disk, struct lhsr_smart_data *smart)
  * Create new RAID array
  */
 struct lhsr_array *lhsr_array_create(struct lhsr_context *ctx,
-				      enum lhsr_raid_type raid_type,
+				      unsigned int raid_type,
 				      struct lhsr_disk *disks,
 				      unsigned int disk_count)
 {
@@ -445,7 +445,7 @@ void lhsr_shr_calculate_layout(struct lhsr_array *arr,
 /*
  * Get RAID type name
  */
-const char *lhsr_raid_name(enum lhsr_raid_type type)
+const char *lhsr_raid_name(unsigned int type)
 {
 	switch (type) {
 	case LHSR_RAID_SINGLE: return "Single";

@@ -16,12 +16,12 @@
 #include <string.h>
 #include <errno.h>
 
-/* Version */
-#define LHSR_VERSION_MAJOR  1
-#define LHSR_VERSION_MINOR   0
-#define LHSR_VERSION_PATCH  0
-
-/* RAID types */
+/*
+ * RAID type constants — must match include/lhsr.h values.
+ * The kernel module uses #define constants from the shared on-disk
+ * header; the userspace library uses an enum.  Values are the same.
+ * Function signatures use unsigned int so they're compatible.
+ */
 enum lhsr_raid_type {
 	LHSR_RAID_SINGLE = 0,
 	LHSR_RAID_MIRROR = 1,
@@ -30,6 +30,11 @@ enum lhsr_raid_type {
 	LHSR_RAID_SHR = 4,
 	LHSR_RAID_SHR2 = 5,
 };
+
+/* Version */
+#define LHSR_VERSION_MAJOR  1
+#define LHSR_VERSION_MINOR   0
+#define LHSR_VERSION_PATCH  0
 
 /* States */
 enum lhsr_state {
@@ -96,7 +101,7 @@ struct lhsr_array {
 	unsigned char uuid_bin[16];  /* UUID binary */
 
 	char name[64];
-	enum lhsr_raid_type raid_type;
+	unsigned int raid_type;		/* LHSR_RAID_* constant */
 	unsigned int disk_count;
 
 	uint64_t total_capacity;
@@ -120,7 +125,7 @@ struct lhsr_array {
 struct lhsr_segment {
 	uint64_t start;
 	uint64_t size;
-	enum lhsr_raid_type raid_type;
+	unsigned int raid_type;		/* LHSR_RAID_* constant */
 };
 
 /* SMART data */
@@ -224,7 +229,7 @@ void lhsr_free(struct lhsr_context *ctx);
 
 /* Array functions */
 struct lhsr_array *lhsr_array_create(struct lhsr_context *ctx,
-					enum lhsr_raid_type raid_type,
+					unsigned int raid_type,
 					struct lhsr_disk *disks,
 					unsigned int disk_count);
 void lhsr_array_free(struct lhsr_array *arr);
@@ -253,7 +258,7 @@ void lhsr_shr_calculate_layout(struct lhsr_array *arr,
 				unsigned int count);
 
 /* Utility */
-const char *lhsr_raid_name(enum lhsr_raid_type type);
+const char *lhsr_raid_name(unsigned int type);
 
 /* Checksum */
 uint32_t lhsr_checksum_crc32c(const void *data, size_t len);
