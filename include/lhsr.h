@@ -74,6 +74,29 @@ typedef uint64_t __u64;
 #define LHSR_SB_SECTORS        16   /* 16 sectors (8 KB) reserved at end of device */
 
 /* ===================================================================
+ * Write-hole journal (dirty stripe bitmap)
+ *
+ * The bitmap is stored between the user data area and the superblock.
+ * Each 4KB page has a 12-byte header (seq + CRC) followed by bits.
+ * Each bit covers LHSR_BITMAP_REGION_BYTES of user data.
+ *
+ * Layout on disk (per device):
+ *   sector 0 .. disk_sectors-1               user data
+ *   sector disk_sectors .. +BITMAP_SECTORS-1  bitmap pages (32 pages * 8 sectors = 256 sectors)
+ *   sector disk_sectors+BITMAP_SECTORS .. +SB_SECTORS-1  superblock (primary + backup)
+ *
+ * Total metadata: LHSR_META_SECTORS = LHSR_BITMAP_TOTAL_SECTORS + LHSR_SB_SECTORS
+ * =================================================================== */
+#define LHSR_BITMAP_REGION_SHIFT      20   /* 2^20 bytes = 1MB per region bit */
+#define LHSR_BITMAP_REGION_SECTORS    (1 << (LHSR_BITMAP_REGION_SHIFT - 9))  /* 2048 */
+#define LHSR_BITMAP_PAGES             32   /* 32 pages = 128KB bitmap */
+#define LHSR_BITMAP_HEADER_BYTES      12   /* 8 bytes seq + 4 bytes CRC */
+#define LHSR_BITMAP_BITS_PER_PAGE     ((4096 - LHSR_BITMAP_HEADER_BYTES) * 8)  /* 32672 */
+#define LHSR_BITMAP_PAGE_SECTORS      (4096 / 512)  /* 8 */
+#define LHSR_BITMAP_TOTAL_SECTORS     (LHSR_BITMAP_PAGES * LHSR_BITMAP_PAGE_SECTORS)  /* 256 */
+#define LHSR_META_SECTORS             (LHSR_BITMAP_TOTAL_SECTORS + LHSR_SB_SECTORS)  /* 272 */
+
+/* ===================================================================
  * RAID types stored in superblock raid_type field
  *
  * These values are ON-DISK.  Do not renumber.

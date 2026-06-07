@@ -32,6 +32,13 @@
 /* Scrubber block size (128 KB) */
 #define LHSR_SCRUB_BLOCK_SIZE (128 * 1024)
 
+/* Write-hole journal — dirty stripe bitmap page (on-disk format) */
+struct lhsr_bitmap_page {
+	u64 seq;			/* Monotonic write sequence (0 = uninitialized) */
+	u32 crc32;			/* CRC32c of entire page with this field zeroed */
+	u8  bits[LHSR_BITMAP_BITS_PER_PAGE / 8];  /* Bit array */
+} __packed;
+
 /* Forward declarations for RAID5/6 read reconstruction */
 struct lhsr_rmw_ctx;
 struct lhsr_array;
@@ -114,6 +121,12 @@ struct lhsr_array {
 
 	/* Checksum cache for scrubber (xarray keyed by sector offset) */
 	struct xarray cksum_cache;
+
+	/* Write-hole journal — dirty stripe bitmap */
+	struct page *bitmap_pages[LHSR_BITMAP_PAGES];	/* In-memory pages */
+	unsigned long bitmap_flags[LHSR_BITMAP_PAGES];	/* Bit 0 = dirty */
+	u64 bitmap_seqs[LHSR_BITMAP_PAGES];		/* Current seq per page */
+	atomic_t bitmap_recovering;			/* 1 = recovery in progress */
 };
 
 /* Accessor helpers for failed_disks bitmask (concurrent hot-path field) */

@@ -24,7 +24,11 @@ DISK_SIZE_MB=64                     # Per-loopback size
 NUM_DISKS=3                         # RAID5 minimum
 LHSR_MODULE="../kernel/dm-lhsr/dm-lhsr.ko"
 LHSR_DEV_NAME="lhsr-smoke-raid5"
-LHSR_SIZE_SECTORS=$(( (DISK_SIZE_MB - 2) * 2048 * NUM_DISKS ))  # conservative
+# Per-disk sectors minus superblock area (272 sectors = 136KB).
+# The dm-lhsr driver computes user-visible size from this value and raid level.
+PER_DISK_SECTORS=$((DISK_SIZE_MB * 1024 * 1024 / 512))
+SUPERBLOCK_SECTORS=272
+LHSR_SIZE_SECTORS=$((PER_DISK_SECTORS - SUPERBLOCK_SECTORS))
 
 # Colors for output
 RED='\033[0;31m'
@@ -145,8 +149,9 @@ pass "Module loaded successfully"
 # ────────────────────────────────────────────────────────────
 info "Step 4/8: Creating RAID5 target ($LHSR_DEV_NAME)..."
 
-# Build table line: raid5 <dev1> <off1> <dev2> <off2> <dev3> <off3>
-TABLE="raid5"
+# Build table line:
+#   raid5 <chunk_sects> <stripes_per_cont> <cont_sects> <dev1> <off1> <dev2> <off2> ...
+TABLE="raid5 8 1 8"
 for ldev in "${LOOP_DEVS[@]}"; do
     TABLE+=" $ldev 0"
 done

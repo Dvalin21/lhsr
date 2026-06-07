@@ -25,9 +25,10 @@
  *   - Error/failover paths — concurrently unprotected (failed_disks race in hot path)
  *   - Concurrent stress — only single-threaded testing so far
  *   - RAID5 double-failure / RAID6 triple-failure — returns IOERR with TODO
- *   - Power-fail recovery — never tested
- *   - Write-hole — REQ_FUA added to RMW writes (mitigation), but no write-intent
- *     bitmap/journal yet for full atomic-stripe guarantee
+ *   - RAID6 Q parity recovery — bitmap recover reconstructs P only, Q is NOT yet
+ *     reconstructed (RAID5 gets full parity recovery from dirty-bit replay)
+ *   - Power-fail recovery — bitmap journal implemented, basic parity reconstruction
+ *     tested on simulated crash (uncommitted dirty bits are recovered on re-assembly)
  *
  * MIXED DISK SIZES:
  *   Array capacity = min(disk_sectors) for mirror, or data_disks × min(disk_sectors)
@@ -57,7 +58,7 @@
 #include <linux/device-mapper.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
-#include <linux/crc32c.h>
+#include <linux/crc32.h>
 #include <linux/ktime.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
@@ -76,6 +77,14 @@ struct lhsr_raid_5_read_ctx;
 static void lhsr_mirror_endio(struct bio *bio);
 static void lhsr_raid_5_read_endio(struct bio *bio);
 static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
+
+/* Write-hole journal bitmap functions */
+static int lhsr_bitmap_init(struct lhsr_array *arr);
+static void lhsr_bitmap_destroy(struct lhsr_array *arr);
+static int lhsr_bitmap_load(struct lhsr_array *arr);
+static int lhsr_bitmap_recover(struct lhsr_array *arr);
+static int lhsr_bitmap_set(struct lhsr_array *arr, sector_t chunk_start);
+static int lhsr_bitmap_clear(struct lhsr_array *arr, sector_t chunk_start);
 
 /* RAID5/6 RMW synchronous worker */
 static void lhsr_rmw_worker(struct work_struct *work);
@@ -161,16 +170,21 @@ MODULE_VERSION(LHSR_VERSION);
 
 /*
  * CRC32c checksum using kernel API
- * Kernel's crc32c() computes CRC32c (Castagnoli) with:
- *   - Initial value: 0xFFFFFFFF
- *   - Final XOR: 0xFFFFFFFF
+ * Kernel's __crc32c_le(crc, buf, len) computes CRC32c (Castagnoli) with:
+ *   - Programmable initial value (passed as first arg)
+ *   - No final XOR
  *   - Polynomial: 0x1EDC6F41 (same as 0x82F63B78 reflected)
  *
- * Synchronous I/O: All sync BIO operations use submit_bio_wait(), the kernel's
- * standard single-page synchronous I/O API.  No ad-hoc timeouts — the block
- * layer handles timeout and error reporting internally.  This eliminates an
- * entire class of races (calling bio_endio on in-flight BIOs, freeing pages
- * while the device is still DMA'ing, etc).
+ * All LHSR CRC calls use __crc32c_le(0, ...) which means:
+ *   init=0, NO final 0xFFFFFFFF XOR.
+ * This is NOT the "standard" CRC32c (which uses init=0xFFFFFFFF and final
+ * XOR=0xFFFFFFFF). It is the raw table-based accumulation starting from 0.
+ *
+ * Userspace verification (for test scripts) must use identical semantics:
+ *   crc = 0;                          // init = 0
+ *   for each byte: crc = table[...];  // no final XOR
+ *
+ * This is used for superblock, scrub checksums, and bitmap page CRCs.
  */
 
 /* Atomic superblock write - write-hole protection
@@ -191,12 +205,15 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	int ret;
 
 	/*
-	 * Superblock lives at the END of the user data area, outside the
-	 * user-visible range (ti->len = array_size, SB is at array_size + offset).
-	 * Primary at the boundary, backup 8 sectors further in the reserved zone.
+	 * Superblock lives after the bitmap area, at the end of the
+	 * per-disk reserved metadata zone.  Layout:
+	 *   sector 0 .. array_size-1           user data
+	 *   sector array_size .. +BITMAP_SECT  bitmap pages
+	 *   +BITMAP_SECT .. +META_SECTORS-1    superblock (primary + backup)
 	 */
-	primary_sector = disk_offset + array_size;
-	backup_sector = disk_offset + array_size + (LHSR_SB_SECTORS / 2);
+	primary_sector = disk_offset + array_size + LHSR_BITMAP_TOTAL_SECTORS;
+	backup_sector = disk_offset + array_size + LHSR_BITMAP_TOTAL_SECTORS
+		+ (LHSR_SB_SECTORS / 2);
 
 	/* Allocate page for I/O */
 	page = alloc_page(GFP_KERNEL);
@@ -209,7 +226,7 @@ static int lhsr_write_superblock(struct block_device *bdev, struct lhsr_superblo
 	memcpy(buf, sb, LHSR_SB_SIZE);
 	/* Zero checksum field for CRC calculation */
 	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
-	sb->checksum = crc32c(0xFFFFFFFF, buf, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
+	sb->checksum = __crc32c_le(0, buf, LHSR_SB_SIZE);
 	/* Copy final superblock with valid checksum */
 	memcpy(buf, sb, LHSR_SB_SIZE);
 	kunmap_local(buf);
@@ -287,11 +304,15 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	int ret;
 
 	/*
-	 * Superblock is at the END of the user data area.
-	 * Primary at the boundary, backup 8 sectors further.
+	 * Superblock lives after the bitmap area, at the end of the
+	 * per-disk reserved metadata zone.  Layout:
+	 *   sector 0 .. array_size-1           user data
+	 *   sector array_size .. +BITMAP_SECT  bitmap pages
+	 *   +BITMAP_SECT .. +META_SECTORS-1    superblock (primary + backup)
 	 */
-	sector = disk_offset + array_size;
-	backup_sector = disk_offset + array_size + (LHSR_SB_SECTORS / 2);
+	sector = disk_offset + array_size + LHSR_BITMAP_TOTAL_SECTORS;
+	backup_sector = disk_offset + array_size + LHSR_BITMAP_TOTAL_SECTORS
+		+ (LHSR_SB_SECTORS / 2);
 	DMDEBUG("lhsr_read_superblock: primary sector=%llu, backup sector=%llu",
 	       (u64)sector, (u64)backup_sector);
 
@@ -326,7 +347,7 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 	buf = kmap_local_page(page);
 	stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
 	*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
-	calc_csum = crc32c(0xFFFFFFFF, buf, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
+	calc_csum = __crc32c_le(0, buf, LHSR_SB_SIZE);
 
 	if (stored_csum != calc_csum) {
 		DMWARN("Primary superblock checksum mismatch (0x%08x vs 0x%08x), trying backup at sector %llu",
@@ -355,7 +376,7 @@ static int lhsr_read_superblock(struct block_device *bdev, struct lhsr_superbloc
 
 		stored_csum = *(u32 *)(buf + offsetof(struct lhsr_superblock, checksum));
 		*(u32 *)(buf + offsetof(struct lhsr_superblock, checksum)) = 0;
-		calc_csum = crc32c(0xFFFFFFFF, buf, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
+		calc_csum = __crc32c_le(0, buf, LHSR_SB_SIZE);
 
 		if (stored_csum != calc_csum) {
 			DMERR("Both primary and backup superblock checksums invalid");
@@ -406,7 +427,7 @@ static void lhsr_init_superblock(struct lhsr_superblock *sb, u64 array_uuid,
 	sb->generation = 1;
 	/* Zero checksum field before computing CRC (field is at offset 0 in struct) */
 	sb->checksum = 0;
-	sb->checksum = crc32c(0xFFFFFFFF, (void *)sb, LHSR_SB_SIZE) ^ 0xFFFFFFFF;
+	sb->checksum = __crc32c_le(0, (void *)sb, LHSR_SB_SIZE);
 }
 
 /* Pack/unpack helpers for checksum cache xarray values (u64 keyed by sector offset) */
@@ -939,7 +960,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	kfree(pages);
 
 	/* Calculate checksum of read data */
-	calc_csum = crc32c(0xFFFFFFFF, buf, LHSR_SCRUB_BLOCK_SIZE) ^ 0xFFFFFFFF;
+	calc_csum = __crc32c_le(0, buf, LHSR_SCRUB_BLOCK_SIZE);
 
 	if (stored_csum == 0) {
 		/* No stored checksum — new block, store it */
@@ -1707,12 +1728,13 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			size = s;
 	}
 
-	/* Reserve space at end of device for superblock metadata (outside user data) */
-	if (size > LHSR_SB_SECTORS * 2) {
-		size -= LHSR_SB_SECTORS;
+	/* Reserve space at end of device for bitmap + superblock metadata */
+	if (size > LHSR_META_SECTORS * 2) {
+		size -= LHSR_META_SECTORS;
 	} else {
-		DMERR("Device too small for superblock: %llu sectors", (u64)size);
-		ti->error = "Device too small for superblock";
+		DMERR("Device too small for metadata (%llu sectors, need %u)",
+		      (u64)size, LHSR_META_SECTORS);
+		ti->error = "Device too small";
 		r = -EINVAL;
 		goto bad;
 	}
@@ -1724,7 +1746,7 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
-	/* Save per-disk usable sectors (after superblock reservation) */
+	/* Save per-disk usable sectors (after metadata reservation) */
 	arr->disk_sectors = size;
 
 	/* For RAID5/6, user-visible capacity = data_disks × disk_sectors */
@@ -1825,6 +1847,27 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
+	/* Initialize write-hole journal (dirty stripe bitmap) */
+	r = lhsr_bitmap_init(arr);
+	if (r) {
+		DMERR("ctr: Failed to initialize bitmap");
+		ti->error = "Failed to initialize bitmap";
+		goto bad;
+	}
+
+	/* Load bitmap from disk (recover after crash) */
+	r = lhsr_bitmap_load(arr);
+	if (r) {
+		DMERR("ctr: Failed to load bitmap");
+		ti->error = "Failed to load bitmap";
+		goto bad;
+	}
+
+	/* Recover any dirty stripes — reconstruct parity from data */
+	r = lhsr_bitmap_recover(arr);
+	if (r)
+		DMWARN("ctr: Bitmap recovery failed (%d), continuing", r);
+
 	ti->private = arr;
 	ti->len = size;
 	ti->begin = 0;
@@ -1857,6 +1900,7 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	return 0;
 
 bad:
+	lhsr_bitmap_destroy(arr);
 	while (i > 0) {
 		i--;
 		if (arr->dm_devs[i])
@@ -1963,6 +2007,9 @@ static void lhsr_dtr(struct dm_target *ti)
 		arr->rebuild_wq = NULL;
 		DMINFO("dtr: Rebuild stopped");
 	}
+
+	/* Flush and free write-hole journal bitmap */
+	lhsr_bitmap_destroy(arr);
 
 	DMINFO("dtr: Putting devices...");
 
@@ -2083,6 +2130,525 @@ static blk_status_t lhsr_submit_bio_sync(struct block_device *bdev,
 	status = done.status;
 	bio_put(bio);
 	return status;
+}
+
+/* =====================================================================
+ * Write-hole journal (dirty stripe bitmap)
+ *
+ * The bitmap tracks which 1MB regions of user data have uncommitted
+ * RMW parity updates.  Each bit represents one region; the bitmap is
+ * stored on ALL disks to survive single-disk failure.
+ *
+ * Crash recovery:
+ *   On array assembly, scan all dirty bits.  For each dirty region,
+ *   reconstruct parity from the data disks using XOR (RAID5).
+ *
+ * On-disk format per page (4096 bytes):
+ *   offset 0:  8 bytes seq (monotonic, 0 = uninitialized)
+ *   offset 8:  4 bytes CRC32c (of entire page with crc32=0)
+ *   offset 12: 4084 bytes of bitmap data (32672 bits)
+ *
+ * Layout on disk (per device):
+ *   sector 0 .. disk_sectors-1               user data
+ *   sector disk_sectors .. +BITMAP_SECTORS   bitmap pages
+ *   sector +BITMAP_SECTORS .. +META_SECTORS  superblock
+ * ===================================================================== */
+
+#define LHSR_BITMAP_FLAG_DIRTY 0
+
+/* ------------------------------------------------------------------ */
+/* Helper: compute CRC32c of a bitmap page (leaves page unchanged)    */
+/* ------------------------------------------------------------------ */
+static u32 lhsr_bitmap_page_crc(struct lhsr_bitmap_page *page)
+{
+	u32 saved = page->crc32;
+	u32 csum;
+
+	page->crc32 = 0;
+	csum = __crc32c_le(0, (const unsigned char *)page, 4096);
+	page->crc32 = saved;
+	return csum;
+}
+
+/* ---------------------------------------------------------------- */
+/* Helper: get the disk sector for a bitmap page index              */
+/* ---------------------------------------------------------------- */
+static sector_t lhsr_bitmap_page_sector(struct lhsr_array *arr,
+					unsigned int page_idx,
+					unsigned int disk)
+{
+	/* Bitmap lives in the reserved metadata area, between user data
+	 * and the superblock. */
+	return arr->disk_offset[disk] + arr->disk_sectors
+		+ page_idx * LHSR_BITMAP_PAGE_SECTORS;
+}
+
+/* ---------------------------------------------------------------- */
+/* Convert a physical chunk-start sector to a bitmap region index   */
+/* ---------------------------------------------------------------- */
+static inline sector_t lhsr_bitmap_region_from_sector(sector_t chunk_start)
+{
+	return chunk_start >> (LHSR_BITMAP_REGION_SHIFT - 9);
+}
+
+/* ---------------------------------------------------------------- */
+/* Write one bitmap page to ALL available disks with FUA            */
+/* Returns 0 on success (or partial), -EIO if ALL disks failed.     */
+/* ---------------------------------------------------------------- */
+static int lhsr_bitmap_write_page(struct lhsr_array *arr,
+				  unsigned int page_idx)
+{
+	struct page *page = arr->bitmap_pages[page_idx];
+	struct lhsr_bitmap_page *bmp;
+	unsigned int d, ok_count = 0, fail_count = 0;
+	int ret = -EIO;
+
+	if (!page) {
+		DMERR("bitmap: write_page %u: page is NULL", page_idx);
+		return -EINVAL;
+	}
+
+	bmp = (struct lhsr_bitmap_page *)kmap_local_page(page);
+
+	/* Increment sequence number and update CRC */
+	arr->bitmap_seqs[page_idx]++;
+	bmp->seq = arr->bitmap_seqs[page_idx];
+	bmp->crc32 = lhsr_bitmap_page_crc(bmp);
+	DMINFO("bitmap: writing page %u seq=%llu crc32=0x%08x to %u disks",
+	       page_idx, (u64)bmp->seq, bmp->crc32, arr->disks);
+
+	kunmap_local(bmp);
+
+	/* Write to ALL available disks */
+	for (d = 0; d < arr->disks; d++) {
+		blk_status_t st;
+
+		/* Skip failed or missing disks */
+		if (lhsr_failed_disks_get(arr) & (1 << d))
+			continue;
+		if (!arr->disk[d])
+			continue;
+
+		st = lhsr_submit_bio_sync(arr->disk[d], page, 4096,
+			lhsr_bitmap_page_sector(arr, page_idx, d),
+			REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
+
+		if (st == BLK_STS_OK) {
+			ok_count++;
+		} else {
+			DMERR("bitmap: write_page %u to disk %u failed: %d",
+			      page_idx, d, st);
+			fail_count++;
+		}
+	}
+
+	if (ok_count == 0) {
+		DMERR("bitmap: write_page %u FAILED on ALL %u disks",
+		      page_idx, arr->disks);
+		ret = -EIO;
+	} else {
+		if (fail_count > 0)
+			DMWARN("bitmap: write_page %u: %u/%u disks succeeded",
+			       page_idx, ok_count, arr->disks);
+		clear_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[page_idx]);
+		ret = 0;
+	}
+
+	return ret;
+}
+
+/* ---------------------------------------------------------------- */
+/* Set a dirty bit for a region and write the page to all disks     */
+/* Called BEFORE writing data+parity to mark intent.                */
+/* ---------------------------------------------------------------- */
+static int lhsr_bitmap_set(struct lhsr_array *arr, sector_t chunk_start)
+{
+	sector_t region = lhsr_bitmap_region_from_sector(chunk_start);
+	unsigned int page_idx, bit_idx;
+	struct lhsr_bitmap_page *bmp;
+
+	/* Don't set bits during recovery */
+	if (atomic_read(&arr->bitmap_recovering)) {
+		DMINFO("bitmap: set called but recovering=1, skipping");
+		return 0;
+	}
+
+	page_idx = region / LHSR_BITMAP_BITS_PER_PAGE;
+	bit_idx  = region % LHSR_BITMAP_BITS_PER_PAGE;
+
+	if (page_idx >= LHSR_BITMAP_PAGES) {
+		DMERR("bitmap: region %llu out of range (page %u >= %u)",
+		      (u64)region, page_idx, LHSR_BITMAP_PAGES);
+		return -EINVAL;
+	}
+
+	bmp = (struct lhsr_bitmap_page *)kmap_local_page(arr->bitmap_pages[page_idx]);
+
+	if (bmp->bits[bit_idx / 8] & (1 << (bit_idx % 8))) {
+		/* Already set */
+		kunmap_local(bmp);
+		return 0;
+	}
+
+	bmp->bits[bit_idx / 8] |= (1 << (bit_idx % 8));
+	kunmap_local(bmp);
+
+	set_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[page_idx]);
+
+	return lhsr_bitmap_write_page(arr, page_idx);
+}
+
+/* ---------------------------------------------------------------- */
+/* Clear a dirty bit for a region and write the page to all disks   */
+/* Called AFTER data+parity are fully committed.                    */
+/* ---------------------------------------------------------------- */
+static int lhsr_bitmap_clear(struct lhsr_array *arr, sector_t chunk_start)
+{
+	sector_t region = lhsr_bitmap_region_from_sector(chunk_start);
+	unsigned int page_idx, bit_idx;
+	struct lhsr_bitmap_page *bmp;
+
+	page_idx = region / LHSR_BITMAP_BITS_PER_PAGE;
+	bit_idx  = region % LHSR_BITMAP_BITS_PER_PAGE;
+
+	if (page_idx >= LHSR_BITMAP_PAGES)
+		return -EINVAL;
+
+	bmp = (struct lhsr_bitmap_page *)kmap_local_page(arr->bitmap_pages[page_idx]);
+
+	if (!(bmp->bits[bit_idx / 8] & (1 << (bit_idx % 8)))) {
+		/* Already clear */
+		kunmap_local(bmp);
+		return 0;
+	}
+
+	bmp->bits[bit_idx / 8] &= ~(1 << (bit_idx % 8));
+	kunmap_local(bmp);
+
+	set_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[page_idx]);
+
+	return lhsr_bitmap_write_page(arr, page_idx);
+}
+
+/* ---------------------------------------------------------------- */
+/* Initialize bitmap pages (allocate zeroed pages)                  */
+/* Returns 0 on success, -ENOMEM on allocation failure.            */
+/* ---------------------------------------------------------------- */
+static int lhsr_bitmap_init(struct lhsr_array *arr)
+{
+	unsigned int i;
+
+	for (i = 0; i < LHSR_BITMAP_PAGES; i++) {
+		struct lhsr_bitmap_page *bmp;
+
+		arr->bitmap_pages[i] = alloc_page(GFP_KERNEL);
+		if (!arr->bitmap_pages[i]) {
+			DMERR("bitmap: failed to allocate page %u", i);
+			while (i > 0) {
+				i--;
+				__free_page(arr->bitmap_pages[i]);
+				arr->bitmap_pages[i] = NULL;
+			}
+			return -ENOMEM;
+		}
+
+		bmp = (struct lhsr_bitmap_page *)kmap_local_page(arr->bitmap_pages[i]);
+		memset(bmp, 0, 4096);
+		kunmap_local(bmp);
+
+		arr->bitmap_flags[i] = 0;
+		arr->bitmap_seqs[i] = 0;
+	}
+
+	atomic_set(&arr->bitmap_recovering, 1);
+	return 0;
+}
+
+/* ---------------------------------------------------------------- */
+/* Destroy bitmap pages — flush dirty pages, free all memory        */
+/* ---------------------------------------------------------------- */
+static void lhsr_bitmap_destroy(struct lhsr_array *arr)
+{
+	unsigned int i;
+
+	if (!arr)
+		return;
+
+	/* Flush any dirty pages */
+	for (i = 0; i < LHSR_BITMAP_PAGES; i++) {
+		if (arr->bitmap_pages[i] &&
+		    test_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[i]))
+			lhsr_bitmap_write_page(arr, i);
+	}
+
+	/* Free all pages */
+	for (i = 0; i < LHSR_BITMAP_PAGES; i++) {
+		if (arr->bitmap_pages[i]) {
+			__free_page(arr->bitmap_pages[i]);
+			arr->bitmap_pages[i] = NULL;
+		}
+	}
+}
+
+/* ---------------------------------------------------------------- */
+/* Load bitmap from disk — for each page, pick the copy with the    */
+/* highest valid sequence number across all disks.                  */
+/* Returns 0 on success, negative on error.                         */
+/* ---------------------------------------------------------------- */
+static int lhsr_bitmap_load(struct lhsr_array *arr)
+{
+	unsigned int p;
+	int ret = 0;
+
+	DMINFO("bitmap: loading from %u disks", arr->disks);
+
+	for (p = 0; p < LHSR_BITMAP_PAGES; p++) {
+		struct lhsr_bitmap_page *dst;
+		u64 best_seq = 0;
+		unsigned int best_disk = arr->disks;
+		bool any_valid = false;
+		unsigned int d;
+
+		dst = (struct lhsr_bitmap_page *)kmap_local_page(
+			arr->bitmap_pages[p]);
+
+		for (d = 0; d < arr->disks; d++) {
+			struct page *tmp_page;
+			struct lhsr_bitmap_page *tmp;
+			u32 expected_crc;
+			blk_status_t st;
+
+			if (!arr->disk[d])
+				continue;
+
+			tmp_page = alloc_page(GFP_KERNEL);
+			if (!tmp_page)
+				continue;
+
+			st = lhsr_submit_bio_sync(arr->disk[d], tmp_page,
+				4096,
+				lhsr_bitmap_page_sector(arr, p, d),
+				REQ_OP_READ | REQ_SYNC);
+
+			if (st != BLK_STS_OK) {
+				__free_page(tmp_page);
+				continue;
+			}
+
+			tmp = (struct lhsr_bitmap_page *)kmap_local_page(tmp_page);
+
+			/* All zeros = uninitialized */
+			if (tmp->seq == 0) {
+				kunmap_local(tmp);
+				__free_page(tmp_page);
+				continue;
+			}
+
+			/* Verify CRC */
+			expected_crc = tmp->crc32;
+			tmp->crc32 = 0;
+			if (__crc32c_le(0, (const unsigned char *)tmp, 4096) != expected_crc) {
+				DMERR("bitmap: page %u disk %u CRC mismatch",
+				      p, d);
+				tmp->crc32 = expected_crc;
+				kunmap_local(tmp);
+				__free_page(tmp_page);
+				continue;
+			}
+			tmp->crc32 = expected_crc;
+
+			/* Check sequence number */
+			if (tmp->seq > best_seq) {
+				best_seq = tmp->seq;
+				best_disk = d;
+				memcpy(dst, tmp, 4096);
+				any_valid = true;
+			}
+
+			kunmap_local(tmp);
+			__free_page(tmp_page);
+		}
+
+		if (any_valid) {
+			arr->bitmap_seqs[p] = best_seq;
+			DMDEBUG("bitmap: page %u loaded from disk %u (seq %llu)",
+				p, best_disk, (u64)best_seq);
+		} else {
+			DMDEBUG("bitmap: page %u uninitialized (no valid copy)", p);
+			memset(dst, 0, 4096);
+			arr->bitmap_seqs[p] = 0;
+		}
+
+		kunmap_local(dst);
+	}
+
+	DMINFO("bitmap: load complete");
+	return ret;
+}
+
+/* ---------------------------------------------------------------- */
+/* Recover dirty stripes — reconstruct parity for all set bits,     */
+/* then clear the bits.  Called once during array assembly.         */
+/* ---------------------------------------------------------------- */
+static int lhsr_bitmap_recover(struct lhsr_array *arr)
+{
+	unsigned int pd, data_disks, parity_disks;
+	sector_t sectors_recovered = 0;
+	unsigned int regions_recovered = 0;
+	unsigned int p;
+
+	if (arr->raid_type < LHSR_RAID5) {
+		atomic_set(&arr->bitmap_recovering, 0);
+		return 0;
+	}
+
+	parity_disks = (arr->raid_type == LHSR_RAID5) ? 1 : 2;
+	data_disks = arr->disks - parity_disks;
+	pd = data_disks;
+
+	DMINFO("bitmap: recovery starting — %u data + %u parity, %llu sectors/disk",
+	       data_disks, parity_disks, (u64)arr->disk_sectors);
+
+	for (p = 0; p < LHSR_BITMAP_PAGES; p++) {
+		struct page *parity_page = NULL, *temp_page = NULL;
+		void *parity_buf, *temp_buf;
+		size_t chunk_bytes = arr->chunk_sectors * 512;
+		int ret;
+
+		parity_page = alloc_page(GFP_KERNEL);
+		temp_page   = alloc_page(GFP_KERNEL);
+		if (!parity_page || !temp_page) {
+			DMERR("bitmap: recovery OOM");
+			if (parity_page) __free_page(parity_page);
+			if (temp_page) __free_page(temp_page);
+			goto out;
+		}
+
+		parity_buf = kmap_local_page(parity_page);
+		temp_buf   = kmap_local_page(temp_page);
+
+		/*
+		 * Process dirty regions one at a time.
+		 * For each set bit: 1) clear it, 2) reconstruct parity,
+		 * 3) write page.  Crash-safe because unprocessed bits survive.
+		 */
+		for (;;) {
+			struct lhsr_bitmap_page *bmp;
+			unsigned int b, bit;
+			sector_t region;
+			int found = 0;
+
+			/* Scan for the next dirty bit */
+			bmp = (struct lhsr_bitmap_page *)kmap_local_page(
+				arr->bitmap_pages[p]);
+
+			for (b = 0; b < LHSR_BITMAP_BITS_PER_PAGE; b++) {
+				if (bmp->bits[b / 8] & (1 << (b % 8))) {
+					bit = b;
+					found = 1;
+					break;
+				}
+			}
+
+			if (!found) {
+				kunmap_local(bmp);
+				break;
+			}
+
+			/* Clear the bit NOW (while mapped) */
+			bmp->bits[bit / 8] &= ~(1 << (bit % 8));
+			kunmap_local(bmp);
+
+			region = (sector_t)p * LHSR_BITMAP_BITS_PER_PAGE + bit;
+			DMINFO("bitmap: recovering region %llu (page %u bit %u)",
+			       (u64)region, p, bit);
+
+			/* Reconstruct parity for this region's stripes */
+			{
+				sector_t stripe, stripe_end;
+				unsigned int d;
+
+				stripe = region * LHSR_BITMAP_REGION_SECTORS
+					/ arr->chunk_sectors;
+				stripe_end = stripe + LHSR_BITMAP_REGION_SECTORS
+					/ arr->chunk_sectors;
+
+				for (; stripe < stripe_end; stripe++) {
+					sector_t s = stripe * arr->chunk_sectors;
+
+					memset(parity_buf, 0, chunk_bytes);
+
+					/* XOR all readable data disks */
+					for (d = 0; d < data_disks; d++) {
+						blk_status_t st;
+
+						if (lhsr_failed_disks_get(arr) & (1 << d))
+							continue;
+						if (!arr->disk[d])
+							continue;
+
+						st = lhsr_submit_bio_sync(arr->disk[d],
+							temp_page, chunk_bytes,
+							s + arr->disk_offset[d],
+							REQ_OP_READ | REQ_SYNC);
+						if (st != BLK_STS_OK) {
+							DMERR("bitmap: recover read disk %u sector %llu failed",
+							      d, (u64)(s + arr->disk_offset[d]));
+							continue;
+						}
+
+						/* XOR temp into parity */
+						{
+							size_t i;
+							u8 *p8 = parity_buf;
+							u8 *t8 = temp_buf;
+							for (i = 0; i < chunk_bytes; i++)
+								p8[i] ^= t8[i];
+						}
+					}
+
+					/* Write P parity with FUA */
+					if (!(lhsr_failed_disks_get(arr) & (1 << pd)) &&
+					    arr->disk[pd]) {
+						blk_status_t st;
+						st = lhsr_submit_bio_sync(arr->disk[pd],
+							parity_page, chunk_bytes,
+							s + arr->disk_offset[pd],
+							REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
+						if (st != BLK_STS_OK)
+							DMERR("bitmap: recover write P disk %u sector %llu failed",
+							      pd, (u64)(s + arr->disk_offset[pd]));
+					}
+
+					sectors_recovered += arr->chunk_sectors;
+				}
+			}
+
+			regions_recovered++;
+
+			/* Write page to persist bit-cleared state */
+			set_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[p]);
+			ret = lhsr_bitmap_write_page(arr, p);
+			if (ret)
+				DMERR("bitmap: write page %u after recovery failed", p);
+		}
+
+		kunmap_local(temp_buf);
+		kunmap_local(parity_buf);
+		__free_page(temp_page);
+		__free_page(parity_page);
+	}
+
+out:
+	atomic_set(&arr->bitmap_recovering, 0);
+
+	if (regions_recovered > 0)
+		DMINFO("bitmap: recovery COMPLETE — %u regions, %llu sectors",
+		       regions_recovered, (u64)sectors_recovered);
+	else
+		DMINFO("bitmap: no dirty regions found");
+
+	return 0;  /* Non-fatal: data is safe even if some stripes skipped */
 }
 
 /* Synchronous RMW worker — executes on ordered rmw_wq (one at a time) */
@@ -2239,6 +2805,14 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		kunmap_local(old_data);
 	}
 
+	/*
+	 * Mark intent in write-hole journal BEFORE modifying data/parity.
+	 * If we crash now, recovery sees the dirty bit and reconstructs
+	 * parity from the (unchanged) data disks — always consistent.
+	 */
+	if (lhsr_bitmap_set(arr, chunk_start))
+		DMWARN("RMW: bitmap_set failed for chunk %llu", (u64)chunk_start);
+
 	/* Phase 5: Write new data to data disk */
 	status = lhsr_submit_bio_sync(arr->disk[data_disk], new_data_page,
 				       chunk_bytes,
@@ -2276,6 +2850,10 @@ static void lhsr_rmw_worker(struct work_struct *work)
 			}
 		}
 	}
+
+	/* All writes committed — clear the dirty bit */
+	if (lhsr_bitmap_clear(arr, chunk_start))
+		DMWARN("RMW: bitmap_clear failed for chunk %llu", (u64)chunk_start);
 
 out:
 	if (old_data_page)
@@ -2316,7 +2894,6 @@ static void lhsr_mirror_endio(struct bio *bio)
 	bio_put(bio);
 }
 
-/* Map function - with error tracking */
 static int lhsr_map(struct dm_target *ti, struct bio *bio)
 {
 	struct lhsr_array *arr = ti->private;
