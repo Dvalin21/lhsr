@@ -70,7 +70,7 @@
 #include "dm_lhsr.h"
 
 #define DM_MSG_PREFIX "lhsr"
-#define LHSR_VERSION "1.3.0"
+#define LHSR_VERSION "1.4.0"
 
 /* Forward declarations */
 struct lhsr_raid_5_read_ctx;
@@ -3454,7 +3454,7 @@ passthrough_single:
 			int alloc_failed = 0;
 
 			DMINFO("RECON clone setup: orig_bio_size=%zu ctx_bio_size=%zu chunk_bytes=%zu",
-			       bio->bi_iter.bi_size, ctx->bio_size, (size_t)chunk_sects << SECTOR_SHIFT);
+			       (size_t)bio->bi_iter.bi_size, ctx->bio_size, (size_t)chunk_sects << SECTOR_SHIFT);
 
 			for (i = 0; i < ctx->num_slots; i++) {
 				struct bio *recon_bio;

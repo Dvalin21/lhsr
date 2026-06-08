@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-08 (Phase 0.4 testing complete — see CHANGELOG)
+**Last Updated:** 2026-06-08 (Phase 0 COMPLETE — RAID5 smoke test PASS)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -18,7 +18,7 @@
 
 ---
 
-## Phase 0: Honest Foundation (2026-06-03 — In Progress)
+## Phase 0: Honest Foundation (2026-06-03 — ✅ COMPLETE 2026-06-08)
 
 Stop lying to users. Fix critical bugs before adding features.
 
@@ -59,8 +59,10 @@ Stop lying to users. Fix critical bugs before adding features.
   7. Module reload: state + data persistence
 - `tests/smoke-test-raid5.sh` created for RAID5 — not yet executed
   (requires loopback devices and pre-flight approval)
-- **NOTE:** Pre-flight gate requires explicit approval before running RAID5 smoke test.
-  See `lhsr-testing-safety` skill.
+- **RAID5 smoke test (PASS):** Executed 2026-06-08 on VM (`lhsr-dev`, kernel
+   6.12.90+deb13.1-amd64). 3×64MB loopbacks, 4MB write at 1MB offset, SHA256
+   checksum verified match. Config: `uuid=6260e0e raid=2 disks=3 state=2 gen=1`.
+   See CHANGELOG for details.
 
 ### Bugs found and fixed during testing
 - **Rebuild completion didn't clear `failed_disks` bitmask** — after rebuild completed,

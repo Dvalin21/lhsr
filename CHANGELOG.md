@@ -6,6 +6,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.4.1] — 2026-06-08 — Phase 0 Complete / RAID5 Smoke Test
+
+### Added
+- **RAID5 smoke test executed (PASS):** 3×64MB loopback devices, write 4MB at 1MB
+  offset, read-back SHA256 checksum verified match, zero dmesg errors.
+  Config: `uuid=6260e0e raid=2 disks=3 state=2 gen=1`.
+- **LHSR module now prints version 1.4.0** on load (was 1.3.0).
+
+### Fixed
+- **Format specifier warning:** `bio->bi_iter.bi_size` is `unsigned int`, not
+  `size_t`. Cast to `(size_t)` in DMINFO to suppress `-Wformat` warning.
+
+### Changed
+- `PRODUCTION_READINESS.md`, `ROADMAP.md`: Phase 0 marked fully complete,
+  RAID5 smoke test result recorded.
+
+---
+
 ## [1.4.0] — 2026-06-03 — Phase 0: Honest Foundation
 
 ### Fixed (Critical Bugs)
