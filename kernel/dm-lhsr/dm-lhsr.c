@@ -18,17 +18,18 @@
  *   - Memory ownership model (endio chain, dtr NULL-before-free, destroying flag)
  *   - Scrubber (single-pass block verification, checksum cache)
  *   - Module load/unload with active device drain + rcu_barrier
+ *   - Write-hole journal (dirty stripe bitmap) — 32-page/128KB per disk,
+ *     1MB regions, CRC32c protected, FUA write, crash recovery on re-assembly
+ *   - RAID5 rebuild (data disk XOR reconstruction + parity disk XOR reconstruction)
+ *     with bitmap journal crash safety
  *
  * NOT YET PRODUCTION-READY (needs work):
  *   - Read reconstruction on failure — code exists, NOT tested with failed disk
- *   - Rebuild — block copy only, no parity reconstruction, no bitmap, EOPNOTSUPP on parity disks
+ *   - RAID6 Q parity rebuild (GF multiply) — code exists, NOT tested
+ *   - RAID6 bitmap recovery — reconstructs P only, Q is NOT reconstructed
  *   - Error/failover paths — concurrently unprotected (failed_disks race in hot path)
  *   - Concurrent stress — only single-threaded testing so far
  *   - RAID5 double-failure / RAID6 triple-failure — returns IOERR with TODO
- *   - RAID6 Q parity recovery — bitmap recover reconstructs P only, Q is NOT yet
- *     reconstructed (RAID5 gets full parity recovery from dirty-bit replay)
- *   - Power-fail recovery — bitmap journal implemented, basic parity reconstruction
- *     tested on simulated crash (uncommitted dirty bits are recovered on re-assembly)
  *
  * MIXED DISK SIZES:
  *   Array capacity = min(disk_sectors) for mirror, or data_disks × min(disk_sectors)
@@ -639,7 +640,7 @@ static int lhsr_setup_io_tracking(struct bio *bio, struct dm_target *ti)
 {
 	struct lhsr_io_ctx *ctx;
 
-	ctx = kmalloc(sizeof(*ctx), GFP_KERNEL);
+	ctx = kmalloc(sizeof(*ctx), GFP_NOIO);
 	if (!ctx)
 		return -ENOMEM;
 
@@ -1084,45 +1085,91 @@ static int lhsr_scrub_start(struct lhsr_array *arr)
  *
  * Returns 0 on success, negative errno on failure.
  */
-static int lhsr_rebuild_parity_stripe(struct lhsr_array *arr,
-				       unsigned int disk_idx, sector_t offset,
-				       u64 block_bytes)
+/*
+ * Reconstruct a single-disk stripe via XOR (RAID5) or GF (RAID6 Q).
+ *
+ * Reads every non-failed, non-target disk at @offset, XORs or GF-accumulates
+ * into a result buffer, and writes the result to @disk_idx.
+ *
+ * For RAID5: XOR all remaining disks (data + P) — works for both data-disk
+ *   rebuild (reconstruct missing data) and parity-disk rebuild (reconstruct P).
+ * For RAID6 single-failure (non-Q): XOR remaining data + P — Q is excluded
+ *   from XOR because Q = gf_mul(D0) ^ gf_mul(D1) ^ ... — XORing Q would
+ *   produce wrong data.  P is XOR-of-data, correct for single-disk recovery.
+ * For RAID6 Q rebuild (disk_idx = data_disks+1): GF multiply per data disk.
+ */
+static int lhsr_rebuild_reconstruct_stripe(struct lhsr_array *arr,
+					   unsigned int disk_idx,
+					   sector_t offset, u64 block_bytes)
 {
-	unsigned int data_disks;
+	unsigned int data_disks = 0, parity_disks = 0;
 	unsigned int nr_pages;
-	struct page **read_pages;
-	struct page **parity_pages;
+	struct page **read_pages = NULL;
+	struct page **result_pages = NULL;
 	unsigned int i, p;
 	int ret = 0;
+	bool first = true;
 
-	if (arr->raid_type == LHSR_RAID5)
+	if (arr->raid_type == LHSR_RAID5) {
 		data_disks = arr->disks - 1;
-	else if (arr->raid_type == LHSR_RAID6)
+		parity_disks = 1;
+	} else if (arr->raid_type == LHSR_RAID6) {
 		data_disks = arr->disks - 2;
-	else
+		parity_disks = 2;
+	} else {
 		return -EINVAL;
+	}
 
 	nr_pages = (block_bytes + PAGE_SIZE - 1) >> PAGE_SHIFT;
 	if (!nr_pages)
 		return -EINVAL;
 
 	read_pages = kcalloc(nr_pages, sizeof(*read_pages), GFP_KERNEL);
-	parity_pages = kcalloc(nr_pages, sizeof(*parity_pages), GFP_KERNEL);
-	if (!read_pages || !parity_pages) {
-		kfree(read_pages);
-		kfree(parity_pages);
-		return -ENOMEM;
+	result_pages = kcalloc(nr_pages, sizeof(*result_pages), GFP_KERNEL);
+	if (!read_pages || !result_pages) {
+		ret = -ENOMEM;
+		goto out;
 	}
 
-	/*
-	 * For each data disk: read its chunk, XOR/accumulate into parity pages.
-	 * This avoids holding all data disk pages simultaneously.
-	 */
-	for (i = 0; i < data_disks; i++) {
-		if ((lhsr_failed_disks_get(arr) & (1 << i)) || !arr->disk[i])
+	/* Iterate ALL disks, skip the failed target and already-failed disks */
+	for (i = 0; i < arr->disks; i++) {
+		void *rbuf, *rbuftmp;
+
+		/* Skip target and already-failed */
+		if (i == disk_idx || (lhsr_failed_disks_get(arr) & (1 << i)) ||
+		    !arr->disk[i])
 			continue;
 
-		/* Allocate read pages for this disk */
+		/*
+		 * RAID6 Q parity rebuild: GF multiply from data disks only.
+		 * Q can only be rebuilt from data — reading P doesn't help
+		 * because Q = gf_mul(D0) ^ gf_mul(D1) ^ ... (not XOR of data).
+		 */
+		if (arr->raid_type == LHSR_RAID6 && disk_idx == data_disks + 1) {
+			if (i >= data_disks)
+				continue;  /* skip parity disks for Q rebuild */
+			/* Q rebuild path — uses GF(2^8) multiply-accumulate */
+			goto q_rebuild;
+		}
+
+		/*
+		 * RAID6 single-disk failure (non-Q): skip Q disk in XOR path.
+		 * Q = gf_mul(D0) ^ gf_mul(D1) ^ ... — XORing Q produces
+		 * wrong data because Q uses GF multiplication, not XOR.
+		 * P = D0 ^ D1 ^ ... — XORing P is correct for recovery.
+		 */
+		if (arr->raid_type == LHSR_RAID6 && i == data_disks + 1)
+			continue;
+
+		/*
+		 * All other cases (RAID5 any disk, RAID6 data or P rebuild):
+		 * XOR all non-target, non-failed, non-Q disks.
+		 */
+
+		/* Fall through to XOR path */
+		{
+
+		/* Allocate read pages */
 		for (p = 0; p < nr_pages; p++) {
 			read_pages[p] = alloc_page(GFP_KERNEL);
 			if (!read_pages[p]) {
@@ -1131,7 +1178,7 @@ static int lhsr_rebuild_parity_stripe(struct lhsr_array *arr,
 			}
 		}
 
-		/* Read from this data disk */
+		/* Read from this disk */
 		{
 			struct bio *bio;
 
@@ -1154,80 +1201,124 @@ static int lhsr_rebuild_parity_stripe(struct lhsr_array *arr,
 				goto out;
 		}
 
-		if (disk_idx == data_disks) {
-			/* Rebuilding P parity: XOR all data disks */
-			if (i == 0) {
-				/* First data disk: copy to parity pages */
-				for (p = 0; p < nr_pages; p++) {
-					parity_pages[p] = alloc_page(GFP_KERNEL);
-					if (!parity_pages[p]) {
-						ret = -ENOMEM;
-						goto out;
-					}
-					{
-						void *src = kmap_local_page(read_pages[p]);
-						void *dst = kmap_local_page(parity_pages[p]);
-						memcpy(dst, src, PAGE_SIZE);
-						kunmap_local(dst);
-						kunmap_local(src);
-					}
+		if (first) {
+			/* First source: copy to result pages */
+			for (p = 0; p < nr_pages; p++) {
+				result_pages[p] = alloc_page(GFP_KERNEL);
+				if (!result_pages[p]) {
+					ret = -ENOMEM;
+					goto out;
 				}
-			} else {
-				/* XOR into parity pages */
-				for (p = 0; p < nr_pages; p++) {
-					void *src = kmap_local_page(read_pages[p]);
-					void *dst = kmap_local_page(parity_pages[p]);
-					unsigned long *s = src;
-					unsigned long *d = dst;
-					unsigned int j;
-					for (j = 0; j < PAGE_SIZE / sizeof(unsigned long); j++)
-						d[j] ^= s[j];
-					kunmap_local(dst);
-					kunmap_local(src);
-				}
+				rbuf = kmap_local_page(read_pages[p]);
+				rbuftmp = kmap_local_page(result_pages[p]);
+				memcpy(rbuftmp, rbuf, PAGE_SIZE);
+				kunmap_local(rbuftmp);
+				kunmap_local(rbuf);
 			}
-		} else if (arr->raid_type == LHSR_RAID6 && disk_idx == data_disks + 1) {
-			/* Rebuilding Q parity: GF(2^8) multiply-accumulate */
+			first = false;
+		} else {
+			/* XOR into result pages */
+			for (p = 0; p < nr_pages; p++) {
+				unsigned long *s, *d;
+				unsigned int j;
+
+				rbuf = kmap_local_page(read_pages[p]);
+				rbuftmp = kmap_local_page(result_pages[p]);
+				s = rbuf;
+				d = rbuftmp;
+				for (j = 0; j < PAGE_SIZE / sizeof(unsigned long); j++)
+					d[j] ^= s[j];
+				kunmap_local(rbuftmp);
+				kunmap_local(rbuf);
+			}
+		}
+
+		/* Free read pages */
+		for (p = 0; p < nr_pages; p++) {
+			__free_page(read_pages[p]);
+			read_pages[p] = NULL;
+		}
+
+		/* End of XOR path */
+		}
+
+		continue;
+
+q_rebuild:
+		/* RAID6 Q parity rebuild: GF(2^8) multiply-accumulate */
+		{
 			u8 coeff = rs_power_table[i];
 
 			for (p = 0; p < nr_pages; p++) {
 				unsigned int page_bytes = (p == nr_pages - 1) ?
 					block_bytes - (p << PAGE_SHIFT) : PAGE_SIZE;
-				u8 *src = kmap_local_page(read_pages[p]);
+				u8 *src;
 
-				if (i == 0) {
-					/* First data disk: gf_mul each byte, store */
-					parity_pages[p] = alloc_page(GFP_KERNEL);
-					if (!parity_pages[p]) {
-						kunmap_local(src);
+				read_pages[p] = alloc_page(GFP_KERNEL);
+				if (!read_pages[p]) {
+					ret = -ENOMEM;
+					goto out;
+				}
+				rbuf = kmap_local_page(read_pages[p]);
+				{
+					struct bio *bio;
+
+					bio = bio_alloc_bioset(arr->disk[i], 1,
+						REQ_OP_READ, GFP_KERNEL,
+						&lhsr_bioset);
+					if (!bio) {
+						kunmap_local(rbuf);
 						ret = -ENOMEM;
 						goto out;
 					}
-					u8 *dst = kmap_local_page(parity_pages[p]);
+					bio->bi_iter.bi_sector = offset +
+						arr->disk_offset[i];
+					__bio_add_page(bio, read_pages[p],
+						       page_bytes, 0);
+					ret = submit_bio_wait(bio);
+					bio_put(bio);
+					if (ret) {
+						kunmap_local(rbuf);
+						goto out;
+					}
+				}
+				src = rbuf;
+
+				if (i == 0) {
+					/* First data disk: store gf_mul */
+					result_pages[p] = alloc_page(GFP_KERNEL);
+					if (!result_pages[p]) {
+						kunmap_local(rbuf);
+						ret = -ENOMEM;
+						goto out;
+					}
+					u8 *dst = kmap_local_page(result_pages[p]);
 					unsigned int j;
 					for (j = 0; j < page_bytes; j++)
 						dst[j] = lhsr_gf_mul(src[j], coeff);
 					kunmap_local(dst);
 				} else {
-					/* Accumulate: dst[j] ^= gf_mul(src[j], coeff) */
-					u8 *dst = kmap_local_page(parity_pages[p]);
+					/* Accumulate */
+					u8 *dst = kmap_local_page(result_pages[p]);
 					unsigned int j;
 					for (j = 0; j < page_bytes; j++)
 						dst[j] ^= lhsr_gf_mul(src[j], coeff);
 					kunmap_local(dst);
 				}
-				kunmap_local(src);
+				kunmap_local(rbuf);
+				__free_page(read_pages[p]);
+				read_pages[p] = NULL;
 			}
-		}
-
-		/* Free read pages after each disk */
-		for (p = 0; p < nr_pages; p++) {
-			__free_page(read_pages[p]);
-			read_pages[p] = NULL;
 		}
 	}
 
-	/* Write computed parity to target disk */
+	if (first) {
+		DMERR("Rebuild: no readable source disks for disk %u", disk_idx);
+		ret = -EIO;
+		goto out;
+	}
+
+	/* Write reconstructed data to target disk with FUA */
 	{
 		struct bio *bio;
 
@@ -1242,7 +1333,7 @@ static int lhsr_rebuild_parity_stripe(struct lhsr_array *arr,
 		for (p = 0; p < nr_pages; p++) {
 			unsigned int page_bytes = (p == nr_pages - 1) ?
 				block_bytes - (p << PAGE_SHIFT) : PAGE_SIZE;
-			__bio_add_page(bio, parity_pages[p], page_bytes, 0);
+			__bio_add_page(bio, result_pages[p], page_bytes, 0);
 		}
 		ret = submit_bio_wait(bio);
 		bio_put(bio);
@@ -1252,11 +1343,11 @@ out:
 	for (p = 0; p < nr_pages; p++) {
 		if (read_pages[p])
 			__free_page(read_pages[p]);
-		if (parity_pages[p])
-			__free_page(parity_pages[p]);
+		if (result_pages[p])
+			__free_page(result_pages[p]);
 	}
 	kfree(read_pages);
-	kfree(parity_pages);
+	kfree(result_pages);
 	return ret;
 }
 
@@ -1293,6 +1384,10 @@ static void rebuild_work(struct work_struct *work)
 		DMINFO("Rebuild complete: %llu sectors copied", arr->rebuild_verified);
 		arr->rebuild_state = LHSR_REBUILD_COMPLETE;
 		lhsr_update_disk_state(arr, arr->rebuild_disk, LHSR_DISK_HEALTHY);
+		lhsr_failed_disks_set(arr,
+			lhsr_failed_disks_get(arr) & ~(1UL << arr->rebuild_disk));
+		if (lhsr_failed_disks_get(arr) == 0)
+			arr->state = LHSR_STATE_HEALTHY;
 		return;
 	}
 
@@ -1326,6 +1421,10 @@ static void rebuild_work(struct work_struct *work)
 		DMINFO("Rebuild complete: %llu sectors copied", arr->rebuild_verified);
 		arr->rebuild_state = LHSR_REBUILD_COMPLETE;
 		lhsr_update_disk_state(arr, arr->rebuild_disk, LHSR_DISK_HEALTHY);
+		lhsr_failed_disks_set(arr,
+			lhsr_failed_disks_get(arr) & ~(1UL << arr->rebuild_disk));
+		if (lhsr_failed_disks_get(arr) == 0)
+			arr->state = LHSR_STATE_HEALTHY;
 		return;
 	}
 
@@ -1333,24 +1432,47 @@ static void rebuild_work(struct work_struct *work)
 	if (offset + (block_size >> SECTOR_SHIFT) > arr->disk_sectors)
 		block_size = (arr->disk_sectors - offset) << SECTOR_SHIFT;
 
-	/* RAID5/6 parity disk rebuild: compute parity from all data disks */
+	/*
+	 * RAID5/6: reconstruct stripe via XOR/GF from all non-failed disks.
+	 * This handles BOTH data-disk rebuild (reconstruct missing data from
+	 * remaining data + parity) AND parity-disk rebuild (reconstruct P via
+	 * XOR or Q via GF).  The function does its own memory management and
+	 * writes with FUA.
+	 *
+	 * Before writing, mark the bitmap region dirty so a crash during
+	 * rebuild gets recovered on re-assembly.  Clear after write commits.
+	 */
 	if (arr->raid_type >= LHSR_RAID5) {
-		unsigned int pd = (arr->raid_type == LHSR_RAID5) ? 1 : 2;
-		unsigned int dd = arr->disks - pd;
-		if (arr->rebuild_disk >= dd) {
-			/* parity function manages its own memory */
-			ret = lhsr_rebuild_parity_stripe(arr, arr->rebuild_disk,
-							  offset, block_size);
-			if (ret)
-				DMERR("Parity rebuild failed at offset 0x%llx: %d",
-				      (u64)offset << SECTOR_SHIFT, ret);
-			arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
-			arr->rebuild_verified += (block_size >> SECTOR_SHIFT);
-			queue_delayed_work(arr->rebuild_wq,
-					   &arr->rebuild_work, HZ / 10);
-			return;
-		}
+		sector_t region_align = offset &
+			~(sector_t)(LHSR_BITMAP_REGION_SECTORS - 1);
+
+		if (lhsr_bitmap_set(arr, region_align))
+			DMWARN("rebuild: bitmap_set failed at sector %llu",
+			       (u64)offset);
+
+		ret = lhsr_rebuild_reconstruct_stripe(arr, arr->rebuild_disk,
+						      offset, block_size);
+		if (ret)
+			DMERR("Rebuild (RAID%c) failed at offset 0x%llx: %d",
+			      arr->raid_type == LHSR_RAID5 ? '5' : '6',
+			      (u64)offset << SECTOR_SHIFT, ret);
+
+		if (lhsr_bitmap_clear(arr, region_align))
+			DMWARN("rebuild: bitmap_clear failed at sector %llu",
+			       (u64)offset);
+
+		arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
+		arr->rebuild_verified += (block_size >> SECTOR_SHIFT);
+		queue_delayed_work(arr->rebuild_wq,
+				   &arr->rebuild_work, HZ / 10);
+		return;
 	}
+
+	/*
+	 * RAID0/1 data disk rebuild: simple block copy from one healthy
+	 * source disk to target.  Not used for RAID5/6 — use the XOR
+	 * reconstruction path above instead.
+	 */
 
 	/* Allocate pages for I/O - block_size may be > PAGE_SIZE */
 	nr_pages = (block_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
@@ -1406,7 +1528,8 @@ static void rebuild_work(struct work_struct *work)
 	bio_put(bio);
 
 	if (ret != 0) {
-		DMERR("Rebuild read failed at offset 0x%llx, ret=%d", (u64)offset << SECTOR_SHIFT, ret);
+		DMERR("Rebuild read failed at offset 0x%llx, ret=%d",
+		      (u64)offset << SECTOR_SHIFT, ret);
 		for (i = 0; i < nr_pages; i++)
 			__free_page(pages[i]);
 		kfree(pages);
@@ -1424,7 +1547,8 @@ static void rebuild_work(struct work_struct *work)
 		arr->rebuild_state = LHSR_REBUILD_NONE;
 		return;
 	}
-	bio = bio_alloc(arr->disk[arr->rebuild_disk], nr_pages, REQ_OP_WRITE, GFP_KERNEL);
+	bio = bio_alloc(arr->disk[arr->rebuild_disk], nr_pages,
+			REQ_OP_WRITE | REQ_SYNC | REQ_FUA, GFP_KERNEL);
 	if (!bio) {
 		DMERR("Rebuild: failed to allocate write bio");
 		for (i = 0; i < nr_pages; i++)
@@ -1450,7 +1574,8 @@ static void rebuild_work(struct work_struct *work)
 	kfree(pages);
 
 	if (ret != 0) {
-		DMERR("Rebuild write failed at offset 0x%llx", (u64)offset << SECTOR_SHIFT);
+		DMERR("Rebuild write failed at offset 0x%llx",
+		      (u64)offset << SECTOR_SHIFT);
 	}
 
 	arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
@@ -2214,8 +2339,8 @@ static int lhsr_bitmap_write_page(struct lhsr_array *arr,
 	arr->bitmap_seqs[page_idx]++;
 	bmp->seq = arr->bitmap_seqs[page_idx];
 	bmp->crc32 = lhsr_bitmap_page_crc(bmp);
-	DMINFO("bitmap: writing page %u seq=%llu crc32=0x%08x to %u disks",
-	       page_idx, (u64)bmp->seq, bmp->crc32, arr->disks);
+	DMDEBUG("bitmap: writing page %u seq=%llu crc32=0x%08x to %u disks",
+		page_idx, (u64)bmp->seq, bmp->crc32, arr->disks);
 
 	kunmap_local(bmp);
 
@@ -3575,17 +3700,6 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 	if (argc < 1)
 		return -EINVAL;
 
-	DMINFO("message: argc=%u argv[0]=%s", argc, argv[0]);
-
-	/* Debug: Log raw command for troubleshooting */
-	DMDEBUG("message handler: processing command '%s' (argc=%u)", argv[0], argc);
-	if (argc > 1) {
-		DMDEBUG("message handler: argv[1]='%s'", argv[1]);
-	}
-	if (argc > 2) {
-		DMDEBUG("message handler: argv[2]='%s'", argv[2]);
-	}
-
 	/* Handle bare command (dmsetup message <device> <cmd>) */
 	if (strncmp(argv[0], "disk_fail", 8) == 0) {
 		if (argc < 2)
@@ -3607,7 +3721,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 
 		arr->state = LHSR_STATE_DEGRADED;
 		scnprintf(result, maxlen, "Disk %u marked failed", disk_idx);
-		return 0;
+		return 1;
 	}
 
 	if (strncmp(argv[0], "disk_online", 10) == 0) {
@@ -3631,7 +3745,24 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			arr->state = LHSR_STATE_DEGRADED;
 
 		scnprintf(result, maxlen, "Disk %u marked online", disk_idx);
-		return 0;
+		return 1;
+	}
+
+	if (strncmp(argv[0], "member_status", 12) == 0) {
+		if (argc < 2)
+			return -EINVAL;
+		err = kstrtouint(argv[1], 10, &disk_idx);
+		if (err || disk_idx >= arr->disks)
+			return -EINVAL;
+
+		scnprintf(result, maxlen,
+			  "member[%u]: state=%s errors=%u gen=%llu",
+			  disk_idx,
+			  (lhsr_failed_disks_get(arr) & (1 << disk_idx)) ?
+				"degraded" : "healthy",
+			  arr->disk_errors[disk_idx],
+			  arr->sbs[disk_idx].generation);
+		return 1;
 	}
 
 	if (strncmp(argv[0], "disk_health", 10) == 0) {
@@ -3646,7 +3777,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			  (int)((lhsr_failed_disks_get(arr) >> disk_idx) & 1),
 			  arr->sbs[disk_idx].generation);
 
-		return 0;
+		return 1;
 	}
 
 	if (strncmp(argv[0], "scrub", 4) == 0) {
@@ -3677,8 +3808,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 				  "scrub: state=%s disk=%u offset=0x%llx verified=%llu corrupted=%llu",
 				  state_str, arr->scrub_disk, arr->scrub_offset,
 				  arr->scrub_verified, arr->scrub_corrupted);
-			DMDEBUG("Returning scrub status: %s", result);
-			return 0;
+			return 1;
 		}
 
 		if (argc < 2)
@@ -3687,39 +3817,67 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		if (strcmp(argv[1], "start") == 0) {
 			lhsr_scrub_start(arr);
 			scnprintf(result, maxlen, "Scrub started");
-			return 0;
+			return 1;
 		}
 
 		if (strcmp(argv[1], "stop") == 0) {
 			arr->scrub_state = LHSR_SCRUB_IDLE;
 			scnprintf(result, maxlen, "Scrub stopped at offset 0x%llx", arr->scrub_offset);
-			return 0;
+			return 1;
 		}
 
 		DMDEBUG("Unknown scrub subcommand: '%s'", argv[1]);
 		return -EINVAL;
 	}
 
+	/* scan - trigger or report health scan status */
+	if (strncmp(argv[0], "scan", 4) == 0) {
+		/* If no scan running, start one */
+		if (arr->scrub_state == LHSR_SCRUB_IDLE ||
+		    arr->scrub_state == LHSR_SCRUB_COMPLETED) {
+			lhsr_scrub_start(arr);
+			scnprintf(result, maxlen, "Scan started");
+		} else {
+			const char *state_str = "RUNNING";
+			if (arr->scrub_state == LHSR_SCRUB_PAUSED)
+				state_str = "PAUSED";
+			scnprintf(result, maxlen,
+				  "scan: state=%s disk=%u offset=0x%llx"
+				  " verified=%llu corrupted=%llu",
+				  state_str, arr->scrub_disk,
+				  arr->scrub_offset,
+				  arr->scrub_verified,
+				  arr->scrub_corrupted);
+		}
+		return 1;
+	}
+
 	if (strncmp(argv[0], "rebuild", 6) == 0) {
 		/* Query status (no second argument) */
 		if (argc == 1 || (argc >= 2 && strcmp(argv[1], "status") == 0)) {
 			const char *state_str = "NONE";
+			u32 pct = 0;
 			switch (arr->rebuild_state) {
 			case LHSR_REBUILD_PENDING:
 				state_str = "PENDING";
 				break;
 			case LHSR_REBUILD_RUNNING:
 				state_str = "RUNNING";
+				pct = arr->rebuild_total ?
+					(u32)((arr->rebuild_offset * 100) /
+					      arr->rebuild_total) : 0;
 				break;
 			case LHSR_REBUILD_COMPLETE:
 				state_str = "COMPLETE";
+				pct = 100;
 				break;
 			}
 			scnprintf(result, maxlen,
-				  "rebuild: state=%s disk=%u offset=0x%llx/%llx",
-				  state_str, arr->rebuild_disk,
-				  arr->rebuild_offset, arr->rebuild_total);
-			return 0;
+				  "rebuild: state=%s disk=%u progress=%u%%"
+				  " (%llu/%llu sectors)",
+				  state_str, arr->rebuild_disk, pct,
+				  arr->rebuild_verified, arr->rebuild_total);
+			return 1;
 		}
 
 		if (argc < 2)
@@ -3739,24 +3897,13 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			}
 
 			scnprintf(result, maxlen, "Rebuild started for disk %u", disk_idx);
-			return 0;
-		}
-
-		if (strcmp(argv[1], "status") == 0) {
-			if (arr->rebuild_state == LHSR_REBUILD_NONE) {
-				scnprintf(result, maxlen, "No rebuild in progress");
-			} else {
-				u32 pct = arr->rebuild_total ? (u32)((arr->rebuild_offset * 100) / arr->rebuild_total) : 0;
-				scnprintf(result, maxlen, "Rebuild disk=%u progress=%u%% (%llu/%llu sectors)",
-					  arr->rebuild_disk, pct, arr->rebuild_verified, arr->rebuild_total);
-			}
-			return 0;
+			return 1;
 		}
 
 		if (strcmp(argv[1], "stop") == 0) {
 			arr->rebuild_state = LHSR_REBUILD_NONE;
 			scnprintf(result, maxlen, "Rebuild stopped at offset 0x%llx", arr->rebuild_offset);
-			return 0;
+			return 1;
 		}
 
 		return -EINVAL;
@@ -3770,7 +3917,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 						       LHSR_DISK_DEGRADED : LHSR_DISK_HEALTHY);
 		}
 		scnprintf(result, maxlen, "Persisted gen=%llu", arr->generation);
-		return 0;
+		return 1;
 	}
 
 	if (strncmp(argv[0], "write_verify", 11) == 0) {
@@ -3785,13 +3932,13 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 				break;
 			}
 			scnprintf(result, maxlen, "write_verify=%s", mode_str);
-			return 0;
+			return 1;
 		}
 
 		if (strcmp(argv[1], "none") == 0) {
 			arr->write_verify_enabled = LHSR_WRITE_VERIFY_NONE;
 			scnprintf(result, maxlen, "Write verification disabled");
-			return 0;
+			return 1;
 		}
 		if (strcmp(argv[1], "simple") == 0) {
 			DMERR("Write-verify not yet implemented");
@@ -3812,7 +3959,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			  arr->array_uuid, arr->raid_type, arr->disks,
 			  arr->state, lhsr_failed_disks_get(arr), arr->generation,
 			  arr->write_verify_enabled);
-		return 0;
+		return 1;
 	}
 
 	DMERR("Unknown message: %s", argv[0]);

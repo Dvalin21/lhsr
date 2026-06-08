@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-03 (Phase 0 execution — see CHANGELOG)
+**Last Updated:** 2026-06-08 (Phase 0.4 testing complete — see CHANGELOG)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -48,23 +48,37 @@ Stop lying to users. Fix critical bugs before adding features.
 - CHANGELOG.md replaced vaporware list with real phase references.
 - KERNEL_NOTES.md added with critical bug warnings.
 
-### 0.4 Test what exists — ⏳ SCRIPT CREATED, NOT YET RUN
-- `tests/smoke-test-raid5.sh` created:
-  1. Creates N loopback devices (configurable, default 3 × 64MB)
-  2. Loads dm-lhsr.ko
-  3. Creates RAID5 DM target
-  4. Writes known data pattern
-  5. Reads back and verifies checksum
-  6. Queries array status via `dmsetup message`
-  7. Clean teardown (module unload, loopback detach, temp file cleanup)
-- **NOTE:** Pre-flight gate requires explicit approval before running.
+### 0.4 Test what exists — ✅ COMPLETE (manual testing)
+- Manual testing on VM (6.12.90+deb13.1-amd64) with RAM disk mirror:
+  1. Device creation (RAID1 mirror, 2×64MB)
+  2. Write/read/verify data integrity
+  3. Message interface: `config`, `member_status`, `scan`
+  4. Disk failure + degraded read via mirror
+  5. Rebuild: start, progress tracking, completion
+  6. Scrub: start, stop, progress
+  7. Module reload: state + data persistence
+- `tests/smoke-test-raid5.sh` created for RAID5 — not yet executed
+  (requires loopback devices and pre-flight approval)
+- **NOTE:** Pre-flight gate requires explicit approval before running RAID5 smoke test.
   See `lhsr-testing-safety` skill.
+
+### Bugs found and fixed during testing
+- **Rebuild completion didn't clear `failed_disks` bitmask** — after rebuild completed,
+  the superblock disk_state was set to HEALTHY but the in-memory `failed_disks` atomic
+  still had the bit set. I/O path used the bitmask, so all reads still went through
+  reconstruction. Fixed in both rebuild completion paths.
+- **`arr->state` not updated after rebuild** — cosmetic: config showed `state=3` (DEGRADED)
+  even when `failed=0x0`. Fixed by setting `arr->state = HEALTHY` when no disks failed.
 
 ### Deliverables
 - ✅ Unified superblock struct in `include/lhsr.h`
 - ✅ `atomic_long_t failed_disks` with accessor functions
 - ✅ Accurate README, PRODUCTION_READINESS.md, ROADMAP.md, CHANGELOG.md
-- ⏳ Smoke test script (not yet executed — requires approval)
+- ✅ Message interface: config, member_status, scan, disk_fail, rebuild, scrub, persist
+- ✅ Data I/O path validated: write → read → checksum match
+- ✅ Rebuild: start/progress/completion with failed_disks cleanup
+- ✅ Module reload persistence verified
+- ⏳ RAID5 smoke test script (requires approval to execute)
 
 ---
 

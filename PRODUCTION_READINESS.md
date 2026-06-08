@@ -1,7 +1,7 @@
 # LHSR Production Readiness Registry
 
-**Last Updated:** 2026-06-03 (Phase 0 fixes applied)
-**Version:** 1.4.0
+**Last Updated:** 2026-06-08 (Phase 0 testing + rebuild bug fixes)
+**Version:** 1.4.1
 **Status:** Honest assessment of every claimed feature vs. reality.
 
 ---
@@ -329,9 +329,45 @@ firmware crash detection.
 | Two diverging superblock structs | `include/lhsr.h` vs `kernel/dm-lhsr/dm_lhsr.h` | CRITICAL | Unified in include/lhsr.h — single source of truth | ✅ **FIXED Phase 0** |
 | `failed_disks` bitmask race | `dm-lhsr.c` | HIGH | Converted to `atomic_long_t` with accessor functions | ✅ **FIXED Phase 0** |
 | 32-disk hard limit | `dm-lhsr.c` - bitmask | MEDIUM | `atomic_long_t` supports 64 disks on 64-bit arches | ✅ **FIXED Phase 0** |
+| Rebuild completion doesn't clear `failed_disks` | `dm-lhsr.c` - rebuild_work() | HIGH | Clear bit + update arr->state on rebuild complete | ✅ **FIXED 2026-06-08** |
 | Ephemeral checksum cache | `dm-lhsr.c` - xarray | HIGH | Persist or stack on dm-integrity | ⏳ Phase 5 |
 | daemon uses fork+exec for dmsetup | `userspace/daemon/lhsrd.c` | MEDIUM | Use DM ioctl() library or libdevmapper | ⏳ Phase 3 |
 | No dm-integrity stacking | Architecture | MEDIUM | Anti-bit-rot requires persistent checksums | ⏳ Phase 5 |
+
+---
+
+---
+## Testing Status (Phase 0.4) — 2026-06-08
+
+Tested on VM (6.12.90+deb13.1-amd64) with RAM disk mirror (RAID1, 2×64MB).
+
+| Scenario | Result | Notes |
+|----------|--------|-------|
+| Device creation (mirror) | ✅ PASS | `dmsetup create` with correct table line |
+| Write 1MB data + read back | ✅ PASS | Checksum match, `conv=fsync` |
+| `dmsetup message config` | ✅ PASS | Returns uuid, raid, disks, state, failed, gen, verify |
+| `dmsetup message member_status N` | ✅ PASS | Reports per-disk state, errors, generation |
+| `dmsetup message scan` (trigger) | ✅ PASS | Starts scrub if idle |
+| `dmsetup message scan` (progress) | ✅ PASS | Returns state=RUNNING with progress |
+| `dmsetup message disk_fail N` | ✅ PASS | Marks disk failed, triggers failover |
+| Degraded read (1 disk failed) | ✅ PASS | Data read via mirror, checksum match |
+| Rebuild start + progress tracking | ✅ PASS | Progress updates every ~5s |
+| Rebuild completion | ✅ PASS | 130800 sectors copied |
+| `failed_disks` cleared after rebuild | ✅ PASS | Bug fix: bitmask now correctly cleared |
+| `arr->state` = HEALTHY after rebuild | ✅ PASS | Bug fix: cosmetic state field corrected |
+| Module reload persistence | ✅ PASS | Data + superblock state survives unload/reload |
+| Scrub start/stop/progress | ✅ PASS | Verified blocks increment, no corruption |
+
+**Bugs found and fixed during testing:**
+1. Rebuild completion left `failed_disks` bit set → cleared in both rebuild completion paths
+2. `arr->state` not updated after rebuild → set to HEALTHY when no disks failed
+3. Module deployment path wrong (documented in ROADMAP build notes)
+
+**Not tested:**
+- RAID5/6 (requires 3+ loopback devices)
+- Persistent checksums across module reload (Phase 1)
+- Incremental rebuild with write-intent bitmap (Phase 2)
+- Degraded array assembly with no superblock (Phase 5)
 
 ---
 
