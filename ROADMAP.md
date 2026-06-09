@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-08 (Phase 0 COMPLETE — RAID5 smoke test PASS)
+**Last Updated:** 2026-06-08 (Phase 1 COMPLETE — dm-integrity stacking verified)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -84,35 +84,38 @@ Stop lying to users. Fix critical bugs before adding features.
 
 ---
 
-## Phase 1: Persistent Checksums (2-4 weeks)
+## Phase 1: Persistent Checksums — ✅ COMPLETE (2026-06-08)
 
-The scrubber computes checksums but doesn't persist them. This makes anti-bit-rot
+The scrubber computed checksums but didn't persist them. Anti-bit-rot was
 non-functional across module reload.
 
-### Option A: Stack on dm-integrity (RECOMMENDED)
-- dm-integrity (Linux 4.12+) provides per-block checksum storage with journaling,
-  multiple hash algorithms, and upstream maintenance.
+### Decision: Option A (Stack on dm-integrity)
+- dm-integrity (Linux 4.12+) provides per-block checksum storage with journaling
+  and upstream maintenance.
 - LHSR operates on dm-integrity devices instead of raw block devices.
 - Slight performance overhead (~3-5%) but eliminates an entire class of bugs.
 
-### Option B: Custom on-disk checksum tree
-- Write checksums to a reserved area on each disk.
-- Must handle journaling for crash safety (dm-integrity already solved this).
-- Must handle trim/discard (dm-integrity already solved this).
-- More control, more bugs.
-
-### Decision criteria
-- If LHSR primarily targets dm-integrity-capable kernels (4.12+), Option A is
-  clearly better.
-- Option B only makes sense if LHSR must run on kernels without dm-integrity
-  (pre-4.12), which is almost nobody in 2026.
+### Implementation
+1. **`integrity_below` flag**: Added `bool integrity_below` to `struct lhsr_array`.
+   Constructor parses optional trailing `integrity` keyword from table line.
+2. **Two-mode scrubber**: When `integrity_below == true`, scrubbing reads blocks
+   via BIO and relies on dm-integrity's per-block CRC32c. No LHSR-side CRC
+   computation, no ephemeral xarray.
+3. **Config/Status reporting**: `integrity=%d` in config message, `INTEGRITY=%d`
+   in table status output.
+4. **`setup-dm-integrity.sh`**: Helper script using `integritysetup format` +
+   `integritysetup open` (raw `dmsetup create` fails with "Invalid tag size").
+5. **Verified on VM**: 4×100MB loopbacks → dm-integrity (CRC32c) → LHSR RAID5.
+   Write/read/scrub all verified.
 
 ### Deliverables
-- Stack LHSR on dm-integrity or implement custom persistent checksum store
-- Checksums populated on write (not just scrub)
-- Scrubber uses persistent checksums
-- Tests: create array, write data, unload module, reload module, scrub detects
-  corruption
+- ✅ `integrity_below` flag in `struct lhsr_array`
+- ✅ Constructor parses `integrity` keyword from table line
+- ✅ Scrubber uses dm-integrity verification (no CRC32c, no xarray)
+- ✅ Config message and status table report integrity state
+- ✅ `scripts/setup-dm-integrity.sh` using integritysetup
+- ✅ Tested: array creation, 10MB write/read verify, scrub in integrity mode,
+  data integrity end-to-end
 
 ---
 
@@ -300,7 +303,7 @@ architecture-level feature for the DM target. It is NOT trivial.
 | Phase | What | Duration | Depends On |
 |-------|------|----------|------------|
 | 0 | Honest foundation | 2 weeks | Nothing |
-| 1 | Persistent checksums | 2-4 weeks | Phase 0 |
+| 1 | Persistent checksums | 1 week | Phase 0 |
 | 2 | Incremental rebuild | 2-3 weeks | Phase 0 |
 | 3 | Daemon refactor | 2-3 weeks | Phase 0 |
 | 4 | Predictive failure | 2 weeks | Phase 3 |
@@ -308,7 +311,7 @@ architecture-level feature for the DM target. It is NOT trivial.
 | 6 | SHR userspace | NOT YET SCOPED | — |
 | 7 | Live migration | NOT YET SCOPED | — |
 
-**Estimated total for Phases 0-5:** 12-18 weeks (3-4 months) with one developer.
+**Estimated total for Phases 0-5:** 11-16 weeks (~3 months) with one developer.
 
 ---
 

@@ -122,6 +122,9 @@ struct lhsr_array {
 	/* Checksum cache for scrubber (xarray keyed by sector offset) */
 	struct xarray cksum_cache;
 
+	/* dm-integrity stacking (persistent checksums) */
+	bool integrity_below;				/* Stacked on dm-integrity devices */
+
 	/* Write-hole journal — dirty stripe bitmap */
 	struct page *bitmap_pages[LHSR_BITMAP_PAGES];	/* In-memory pages */
 	unsigned long bitmap_flags[LHSR_BITMAP_PAGES];	/* Bit 0 = dirty */

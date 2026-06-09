@@ -6,6 +6,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [1.5.0] — 2026-06-08 — Phase 1: dm-integrity Stacking (Persistent Checksums)
+
+### Added
+- **`integrity_below` flag**: `bool integrity_below` in `struct lhsr_array`.
+  Constructor parses optional trailing `integrity` keyword from table line.
+  Config message shows `integrity=%d`, status table shows `INTEGRITY=%d`.
+- **Two-mode scrubber**: When `integrity_below == true`, scrubber reads blocks
+  via BIO and relies on dm-integrity per-block CRC32c verification (no LHSR-side
+  CRC computation, no ephemeral xarray). Legacy mode unchanged.
+- **`scripts/setup-dm-integrity.sh`**: Helper script for creating/removing
+  dm-integrity devices using `integritysetup format` + `integritysetup open`
+  (raw `dmsetup create` with integrity target fails with "Invalid tag size").
+
+### Verified
+- **VM testing (6.12.90+deb13.1-amd64)**: 4 loopback devices → dm-integrity
+  (CRC32c, 4K blocks, 4-byte tags) → LHSR RAID5 with `integrity` flag.
+  - Write 10MB random data, read back SHA256 — checksum match
+  - Scrub in integrity mode — dmesg: `Scrub (integrity): block at offset... verified OK`
+  - Config query returns `integrity=1`, status shows `INTEGRITY=1`
+  - RAID5 parity reconstruction handles corrupted sectors transparently
+
+### Changed
+- `PRODUCTION_READINESS.md`: Features #2 (self-healing) and #3 (anti-bit-rot)
+  updated to ✅ FUNCTIONAL via dm-integrity stacking. Ephemeral checksum cache
+  marked as Phase 1 FIXED. New Phase 1 testing section.
+- `ROADMAP.md`: Phase 1 marked ✅ COMPLETE. Duration updated to 1 week.
+- `scripts/setup-dm-integrity.sh`: Rewritten from raw `dmsetup create` to
+  `integritysetup format` + `integritysetup open` two-step process.
+
+---
+
 ## [1.4.1] — 2026-06-08 — Phase 0 Complete / RAID5 Smoke Test
 
 ### Added

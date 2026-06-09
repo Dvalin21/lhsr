@@ -856,7 +856,17 @@ static void __used disk_check_work(struct work_struct *work)
 	}
 }
 
-/* Scrub a block - reads and verifies checksums
+/* Scrub a block - reads and verifies data integrity
+ *
+ * Two modes:
+ *   1. dm-integrity stacking (arr->integrity_below == true):
+ *      dm-integrity verifies per-block checksums on every read.  If the read
+ *      succeeds the block is intact; if it fails with -EIO the block is
+ *      corrupt.  No CRC computation, no ephemeral xarray cache needed.
+ *
+ *   2. Native checksum cache (arr->integrity_below == false):
+ *      Read block, compute CRC32c, compare against previously stored value
+ *      in the xarray cache.  Cache is ephemeral (lost on module reload).
  *
  * Uses proper page cache pages for BIO I/O instead of vmalloc'd memory.
  * vmalloc_to_page() is unreliable for I/O because kvmalloc may return
@@ -880,6 +890,66 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 
 	if (!arr->disk[disk_idx])
 		return -EINVAL;
+
+	/*
+	 * When stacked on dm-integrity, no checksum cache operations are
+	 * needed — integrity verification happens at the block layer below.
+	 * Just read the block; success means verified, failure means corrupt.
+	 */
+	if (arr->integrity_below) {
+		nr_pages = (LHSR_SCRUB_BLOCK_SIZE + PAGE_SIZE - 1) >> PAGE_SHIFT;
+
+		pages = kcalloc(nr_pages, sizeof(*pages), GFP_KERNEL);
+		if (!pages)
+			return -ENOMEM;
+
+		for (i = 0; i < nr_pages; i++) {
+			pages[i] = alloc_page(GFP_KERNEL);
+			if (!pages[i]) {
+				while (i--)
+					__free_page(pages[i]);
+				kfree(pages);
+				return -ENOMEM;
+			}
+		}
+
+		bio = bio_alloc_bioset(arr->disk[disk_idx], nr_pages,
+				       REQ_OP_READ, GFP_KERNEL, &lhsr_bioset);
+		if (!bio) {
+			for (i = 0; i < nr_pages; i++)
+				__free_page(pages[i]);
+			kfree(pages);
+			return -ENOMEM;
+		}
+		bio->bi_iter.bi_sector = offset + arr->disk_offset[disk_idx];
+		for (i = 0; i < nr_pages; i++) {
+			unsigned int page_off = i << PAGE_SHIFT;
+			unsigned int page_bytes = min_t(unsigned int,
+				LHSR_SCRUB_BLOCK_SIZE - page_off, PAGE_SIZE);
+			__bio_add_page(bio, pages[i], page_bytes, 0);
+		}
+
+		ret = submit_bio_wait(bio);
+		bio_put(bio);
+
+		for (i = 0; i < nr_pages; i++)
+			__free_page(pages[i]);
+		kfree(pages);
+
+		if (ret != 0) {
+			DMERR("Scrub (integrity) read failed at offset 0x%llx: %d",
+			      offset, ret);
+			return ret;
+		}
+
+		DMINFO("Scrub (integrity): block at offset 0x%llx verified OK", offset);
+		return 0;
+	}
+
+	/*
+	 * Native mode: read block into pages, compute CRC32c, compare against
+	 * ephemeral xarray cache.
+	 */
 
 	/* Look up stored checksum for this offset in xarray */
 	xa_val = xa_load(&arr->cksum_cache, offset);
@@ -1652,6 +1722,7 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	unsigned int i = 0;
 	sector_t size = 0;
 	int r = 0;
+	bool integrity_below = false;
 
 	/* Prevent new devices during module exit */
 	if (lhsr_module_exiting) {
@@ -1663,6 +1734,21 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	DMINFO("ctr: argc=%u", argc);
 	for (i = 0; i < argc; i++)
 		DMINFO("ctr: argv[%u]=[%s]", i, argv[i]);
+
+	/*
+	 * Check for optional trailing "integrity" flag — indicates dm-integrity
+	 * devices are stacked below.  When set, LHSR skips its own ephemeral
+	 * checksum cache and relies on dm-integrity's persistent per-block
+	 * checksums for data integrity verification.
+	 *
+	 * This MUST be checked BEFORE any argc-dependent calculations so the
+	 * device count and argument positions remain correct.
+	 */
+	if (argc >= 2 && strcmp(argv[argc - 1], "integrity") == 0) {
+		argc--;
+		integrity_below = true;
+		DMINFO("ctr: integrity-below flag set");
+	}
 
 	/* Validate argument count based on raid type */
 	/* Format: type [device offset] [device offset] ... */
@@ -1753,6 +1839,7 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	DMINFO("ctr: Active devices now: %d", atomic_read(&lhsr_active_devices));
 
 	/* Initialize all fields */
+	arr->integrity_below = integrity_below;
 	arr->uuid = fast_hash_32(raid_type);
 	arr->raid_type = raid_type;
 	arr->disks = num_disks;
@@ -3646,8 +3733,9 @@ static void lhsr_status(struct dm_target *ti, status_type_t type, unsigned int f
 		}
 		break;
 	case STATUSTYPE_TABLE:
-		sz += scnprintf(result + sz, maxlen - sz, "UUID=%llx RAID=%u DISKS=%u",
-			       arr->uuid, arr->raid_type, arr->disks);
+		sz += scnprintf(result + sz, maxlen - sz, "UUID=%llx RAID=%u DISKS=%u INTEGRITY=%d",
+			       arr->uuid, arr->raid_type, arr->disks,
+			       arr->integrity_below);
 		if (arr->raid_type >= LHSR_RAID5) {
 			const char *raid_name = arr->raid_type == LHSR_RAID5 ? "RAID5" : "RAID6";
 			sz += scnprintf(result + sz, maxlen - sz, " TYPE=%s", raid_name);
@@ -3955,10 +4043,10 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 
 	if (strncmp(argv[0], "config", 6) == 0) {
 		scnprintf(result, maxlen,
-			  "uuid=%llx raid=%u disks=%u state=%u failed=0x%lx gen=%llu verify=%u",
+			  "uuid=%llx raid=%u disks=%u state=%u failed=0x%lx gen=%llu verify=%u integrity=%d",
 			  arr->array_uuid, arr->raid_type, arr->disks,
 			  arr->state, lhsr_failed_disks_get(arr), arr->generation,
-			  arr->write_verify_enabled);
+			  arr->write_verify_enabled, arr->integrity_below);
 		return 1;
 	}
 

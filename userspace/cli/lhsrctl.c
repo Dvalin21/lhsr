@@ -116,6 +116,16 @@ static void usage(const char *prog)
 		"  %s create --raid shr /dev/sdb /dev/sdc /dev/sdd /dev/sde\n"
 		"  %s status\n"
 		"  %s predict\n"
+		"\n"
+		"dm-integrity support:\n"
+		"  Stack LHSR on dm-integrity for persistent per-block checksums.\n"
+		"  Append 'integrity' to the dmsetup table line:\n"
+		"    dmsetup create my-array --table \\\n"
+		"      \"0 <size> lhsr raid5 8 1 8 \\\n"
+		"       /dev/mapper/integrity-sdb 0 \\\n"
+		"       /dev/mapper/integrity-sdc 0 \\\n"
+		"       integrity\"\n"
+		"  See scripts/setup-dm-integrity.sh for setup.\n"
 		"\n",
 		prog, prog, prog, prog, prog);
 }
@@ -834,7 +844,7 @@ static int cmd_recover(int argc, char **argv)
 		 * For missing disks: create a sparse loop device placeholder.
 		 * The kernel module detects these via superblock disk_state.
 		 */
-		printf("\n  Assembly command:\n\n");
+		printf("\n  Assembly command:\n");
 
 		/* Build the full table line */
 		char table_line[4096];
@@ -906,6 +916,15 @@ static int cmd_recover(int argc, char **argv)
 		printf("  # lhsrctl disk-online %s <index>   # for degraded disks\n", dev_name);
 		printf("  # lhsrctl disk-fail %s <index>     # to mark disks as failed\n", dev_name);
 		printf("  # dmsetup remove %s                 # to tear down\n\n", dev_name);
+
+		printf("  If using dm-integrity for anti-bit-rot, append 'integrity' to the\n");
+		printf("  table line and use dm-integrity device paths instead of raw disks:\n");
+		printf("  # dmsetup create %s --table\n", dev_name);
+		printf("      \"0 <size> lhsr %s", table_type);
+		for (d = 0; d < (int)arr->disk_count; d++) {
+			printf(" /dev/mapper/integrity-<disk> 0");
+		}
+		printf(" integrity\"\n\n");
 	}
 
 	free(scanned);
