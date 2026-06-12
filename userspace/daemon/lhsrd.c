@@ -31,6 +31,8 @@
 #include "lhsr-dm.h"
 #include "lhsr-smart.h"
 #include "lhsr-config.h"
+#include "lhsr-trend.h"
+#include "lhsr-control.h"
 
 /* Global state for signal handler */
 struct daemon_state *g_state = NULL;
@@ -217,6 +219,11 @@ static void *health_monitor_thread(void *arg)
 				}
 			}
 			check_disk_health(&st->disks[i], dm_name);
+			/* Record trend snapshot if enabled */
+			if (st->cfg.trend_enabled) {
+				lhsr_trend_record(st->disks[i].device_path,
+						  &st->disks[i]);
+			}
 		}
 
 		pthread_mutex_unlock(&st->lock);
@@ -234,28 +241,57 @@ static void write_status_file(struct daemon_state *st)
 	if (!f)
 		return;
 
-	fprintf(f, "# LHSR Daemon Status\n");
-	fprintf(f, "version: %d.%d.%d\n",
-		LHSR_VERSION_MAJOR, LHSR_VERSION_MINOR, LHSR_VERSION_PATCH);
-	fprintf(f, "timestamp: %ld\n", (long)time(NULL));
-	fprintf(f, "running: %d\n", st->running ? 1 : 0);
-	fprintf(f, "num_arrays: %d\n", st->num_arrays);
-	fprintf(f, "num_disks: %d\n", st->num_disks);
+	time_t now = time(NULL);
+	time_t uptime = st->start_time ? (now - st->start_time) : 0;
 
 	pthread_mutex_lock(&st->lock);
 
+	fprintf(f, "{\n");
+	fprintf(f, "  \"version\": \"%d.%d.%d\",\n",
+		LHSR_VERSION_MAJOR, LHSR_VERSION_MINOR, LHSR_VERSION_PATCH);
+	fprintf(f, "  \"timestamp\": %ld,\n", (long)now);
+	fprintf(f, "  \"uptime\": %ld,\n", (long)uptime);
+	fprintf(f, "  \"running\": %d,\n", st->running ? 1 : 0);
+	fprintf(f, "  \"num_arrays\": %d,\n", st->num_arrays);
+	fprintf(f, "  \"num_disks\": %d,\n", st->num_disks);
+	fprintf(f, "  \"arrays\": [\n");
+
 	for (int i = 0; i < st->num_arrays; i++) {
-		fprintf(f, "array.%d.name: %s\n", i, st->arrays[i].dm_name);
-		fprintf(f, "array.%d.type: raid%d\n", i, st->arrays[i].raid_type);
-		fprintf(f, "array.%d.disks: %d\n", i, st->arrays[i].num_disks);
+		char warn[256] = "";
+		fprintf(f, "    {\n");
+		fprintf(f, "      \"index\": %d,\n", i);
+		fprintf(f, "      \"name\": \"%s\",\n", st->arrays[i].dm_name);
+		fprintf(f, "      \"uuid\": \"%s\",\n", st->arrays[i].dm_uuid);
+		fprintf(f, "      \"raid_type\": %d,\n", st->arrays[i].raid_type);
+		fprintf(f, "      \"num_disks\": %d,\n", st->arrays[i].num_disks);
+		fprintf(f, "      \"num_working\": %d\n", st->arrays[i].num_working);
+		fprintf(f, "    }%s\n", (i + 1 < st->num_arrays) ? "," : "");
+		(void)warn;
 	}
 
+	fprintf(f, "  ],\n");
+	fprintf(f, "  \"disks\": [\n");
+
 	for (int i = 0; i < st->num_disks; i++) {
-		fprintf(f, "disk.%d.device: %s\n", i, st->disks[i].device_path);
-		fprintf(f, "disk.%d.health: %d\n", i, st->disks[i].health);
-		fprintf(f, "disk.%d.temp: %d\n", i, st->disks[i].temperature);
-		fprintf(f, "disk.%d.failed: %d\n", i, st->disks[i].failed);
+		char warn[256] = "";
+		if (st->cfg.trend_enabled)
+			lhsr_trend_warning(st->disks[i].device_path, warn, sizeof(warn));
+
+		fprintf(f, "    {\n");
+		fprintf(f, "      \"index\": %d,\n", i);
+		fprintf(f, "      \"device\": \"%s\",\n", st->disks[i].device_path);
+		fprintf(f, "      \"health\": %d,\n", st->disks[i].health);
+		fprintf(f, "      \"temperature\": %d,\n", st->disks[i].temperature);
+		fprintf(f, "      \"reallocated\": %d,\n", st->disks[i].smart_reallocated);
+		fprintf(f, "      \"pending\": %d,\n", st->disks[i].smart_pending);
+		fprintf(f, "      \"uncorrectable\": %d,\n", st->disks[i].smart_uncorrectable);
+		fprintf(f, "      \"failed\": %d,\n", st->disks[i].failed);
+		fprintf(f, "      \"trend_warning\": \"%s\"\n", warn);
+		fprintf(f, "    }%s\n", (i + 1 < st->num_disks) ? "," : "");
 	}
+
+	fprintf(f, "  ]\n");
+	fprintf(f, "}\n");
 
 	pthread_mutex_unlock(&st->lock);
 
@@ -289,6 +325,7 @@ int main(int argc, char **argv)
 	int ret;
 
 	memset(&state, 0, sizeof(state));
+	state.start_time = time(NULL);
 
 	while ((opt = getopt(argc, argv, "dvh")) != -1) {
 		switch (opt) {
@@ -338,6 +375,17 @@ int main(int argc, char **argv)
 	/* Initialize libdevmapper logging */
 	lhsr_dm_init(state.cfg.verbose);
 
+	/* Initialize trend database if enabled */
+	if (state.cfg.trend_enabled) {
+		if (lhsr_trend_init(state.cfg.trend_db_path) < 0) {
+			syslog(LOG_WARNING, "trend DB init failed, disabling trend tracking");
+			state.cfg.trend_enabled = 0;
+		}
+	}
+
+	/* Start control socket (best-effort, not fatal if fails) */
+	lhsr_control_start(&state);
+
 	/* Create monitor thread */
 	ret = pthread_create(&monitor_tid, NULL, monitor_thread, &state);
 	if (ret != 0) {
@@ -365,10 +413,15 @@ int main(int argc, char **argv)
 
 	syslog(LOG_INFO, "LHSR daemon stopping");
 
-	/* Join threads */
+	/* Stop control socket, join threads */
+	lhsr_control_stop(&state);
 	pthread_join(monitor_tid, NULL);
 	if (health_tid)
 		pthread_join(health_tid, NULL);
+
+	/* Close trend database */
+	if (state.cfg.trend_enabled)
+		lhsr_trend_close();
 
 	pthread_mutex_destroy(&state.lock);
 	remove_pid_file();

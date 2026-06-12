@@ -6,7 +6,65 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [2.0.0] — 2026-06-11 — Phase 2: Write-Intent Bitmap (Incremental Rebuild)
+## [3.0.0] — 2026-06-12 — Phase 3: SMART Trend Tracking, Control Socket, systemd
+
+### Added
+- **SMART trend database**: SQLite-based daily snapshot storage at
+  `/var/lib/lhsrd/trends.db`. Table `smart_snapshots` records reallocated/pending/
+  uncorrectable sectors, temperature, power-on hours, wear level, and composite
+  health score for each disk. Linear regression on last 30 data points computes
+  trend slopes per attribute.
+- **Trend warnings**: Automatic warnings when SMART attribute trends exceed
+  thresholds (reallocated >1/day, pending >1/day, temperature >2°C/day).
+  Warnings appear in JSON status file and control socket responses.
+- **Control socket**: Unix domain socket at `/run/lhsrd.sock`. JSON command/
+  response protocol. Commands: `ping`, `status`, `trends`. Thread-safe under
+  daemon state lock.
+- **JSON status file**: `/run/lhsrd.status` converted from ad-hoc text to valid
+  JSON. Includes version, uptime, array list (name/uuid/type/disks/working), and
+  disk list (device/health/temp/SMART attributes/failed/trend_warning).
+- **systemd unit**: `systemd/lhsrd.service` with restart-on-failure, security
+  hardening (`NoNewPrivileges`, `PrivateTmp`, `ProtectSystem`,
+  `CapabilityBoundingSet`). Installed via Makefile to `/usr/lib/systemd/system/`.
+- **Config support**: New config keys: `trend_enabled`, `trend_db_path`,
+  `trend_snapshot_interval`. Backward-compatible with existing config files.
+
+### New files
+| File | Description | Lines |
+|------|-------------|-------|
+| `userspace/daemon/lhsr-trend.c` | SQLite trend database (init/record/query/warning/close) | 310 |
+| `userspace/daemon/lhsr-trend.h` | Trend API header | 60 |
+| `userspace/daemon/lhsr-control.c` | Unix domain socket control interface | 300 |
+| `userspace/daemon/lhsr-control.h` | Control socket API header | 55 |
+| `systemd/lhsrd.service` | systemd unit file | 35 |
+
+### Changed
+- `userspace/daemon/lhsrd.h`: Added `trend_enabled`, `trend_db_path`,
+  `trend_snapshot_interval` to `struct daemon_config`. Added `start_time` to
+  `struct daemon_state`. Added `LHSRD_SOCKET_FILE` define.
+- `userspace/daemon/lhsrd.c`: Integrated trend DB init (startup), trend recording
+  (health monitor thread), control socket (parallel thread), JSON status file
+  (was text format), and clean shutdown (trend DB close, control socket stop).
+- `userspace/daemon/lhsr-config.c`: `lhsr_config_defaults()` sets trend defaults.
+  Config parser accepts trend keys. `lhsr_config_save()` writes trend settings.
+- `userspace/daemon/Makefile`: Added `lhsr-trend.o`, `lhsr-control.o`, `-lsqlite3`.
+  Install target creates `/var/lib/lhsrd/` and installs systemd unit.
+- `userspace/config/lhsrd.conf.example`: Updated with trend configuration
+  options and defaults.
+
+### Build
+- Zero new compiler warnings on any target (`-Wall -Wextra -O2 -g`).
+- Dependencies: `libsqlite3-dev` (new), `libdevmapper-dev`, `libpthread`.
+- All three components build clean: kernel module (dm-lhsr.ko), userspace daemon
+  (lhsrd), recovery tool (lhsr-scan).
+
+### Documentation
+- `ROADMAP.md`: Phase 3 marked ✅ COMPLETE. Duration updated to 1 day (was
+  estimated 2-3 weeks — 3.1 and 3.2 were already implemented). New Phase 3
+  completion section with detailed file summary.
+- `CHANGELOG.md`: This entry.
+
+---
 
 ### Added
 - **Write-Intent Bitmap (WIB)**: Persistent on-disk bitmap tracking written chunks
@@ -269,7 +327,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 | 0 | Honest foundation | ✅ Complete |
 | 1 | Persistent checksums | ✅ Complete |
 | 2 | Incremental rebuild | ✅ Complete |
-| 3 | Daemon refactor | Up next |
+| 3 | Daemon refactor | ✅ Complete |
 | 4 | Predictive failure | Planned |
 | 5 | Recovery tools | Planned |
 | 6 | SHR userspace | Not yet scoped |

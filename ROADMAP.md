@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-11 (Phase 2 COMPLETE — Write-Intent Bitmap incremental rebuild verified)
+**Last Updated:** 2026-06-12 (Phase 3 COMPLETE — SMART trend tracking, control socket, systemd unit)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -184,32 +184,86 @@ from the write-hole journal — same format, same recovery, no new on-disk forma
 
 ---
 
-## Phase 3: Userspace Daemon Refactor (2-3 weeks)
+## Phase 3: Userspace Daemon — SMART Trending, Control Socket, systemd — ✅ COMPLETE (2026-06-12)
 
-The daemon (`lhsrd`) currently uses `fork()` + `exec()` of `smartctl` and
-`dmsetup`. This is slow, fragile, and prevents real monitoring.
+**Duration:** 1 day (was estimated 2-3 weeks — 3.1 and 3.2 were already done; 3.3 was well-scoped)
 
-### 3.1 Replace dmsetup with libdevmapper
-- Current: `fork() + exec(dmsetup message <dev> <cmd>)`
-- Target: `dm_task_message()` via libdevmapper
-- Eliminates fork overhead, eliminates shell injection vectors
+**What changed:** The daemon now has:
+1. SQLite-based SMART trend database with linear regression trend analysis
+2. Unix domain control socket for live `lhsrctl` queries
+3. JSON machine-parseable status file (was ad-hoc text format)
+4. systemd unit file for proper lifecycle management
 
-### 3.2 Replace smartctl with direct sysfs/SG_IO
-- Current: `fork() + exec(smartctl -a /dev/sdX)` and parse output
-- Target: Read SMART data from sysfs where available, fall back to SG_IO ioctl
-- Faster, no parsing fragility
+### 3.1 Replace dmsetup with libdevmapper — ✅ ALREADY DONE (pre-existing `lhsr-dm.c`)
+- `lhsr-dm.c` (279 lines) implements `lhsr_dm_message()`, `lhsr_dm_status()`,
+  `lhsr_dm_list_arrays()`, `lhsr_dm_create()`, `lhsr_dm_remove()`,
+  `lhsr_dm_get_devices()`, `lhsr_dm_suspend()`, `lhsr_dm_resume()` via
+  `dm_task_create()` / `dm_task_set_message()` / `dm_task_run()`.
+- Daemon uses it end-to-end — no `fork()`+`exec()` of `dmsetup` anywhere.
 
-### 3.3 Add SMART trend tracking
-- Store daily SMART snapshots in a simple SQLite database or flat JSON
-- Track key attributes (reallocated_sectors, pending_sectors, temperature,
-  read_error_rate, write_error_rate)
-- Simple linear regression on each attribute to compute trend slope
+### 3.2 Replace smartctl with sysfs/SG_IO — ✅ ALREADY DONE (pre-existing `lhsr-smart.c`)
+- `lhsr-smart.c` (370 lines) implements two-tier SMART polling:
+  - Tier 1: sysfs `ata_smart_*` attributes (fast, no SCSI command)
+  - Tier 2: SG_IO ATA PASS-THROUGH 16 ioctl for full attribute extraction
+- `lhsr_smart_poll()` returns `struct disk_health` with reallocated, pending,
+  uncorrectable sectors, temperature, and composite health score.
+
+### 3.3 SMART trend tracking — ✅ NEW (lhsr-trend.c/h, ~310 lines)
+- **SQLite database** at `/var/lib/lhsrd/trends.db` (WAL mode + synchronous FULL)
+- `smart_snapshots` table: `(disk_path, snapshot_time, reallocated, pending,
+  uncorrectable, temperature, power_on_hours, wear_level, health_score)`
+- Daily snapshots recorded automatically in health monitor thread
+- Linear regression on last 30 data points per disk computes trend slopes
+- Trend warnings when slope exceeds thresholds:
+  - Reallocated sectors: >1 sector/day
+  - Pending sectors: >1 sector/day
+  - Temperature: >2°C/day
+- Warning strings included in JSON status file and control socket responses
+- CLI tool (`lhsrctl`) can query trends directly from SQLite
+
+### 3.4 Control socket — ✅ NEW (lhsr-control.c/h, ~300 lines)
+- Unix domain socket at `/run/lhsrd.sock`
+- JSON command/response protocol (no json-c dependency — manual snprintf)
+- Commands: `{"cmd":"ping"}`, `{"cmd":"status"}`, `{"cmd":"trends"}`
+- Thread-safe: accesses daemon state under `pthread_mutex_t` lock
+- Listener thread is detached; `lhsr_control_stop()` unblocks `accept()` with a
+  dummy connection on shutdown
+
+### 3.5 JSON status file — ✅ NEW
+- `/run/lhsrd.status` now valid JSON (was ad-hoc `key: value` text)
+- Includes version, uptime, arrays (name/uuid/type/disks/working), disks
+  (device/health/temp/SMART attributes/failed/trend_warning)
+- Machine-parseable by any web GUI or monitoring tool
+
+### 3.6 systemd integration — ✅ NEW
+- `systemd/lhsrd.service` unit file
+- Restart on failure with 10-second delay
+- Security hardening: `NoNewPrivileges=yes`, `PrivateTmp=yes`,
+  `ProtectSystem=full`, `CapabilityBoundingSet` for DM and SG_IO access
+- Makefile install target installs to `/usr/lib/systemd/system/`
+
+### Files changed/created
+| File | Status | Lines |
+|------|--------|-------|
+| `userspace/daemon/lhsr-trend.c` | **NEW** | 310 |
+| `userspace/daemon/lhsr-trend.h` | **NEW** | 60 |
+| `userspace/daemon/lhsr-control.c` | **NEW** | 300 |
+| `userspace/daemon/lhsr-control.h` | **NEW** | 55 |
+| `systemd/lhsrd.service` | **NEW** | 35 |
+| `userspace/daemon/lhsrd.h` | MODIFIED | +15 |
+| `userspace/daemon/lhsrd.c` | MODIFIED | +30 |
+| `userspace/daemon/lhsr-config.c` | MODIFIED | +25 |
+| `userspace/daemon/Makefile` | MODIFIED | +6 |
+| `userspace/config/lhsrd.conf.example` | MODIFIED | +15 |
 
 ### Deliverables
-- Daemon uses libdevmapper instead of fork+exec dmsetup
-- Daemon reads SMART via sysfs/ioctl instead of forking smartctl
-- SMART history database with trend analysis
-- Warning when trend slope exceeds thresholds
+- ✅ SMART trend database with linear regression trending
+- ✅ Control socket for live status queries
+- ✅ JSON machine-parseable status file
+- ✅ systemd unit file with security hardening
+- ✅ Config file support for trend settings
+- ✅ Zero new compiler warnings on any target
+- ✅ All three components build clean: kernel module, daemon, recovery tool
 
 ---
 
@@ -326,11 +380,11 @@ architecture-level feature for the DM target. It is NOT trivial.
 | 0 | Honest foundation | 2 weeks | Nothing |
 | 1 | Persistent checksums | 1 week | Phase 0 |
 | 2 | Incremental rebuild | **2 days** (est. 2-3 weeks) | Phase 0 |
-| 3 | Daemon refactor | 2-3 weeks | Phase 0 |
+| 3 | Daemon refactor | **1 day** (est. 2-3 weeks) | Phase 0 |
 | 4 | Predictive failure | 2 weeks | Phase 3 |
 | 5 | Recovery tools | 2 weeks | Phase 0 |
 
-**Estimated total for Phases 0-5:** 7-10 weeks (~2 months) with one developer (Phase 2 faster than estimated).
+**Estimated total for Phases 0-5:** 7-10 weeks (~2 months) with one developer (Phases 2 and 3 faster than estimated because 3.1 and 3.2 were already implemented).
 
 ---
 

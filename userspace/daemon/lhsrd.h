@@ -15,6 +15,11 @@
 #define LHSRD_CONFIG_DIR  "/etc/lhsr"
 #define LHSRD_STATUS_FILE "/run/lhsrd.status"
 #define LHSRD_CONF_FILE   LHSRD_CONFIG_DIR "/lhsrd.conf"
+#define LHSRD_SOCKET_FILE "/run/lhsrd.sock"
+
+/* Trend DB defaults */
+#define LHSRD_TREND_DB           "/var/lib/lhsrd/trends.db"
+#define LHSRD_TREND_SNAPSHOT_INT 86400   /* 24 hours */
 
 #define MONITOR_INTERVAL       60
 #define SMART_POLL_INTERVAL   300
@@ -61,6 +66,9 @@ struct daemon_config {
 	int    auto_failover;
 	int    notify_on_fail;
 	int    verbose;
+	int    trend_enabled;
+	char   trend_db_path[256];
+	int    trend_snapshot_interval;	/* seconds between snapshots */
 };
 
 /* Global daemon state */
@@ -72,6 +80,7 @@ struct daemon_state {
 	int                   num_disks;
 	pthread_mutex_t       lock;
 	volatile int          running;
+	time_t                start_time;  /* Daemon start time (for uptime) */
 };
 
 /* Shared state pointer (for signal handler access) */

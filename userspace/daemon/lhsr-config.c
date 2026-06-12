@@ -1,19 +1,22 @@
 /*
- * LHSR Daemon - Config file parsing
+ *  LHSR Daemon - Config file parsing
  *
- * Parses /etc/lhsr/lhsrd.conf in simple key=value format.
- * Lines starting with '#' or ';' are comments.
- * Blank lines are ignored.
+ *  Parses /etc/lhsr/lhsrd.conf in simple key=value format.
+ *  Lines starting with '#' or ';' are comments.
+ *  Blank lines are ignored.
  *
- * Supported keys:
- *   smart_poll_interval = <seconds>
- *   error_threshold     = <count>
- *   auto_failover       = <0|1>
- *   notify_on_fail      = <0|1>
- *   verbose             = <0|1>
+ *  Supported keys:
+ *    smart_poll_interval      = <seconds>
+ *    error_threshold          = <count>
+ *    auto_failover            = <0|1>
+ *    notify_on_fail           = <0|1>
+ *    verbose                  = <0|1>
+ *    trend_enabled            = <0|1>
+ *    trend_db_path            = <path>
+ *    trend_snapshot_interval  = <seconds>
  *
- * Copyright (C) 2026 LHSR Team
- * License: GPLv3
+ *  Copyright (C) 2026 LHSR Team
+ *  License: GPLv3
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -34,6 +37,10 @@ void lhsr_config_defaults(struct daemon_config *cfg)
 	cfg->auto_failover       = 1;
 	cfg->notify_on_fail      = 1;
 	cfg->verbose             = 0;
+	cfg->trend_enabled       = 1;
+	strncpy(cfg->trend_db_path, LHSRD_TREND_DB,
+		sizeof(cfg->trend_db_path) - 1);
+	cfg->trend_snapshot_interval = LHSRD_TREND_SNAPSHOT_INT;
 }
 
 /*
@@ -108,6 +115,13 @@ int lhsr_config_load(struct daemon_config *cfg, const char *path)
 			cfg->notify_on_fail = atoi(val) != 0;
 		} else if (strcasecmp(key, "verbose") == 0) {
 			cfg->verbose = atoi(val) != 0;
+		} else if (strcasecmp(key, "trend_enabled") == 0) {
+			cfg->trend_enabled = atoi(val) != 0;
+		} else if (strcasecmp(key, "trend_db_path") == 0) {
+			strncpy(cfg->trend_db_path, val,
+				sizeof(cfg->trend_db_path) - 1);
+		} else if (strcasecmp(key, "trend_snapshot_interval") == 0) {
+			cfg->trend_snapshot_interval = atoi(val);
 		} else {
 			syslog(LOG_WARNING, "%s:%d: unknown key '%s'", path, lineno, key);
 		}
@@ -135,6 +149,9 @@ int lhsr_config_save(const struct daemon_config *cfg, const char *path)
 	fprintf(f, "auto_failover       = %d\n", cfg->auto_failover);
 	fprintf(f, "notify_on_fail      = %d\n", cfg->notify_on_fail);
 	fprintf(f, "verbose             = %d\n", cfg->verbose);
+	fprintf(f, "trend_enabled       = %d\n", cfg->trend_enabled);
+	fprintf(f, "trend_db_path       = %s\n", cfg->trend_db_path);
+	fprintf(f, "trend_snapshot_interval = %d\n", cfg->trend_snapshot_interval);
 
 	fclose(f);
 	return 0;

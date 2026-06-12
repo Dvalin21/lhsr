@@ -25,3 +25,16 @@ notify_on_fail = 1
 # Values: 0 = disabled, 1 = enabled
 # Default: 0
 verbose = 0
+
+# Trend tracking: store daily SMART snapshots to SQLite database
+# Values: 0 = disabled, 1 = enabled
+# Default: 1
+trend_enabled = 1
+
+# Path to trend database (must be writable by lhsrd)
+# Default: /var/lib/lhsrd/trends.db
+# trend_db_path = /var/lib/lhsrd/trends.db
+
+# How often to record a SMART snapshot (seconds)
+# Default: 86400 (24 hours)
+# trend_snapshot_interval = 86400
