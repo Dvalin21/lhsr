@@ -157,6 +157,11 @@ static void check_disk_health(struct disk_health *dh, const char *dm_device)
 
 /* ---------- Monitor thread ---------- */
 
+static void cleanup_mutex_unlock(void *arg)
+{
+	pthread_mutex_unlock((pthread_mutex_t *)arg);
+}
+
 static void *monitor_thread(void *arg)
 {
 	struct daemon_state *st = arg;
@@ -170,6 +175,7 @@ static void *monitor_thread(void *arg)
 			break;
 
 		pthread_mutex_lock(&st->lock);
+		pthread_cleanup_push(cleanup_mutex_unlock, &st->lock);
 
 		/* Discover arrays via libdevmapper */
 		int n = lhsr_dm_list_arrays(st->arrays, LHSRD_MAX_ARRAYS);
@@ -185,6 +191,7 @@ static void *monitor_thread(void *arg)
 			}
 		}
 
+		pthread_cleanup_pop(0);
 		pthread_mutex_unlock(&st->lock);
 
 		if (st->cfg.verbose)
@@ -211,6 +218,7 @@ static void *health_monitor_thread(void *arg)
 			break;
 
 		pthread_mutex_lock(&st->lock);
+		pthread_cleanup_push(cleanup_mutex_unlock, &st->lock);
 
 		for (int i = 0; i < st->num_disks; i++) {
 			/* Find which array this disk belongs to */
@@ -230,6 +238,7 @@ static void *health_monitor_thread(void *arg)
 			}
 		}
 
+		pthread_cleanup_pop(0);
 		pthread_mutex_unlock(&st->lock);
 	}
 
@@ -481,11 +490,14 @@ int main(int argc, char **argv)
 
 	syslog(LOG_INFO, "LHSR daemon stopping");
 
-	/* Stop control socket, join threads */
+	/* Stop control socket, cancel and join threads */
 	lhsr_control_stop(&state);
+	pthread_cancel(monitor_tid);
 	pthread_join(monitor_tid, NULL);
-	if (health_tid)
+	if (health_tid) {
+		pthread_cancel(health_tid);
 		pthread_join(health_tid, NULL);
+	}
 
 	/* Close trend database */
 	if (state.cfg.trend_enabled)
