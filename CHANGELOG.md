@@ -6,6 +6,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [4.0.0] — 2026-06-12 — Phase 4: Predictive Failure Health Score, CLI Integration
+
+### Added
+- **Composite health score**: New `lhsr-health.c/h` module computes a 0-100
+  weighted health score for each disk from SMART values, trend slopes, and error
+  history. Scoring: reallocated (-30 max), pending (-30 max), uncorrectable (-40
+  max), temperature (>50°C: -10, >60°C: -15), trend warnings (-10 each),
+  consecutive errors (-15 max). Labels: >=90 OK, >=70 WARNING, >=40 CRITICAL,
+  <40 FAILING.
+- **`lhsrctl status` rewritten**: Reads daemon JSON status file (`/run/lhsrd.status`)
+  and displays formatted output: version, uptime, arrays, per-disk health score,
+  temperature, SMART attributes, and trend warnings. No longer a stub.
+- **`lhsrctl predict` rewritten**: Connects to daemon control socket
+  (`/run/lhsrd.sock`), queries trend data, and displays per-disk failure
+  predictions with estimated time-to-critical for reallocated sectors, pending
+  sectors, and temperature. Shows active trend warnings and replacement
+  recommendations.
+- **Prometheus metrics file**: Daemon writes `/var/lib/lhsrd/metrics.prom` with
+  gauge metrics for `lhsr_uptime_seconds`, `lhsr_disk_health`,
+  `lhsr_disk_temperature`, `lhsr_reallocated_sectors`, `lhsr_pending_sectors`,
+  `lhsr_uncorrectable_sectors`. Compatible with node_exporter textfile collector.
+- **Control socket trend response enhanced**: Now includes `health_score`,
+  `health_label`, and current SMART values (`temperature`, `reallocated`,
+  `pending`, `uncorrectable`) alongside trend slopes — `predict` command is
+  self-contained with no need to query multiple sources.
+
+### New files
+| File | Description | Lines |
+|------|-------------|-------|
+| `userspace/daemon/lhsr-health.c` | Composite health score computation | 120 |
+| `userspace/daemon/lhsr-health.h` | Health score API header | 55 |
+
+### Changed
+- `userspace/daemon/lhsrd.h`: Added `health_score` field to `struct disk_health`.
+  Added `LHSRD_METRICS_FILE` define.
+- `userspace/daemon/lhsrd.c`: Computes composite health score in
+  `check_disk_health()`. Writes Prometheus metrics file every cycle. Creates
+  `/var/lib/lhsrd/` directory on startup.
+- `userspace/daemon/lhsr-control.c`: `json_disk()` now includes `health_score`
+  and `health_label`. `json_trend()` now includes current SMART values.
+  `lhsr_control_build_trends()` always emits an entry per disk (even with no
+  trend data).
+- `userspace/daemon/Makefile`: Added `lhsr-health.o`.
+- `userspace/cli/lhsrctl.c`: Added JSON helpers (`json_int`, `json_string`,
+  `json_double`, `next_object`), socket helpers (`connect_control_socket`,
+  `control_query`), file reader, and duration formatter. `cmd_status()` and
+  `cmd_predict()` replaced with real implementations.
+
+### Build
+- Zero new compiler warnings on any target (`-Wall -Wextra -O2 -g`).
+- All targets build clean: kernel module (dm-lhsr.ko), daemon (lhsrd), CLI
+  (lhsrctl), recovery tool (lhsr-scan).
+
+### Documentation
+- `ROADMAP.md`: Phase 4 marked ✅ COMPLETE. Duration updated to 1 session (was
+  estimated 2 weeks). New Phase 4 completion section with health score model,
+  output examples, and file summary. Timeline summary updated.
+- `CHANGELOG.md`: This entry.
+
+---
+
 ## [3.0.0] — 2026-06-12 — Phase 3: SMART Trend Tracking, Control Socket, systemd
 
 ### Added

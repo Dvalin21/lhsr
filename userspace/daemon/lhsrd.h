@@ -13,9 +13,10 @@
 
 #define LHSRD_PID_FILE    "/run/lhsrd.pid"
 #define LHSRD_CONFIG_DIR  "/etc/lhsr"
-#define LHSRD_STATUS_FILE "/run/lhsrd.status"
-#define LHSRD_CONF_FILE   LHSRD_CONFIG_DIR "/lhsrd.conf"
-#define LHSRD_SOCKET_FILE "/run/lhsrd.sock"
+#define LHSRD_STATUS_FILE  "/run/lhsrd.status"
+#define LHSRD_METRICS_FILE "/var/lib/lhsrd/metrics.prom"
+#define LHSRD_CONF_FILE    LHSRD_CONFIG_DIR "/lhsrd.conf"
+#define LHSRD_SOCKET_FILE  "/run/lhsrd.sock"
 
 /* Trend DB defaults */
 #define LHSRD_TREND_DB           "/var/lib/lhsrd/trends.db"
@@ -42,7 +43,8 @@ struct disk_health {
 	int    smart_pending;
 	int    smart_uncorrectable;
 	int    temperature;
-	int    health;			/* 0-100 */
+	int    health;			/* 0-100 raw SMART health */
+	int    health_score;		/* 0-100 composite (computed) */
 	time_t last_check;
 	int    consecutive_errors;
 	int    failed;

@@ -33,6 +33,7 @@
 #include "lhsr-config.h"
 #include "lhsr-trend.h"
 #include "lhsr-control.h"
+#include "lhsr-health.h"
 
 /* Global state for signal handler */
 struct daemon_state *g_state = NULL;
@@ -103,6 +104,9 @@ static void check_disk_health(struct disk_health *dh, const char *dm_device)
 		dh->smart_uncorrectable = smart.smart_uncorrectable;
 		dh->temperature         = smart.temperature;
 		dh->health              = smart.health;
+
+		/* Compute composite health score */
+		dh->health_score = lhsr_compute_health_score(dh, dh->device_path);
 
 		if (g_state && g_state->cfg.verbose) {
 			syslog(LOG_DEBUG, "Disk %s: realloc=%d pending=%d uncorr=%d temp=%d health=%d",
@@ -281,6 +285,9 @@ static void write_status_file(struct daemon_state *st)
 		fprintf(f, "      \"index\": %d,\n", i);
 		fprintf(f, "      \"device\": \"%s\",\n", st->disks[i].device_path);
 		fprintf(f, "      \"health\": %d,\n", st->disks[i].health);
+		fprintf(f, "      \"health_score\": %d,\n", st->disks[i].health_score);
+		fprintf(f, "      \"health_label\": \"%s\",\n",
+			lhsr_health_label(st->disks[i].health_score));
 		fprintf(f, "      \"temperature\": %d,\n", st->disks[i].temperature);
 		fprintf(f, "      \"reallocated\": %d,\n", st->disks[i].smart_reallocated);
 		fprintf(f, "      \"pending\": %d,\n", st->disks[i].smart_pending);
@@ -295,6 +302,62 @@ static void write_status_file(struct daemon_state *st)
 
 	pthread_mutex_unlock(&st->lock);
 
+	fclose(f);
+}
+
+/* ---------- Prometheus metrics file ---------- */
+
+static void write_metrics_file(struct daemon_state *st)
+{
+	FILE *f = fopen(LHSRD_METRICS_FILE, "w");
+	if (!f)
+		return;
+
+	time_t now = time(NULL);
+	time_t uptime = st->start_time ? (now - st->start_time) : 0;
+
+	pthread_mutex_lock(&st->lock);
+
+	fprintf(f, "# HELP lhsr_uptime_seconds Daemon uptime in seconds\n");
+	fprintf(f, "# TYPE lhsr_uptime_seconds gauge\n");
+	fprintf(f, "lhsr_uptime_seconds %ld\n\n", (long)uptime);
+
+	fprintf(f, "# HELP lhsr_disk_health Composite health score (0-100, higher=better)\n");
+	fprintf(f, "# TYPE lhsr_disk_health gauge\n");
+	for (int i = 0; i < st->num_disks; i++) {
+		fprintf(f, "lhsr_disk_health{device=\"%s\"} %d\n",
+			st->disks[i].device_path, st->disks[i].health_score);
+	}
+
+	fprintf(f, "\n# HELP lhsr_disk_temperature Disk temperature in Celsius\n");
+	fprintf(f, "# TYPE lhsr_disk_temperature gauge\n");
+	for (int i = 0; i < st->num_disks; i++) {
+		fprintf(f, "lhsr_disk_temperature{device=\"%s\"} %d\n",
+			st->disks[i].device_path, st->disks[i].temperature);
+	}
+
+	fprintf(f, "\n# HELP lhsr_reallocated_sectors Reallocated sector count\n");
+	fprintf(f, "# TYPE lhsr_reallocated_sectors gauge\n");
+	for (int i = 0; i < st->num_disks; i++) {
+		fprintf(f, "lhsr_reallocated_sectors{device=\"%s\"} %d\n",
+			st->disks[i].device_path, st->disks[i].smart_reallocated);
+	}
+
+	fprintf(f, "\n# HELP lhsr_pending_sectors Pending sector count\n");
+	fprintf(f, "# TYPE lhsr_pending_sectors gauge\n");
+	for (int i = 0; i < st->num_disks; i++) {
+		fprintf(f, "lhsr_pending_sectors{device=\"%s\"} %d\n",
+			st->disks[i].device_path, st->disks[i].smart_pending);
+	}
+
+	fprintf(f, "\n# HELP lhsr_uncorrectable_sectors Uncorrectable sector count\n");
+	fprintf(f, "# TYPE lhsr_uncorrectable_sectors gauge\n");
+	for (int i = 0; i < st->num_disks; i++) {
+		fprintf(f, "lhsr_uncorrectable_sectors{device=\"%s\"} %d\n",
+			st->disks[i].device_path, st->disks[i].smart_uncorrectable);
+	}
+
+	pthread_mutex_unlock(&st->lock);
 	fclose(f);
 }
 
@@ -404,11 +467,16 @@ int main(int argc, char **argv)
 
 	syslog(LOG_INFO, "LHSR daemon started (PID: %d)", getpid());
 
-	/* Main loop: write status file periodically, wait for shutdown */
+	/* Create /var/lib/lhsrd if needed (for metrics file) */
+	mkdir("/var/lib/lhsrd", 0755);
+
+	/* Main loop: write status + metrics periodically, wait for shutdown */
 	while (state.running) {
 		sleep(15);
-		if (state.running)
+		if (state.running) {
 			write_status_file(&state);
+			write_metrics_file(&state);
+		}
 	}
 
 	syslog(LOG_INFO, "LHSR daemon stopping");

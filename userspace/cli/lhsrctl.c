@@ -21,6 +21,8 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <linux/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 
 #include "../../lib/raid_engine.h"
 
@@ -61,6 +63,31 @@ struct lhsr_superblock {
 #define PROGNAME "lhsrctl"
 #define DM_DEV_PATH "/dev/mapper/control"
 #define MAX_ARGS 64
+
+/* Daemon communication paths */
+#define LHSRD_STATUS_FILE  "/run/lhsrd.status"
+#define LHSRD_SOCKET_PATH  "/run/lhsrd.sock"
+
+/* SMART thresholds (must match daemon) */
+#define LHSRD_REALLOCATED_THRESH  100
+#define LHSRD_PENDING_THRESH      50
+#define LHSRD_TEMP_CRITICAL       60
+
+/* Forward declarations for daemon communication helpers (defined below) */
+static char *read_file(const char *path);
+static int json_int(const char *json, const char *key, int *val);
+static int json_string(const char *json, const char *key, char *buf, size_t sz);
+static int json_double(const char *json, const char *key, double *val);
+static int json_int_in(const char *start, const char *end,
+		       const char *key, int *val);
+static int json_string_in(const char *start, const char *end,
+			  const char *key, char *buf, size_t sz);
+static int json_double_in(const char *start, const char *end,
+			  const char *key, double *val);
+static const char *next_object(const char *pos, const char **end);
+static void format_duration(long seconds, char *buf, size_t sz);
+static int connect_control_socket(void);
+static char *control_query(const char *cmd);
 
 /* Command options */
 enum {
@@ -205,30 +232,320 @@ static int cmd_create(int argc, char **argv, enum lhsr_raid_type raid_type)
 	return 0;
 }
 
-/* Command status */
+/* Command status — read /run/lhsrd.status and display */
 static int cmd_status(int argc, char **argv)
 {
 	(void)argc; (void)argv;
-	/* In production, would load config and show status */
-	printf("LHSR Status\n");
-	printf("==========\n\n");
-	printf("Note: This is a stub - config loading not implemented\n");
-	printf("Use 'create' to create an array first.\n");
 
+	char *json = read_file(LHSRD_STATUS_FILE);
+	if (!json) {
+		printf("LHSR Status\n");
+		printf("==========\n\n");
+		printf("Daemon not running (status file %s not found).\n",
+		       LHSRD_STATUS_FILE);
+		printf("Start the daemon with: lhsrd -d\n");
+		return 1;
+	}
+
+	/* Top-level fields */
+	char version[32] = "?";
+	int uptime = 0, num_arrays = 0, num_disks = 0;
+
+	json_string(json, "version", version, sizeof(version));
+	json_int(json, "uptime", &uptime);
+	json_int(json, "num_arrays", &num_arrays);
+	json_int(json, "num_disks", &num_disks);
+
+	printf("LHSR Status\n");
+	printf("==========\n");
+
+	char uptime_str[64] = "0s";
+	format_duration(uptime, uptime_str, sizeof(uptime_str));
+	printf("Version: %s  |  Uptime: %s  |  Arrays: %d  |  Disks: %d\n\n",
+	       version, uptime_str, num_arrays, num_disks);
+
+	/* Arrays section */
+	const char *arrays_section = strstr(json, "\"arrays\":");
+	if (arrays_section) {
+		const char *arr_start = strchr(arrays_section, '[');
+		if (arr_start) {
+			const char *obj_end = arr_start;
+			for (int i = 0; i < num_arrays; i++) {
+				const char *obj = next_object(obj_end, &obj_end);
+				if (!obj)
+					break;
+				char name[256] = "?";
+				int num_d = 0, num_w = 0, rtype = 0;
+				json_string_in(obj, obj_end, "name", name, sizeof(name));
+				json_int_in(obj, obj_end, "raid_type", &rtype);
+				json_int_in(obj, obj_end, "num_disks", &num_d);
+				json_int_in(obj, obj_end, "num_working", &num_w);
+				const char *type_str = "?";
+				switch (rtype) {
+				case 0: type_str = "SINGLE"; break;
+				case 1: type_str = "MIRROR"; break;
+				case 2: type_str = "RAID5"; break;
+				case 3: type_str = "RAID6"; break;
+				case 4: type_str = "SHR"; break;
+				case 5: type_str = "SHR2"; break;
+				}
+				printf("Array: %s  (%s, %d disks, %d working)\n",
+				       name, type_str, num_d, num_w);
+			}
+		}
+	}
+
+	/* Disks section */
+	const char *disks_section = strstr(json, "\"disks\":");
+	if (disks_section) {
+		const char *disk_start = strchr(disks_section, '[');
+		if (disk_start) {
+			const char *obj_end = disk_start;
+			for (int i = 0; i < num_disks; i++) {
+				const char *obj = next_object(obj_end, &obj_end);
+				if (!obj)
+					break;
+				char device[256] = "?";
+				int hs = 0, temp = 0, re = 0, pe = 0, un = 0, failed = 0;
+				char warn[256] = "";
+				json_string_in(obj, obj_end, "device", device, sizeof(device));
+				json_int_in(obj, obj_end, "health_score", &hs);
+				json_int_in(obj, obj_end, "temperature", &temp);
+				json_int_in(obj, obj_end, "reallocated", &re);
+				json_int_in(obj, obj_end, "pending", &pe);
+				json_int_in(obj, obj_end, "uncorrectable", &un);
+				json_int_in(obj, obj_end, "failed", &failed);
+				json_string_in(obj, obj_end, "trend_warning",
+					       warn, sizeof(warn));
+
+				const char *label = (hs >= 90) ? "OK" :
+					(hs >= 70) ? "WARNING" :
+					(hs >= 40) ? "CRITICAL" : "FAILING";
+				printf("\nDisk %d: %s\n", i, device);
+				printf("  Health:     %3d/100 [%s]%s\n",
+				       hs, label, failed ? "  *** FAILED ***" : "");
+				printf("  Temp:       %d°C\n", temp);
+				printf("  Realloc:    %d  Pending: %d  Uncorr: %d\n",
+				       re, pe, un);
+				if (warn[0])
+					printf("  Trend:      %s\n", warn);
+			}
+		}
+	}
+
+	if (num_arrays == 0 && num_disks == 0)
+		printf("No arrays configured. Create one with:\n");
+	printf("  lhsrctl create --raid <type> <disk>...\n");
+
+	free(json);
 	return 0;
 }
 
-/* Command predict */
+/* Command predict — query daemon for trend data, estimate failure risk */
 static int cmd_predict(int argc, char **argv)
 {
 	(void)argc; (void)argv;
-	printf("LHSR Predictive Failure\n");
-	printf("=======================\n\n");
-	printf("Scanning disks...\n");
 
-	/* In production, would query SMART and calculate risk */
-	printf("Note: This is a stub - SMART monitoring not implemented\n");
+	char *json = control_query("{\"cmd\":\"trends\"}\n");
+	if (!json) {
+		printf("LHSR Predictive Failure Analysis\n");
+		printf("================================\n\n");
+		printf("Cannot connect to daemon (socket %s).\n",
+		       LHSRD_SOCKET_PATH);
+		printf("Is the daemon running? Start with: lhsrd -d\n");
+		return 1;
+	}
 
+	int num_disks = 0;
+	json_int(json, "num_disks", &num_disks);
+
+	printf("LHSR Predictive Failure Analysis\n");
+	printf("================================\n\n");
+
+	if (num_disks <= 0) {
+		printf("No disks tracked by daemon.\n");
+		free(json);
+		return 0;
+	}
+
+	/* Walk the trends array */
+	const char *trends_section = strstr(json, "\"trends\":");
+	if (!trends_section) {
+		printf("No trend data available.\n");
+		free(json);
+		return 0;
+	}
+
+	const char *arr_start = strchr(trends_section, '[');
+	if (!arr_start) {
+		printf("No trend data available.\n");
+		free(json);
+		return 0;
+	}
+
+	const char *obj_end = arr_start;
+	int found_any = 0;
+
+	for (int i = 0; i < num_disks; i++) {
+		const char *obj = next_object(obj_end, &obj_end);
+		if (!obj)
+			break;
+
+		/* Current values */
+		char device[256] = "?";
+		int health_score = 0, temp = 0, re = 0, pe = 0, un = 0;
+		int data_points = 0;
+		double re_slope = 0, pe_slope = 0, un_slope = 0, tmp_slope = 0;
+		int re_warn = 0, pe_warn = 0, un_warn = 0, tmp_warn = 0;
+
+		json_string_in(obj, obj_end, "device", device, sizeof(device));
+		json_int_in(obj, obj_end, "health_score", &health_score);
+		json_int_in(obj, obj_end, "temperature", &temp);
+		json_int_in(obj, obj_end, "reallocated", &re);
+		json_int_in(obj, obj_end, "pending", &pe);
+		json_int_in(obj, obj_end, "uncorrectable", &un);
+		json_int_in(obj, obj_end, "data_points", &data_points);
+		json_double_in(obj, obj_end, "reallocated_slope", &re_slope);
+		json_double_in(obj, obj_end, "pending_slope", &pe_slope);
+		json_double_in(obj, obj_end, "uncorrectable_slope", &un_slope);
+		json_double_in(obj, obj_end, "temperature_slope", &tmp_slope);
+		json_int_in(obj, obj_end, "reallocated_warn", &re_warn);
+		json_int_in(obj, obj_end, "pending_warn", &pe_warn);
+		json_int_in(obj, obj_end, "uncorrectable_warn", &un_warn);
+		json_int_in(obj, obj_end, "temperature_warn", &tmp_warn);
+
+		found_any = 1;
+
+		const char *label = (health_score >= 90) ? "OK" :
+				    (health_score >= 70) ? "WARNING" :
+				    (health_score >= 40) ? "CRITICAL" : "FAILING";
+
+		printf("Disk: %s\n", device);
+		printf("  Health Score:   %d/100 [%s]\n", health_score, label);
+
+		/* Temperature line */
+		printf("  Temperature:    %d°C", temp);
+		if (tmp_warn)
+			printf(" (rising %.1f°C/day) ***",
+			       tmp_slope);
+		else if (data_points >= 3 && tmp_slope > 0)
+			printf(" (rising %.1f°C/day)", tmp_slope);
+		else
+			printf(" (stable)");
+		printf("\n");
+
+		/* Reallocated line */
+		printf("  Reallocated:    %d sectors", re);
+		if (re_warn)
+			printf(" (increasing %.1f/day) ***", re_slope);
+		else if (data_points >= 3 && re_slope > 0)
+			printf(" (increasing %.1f/day)", re_slope);
+		else
+			printf(" (stable)");
+		printf("\n");
+
+		/* Pending line */
+		printf("  Pending:        %d sectors", pe);
+		if (pe_warn)
+			printf(" (increasing %.1f/day) ***", pe_slope);
+		else if (data_points >= 3 && pe_slope > 0)
+			printf(" (increasing %.1f/day)", pe_slope);
+		else
+			printf(" (stable)");
+		printf("\n");
+
+		/* Trend data count */
+		printf("  Trend Data:     %d points%s\n",
+		       data_points,
+		       data_points < 3 ? " (need 3+ for analysis)" : "");
+
+		/* Predictions */
+		if (data_points >= 3) {
+			int min_days = 9999;
+			const char *min_reason = NULL;
+			char pred_buf[512];
+			int pos = 0;
+
+			snprintf(pred_buf, sizeof(pred_buf), "  Predictions:");
+
+			if (re_slope > 0.01) {
+				int days = (int)((LHSRD_REALLOCATED_THRESH - re)
+						  / re_slope);
+				if (days < 0)
+					days = 0;
+				if (days < min_days) {
+					min_days = days;
+					min_reason = "reallocated sectors";
+				}
+				pos += snprintf(pred_buf + pos,
+						sizeof(pred_buf) - pos,
+						"\n    Reallocated threshold (%d) in ~%d days",
+						LHSRD_REALLOCATED_THRESH, days);
+			}
+			if (pe_slope > 0.01) {
+				int days = (int)((LHSRD_PENDING_THRESH - pe)
+						  / pe_slope);
+				if (days < 0)
+					days = 0;
+				if (days < min_days) {
+					min_days = days;
+					min_reason = "pending sectors";
+				}
+				pos += snprintf(pred_buf + pos,
+						sizeof(pred_buf) - pos,
+						"\n    Pending threshold (%d) in ~%d days",
+						LHSRD_PENDING_THRESH, days);
+			}
+			if (tmp_slope > 0.01) {
+				int days = (int)((LHSRD_TEMP_CRITICAL - temp)
+						  / tmp_slope);
+				if (days < 0)
+					days = 0;
+				if (days < min_days) {
+					min_days = days;
+					min_reason = "temperature";
+				}
+				pos += snprintf(pred_buf + pos,
+						sizeof(pred_buf) - pos,
+						"\n    Temperature critical (%d°C) in ~%d days",
+						LHSRD_TEMP_CRITICAL, days);
+			}
+
+			if (pos > 17) { /* more than "  Predictions:" */
+				printf("%s\n", pred_buf);
+				if (min_days <= 30)
+					printf("  *** Plan disk replacement within %d days (%s) ***\n",
+					       min_days, min_reason);
+				else if (min_days <= 90)
+					printf("  * Monitor closely — threshold in ~%d days (%s)\n",
+					       min_days, min_reason);
+				else
+					printf("  Threshold in ~%d days (%s) — routine monitoring\n",
+					       min_days, min_reason);
+			} else {
+				printf("  Predictions:    No concerning trends detected\n");
+			}
+		} else {
+			printf("  Predictions:    Insufficient data for trend analysis\n");
+		}
+
+		/* Warning count */
+		int warn_count = re_warn + pe_warn + un_warn + tmp_warn;
+		if (warn_count > 0) {
+			printf("  Active alerts:  %d trend warning(s)\n", warn_count);
+			if (health_score < 70)
+				printf("  *** DISK HEALTH CRITICAL — replace immediately ***\n");
+			else if (health_score < 90)
+				printf("  * Disk showing signs of degradation — plan replacement\n");
+		}
+
+		printf("\n");
+	}
+
+	if (!found_any)
+		printf("No trend data available.\n");
+
+	free(json);
 	return 0;
 }
 
@@ -396,6 +713,204 @@ static uint32_t crc32c_calc(uint8_t *buf, size_t len)
 		crc = (crc >> 8) ^ table[(crc ^ *buf++) & 0xFF];
 	return crc ^ 0xFFFFFFFF;
 }
+
+/* ------------------------------------------------------------------ */
+/*  JSON helpers for daemon communication                             */
+/* ------------------------------------------------------------------ */
+
+/* Read entire file into malloc'd buffer. Caller must free. */
+static char *read_file(const char *path)
+{
+	FILE *f = fopen(path, "r");
+	if (!f)
+		return NULL;
+
+	fseek(f, 0, SEEK_END);
+	long len = ftell(f);
+	fseek(f, 0, SEEK_SET);
+
+	if (len < 0) { fclose(f); return NULL; }
+
+	char *buf = malloc((size_t)len + 1);
+	if (!buf) { fclose(f); return NULL; }
+
+	size_t n = fread(buf, 1, len, f);
+	fclose(f);
+	buf[n] = '\0';
+	return buf;
+}
+
+/* Find json key in range [start, end) and extract int value. */
+static int json_int_in(const char *start, const char *end,
+		       const char *key, int *val)
+{
+	char search[64];
+	int klen = snprintf(search, sizeof(search), "\"%s\":", key);
+	const char *p = start;
+	while (p < end) {
+		const char *f = strstr(p, search);
+		if (!f || f >= end)
+			return -1;
+		const char *v = f + klen;
+		while (v < end && (*v == ' ' || *v == '\t'))
+			v++;
+		if (v < end && sscanf(v, "%d", val) == 1)
+			return 0;
+		p = f + 1;
+	}
+	return -1;
+}
+
+/* Find json key in range and extract string value (without quotes). */
+static int json_string_in(const char *start, const char *end,
+			  const char *key, char *buf, size_t sz)
+{
+	char search[64];
+	int klen = snprintf(search, sizeof(search), "\"%s\":", key);
+	const char *p = start;
+	while (p < end) {
+		const char *f = strstr(p, search);
+		if (!f || f >= end)
+			return -1;
+		const char *v = f + klen;
+		while (v < end && (*v == ' ' || *v == '\t'))
+			v++;
+		if (v >= end || *v != '"')
+			return -1;
+		v++; /* skip opening quote */
+		size_t i = 0;
+		while (v < end && *v != '"' && i < sz - 1)
+			buf[i++] = *v++;
+		buf[i] = '\0';
+		return 0;
+	}
+	return -1;
+}
+
+/* Find json key in range and extract double value. */
+static int json_double_in(const char *start, const char *end,
+			  const char *key, double *val)
+{
+	char search[64];
+	int klen = snprintf(search, sizeof(search), "\"%s\":", key);
+	const char *p = start;
+	while (p < end) {
+		const char *f = strstr(p, search);
+		if (!f || f >= end)
+			return -1;
+		const char *v = f + klen;
+		while (v < end && (*v == ' ' || *v == '\t'))
+			v++;
+		if (v < end && sscanf(v, "%lf", val) == 1)
+			return 0;
+		p = f + 1;
+	}
+	return -1;
+}
+
+/* Convenience wrappers that search the whole buffer. */
+static inline int json_int(const char *json, const char *key, int *val)
+{
+	return json_int_in(json, json + strlen(json), key, val);
+}
+static inline int json_string(const char *json, const char *key,
+			      char *buf, size_t sz)
+{
+	return json_string_in(json, json + strlen(json), key, buf, sz);
+}
+static inline int json_double(const char *json, const char *key, double *val)
+{
+	return json_double_in(json, json + strlen(json), key, val);
+}
+
+/* Find the next complete JSON object { ... } starting at or after pos.
+ * Returns pointer to '{' of the object, sets *end to after the '}'.
+ * Returns NULL if no object found. */
+static const char *next_object(const char *pos, const char **end)
+{
+	const char *start = strchr(pos, '{');
+	if (!start)
+		return NULL;
+
+	int depth = 1;
+	const char *p = start + 1;
+	while (*p && depth > 0) {
+		if (*p == '{') depth++;
+		if (*p == '}') depth--;
+		p++;
+	}
+	*end = p;
+	return start;
+}
+
+/* Format seconds as human-readable duration. */
+static void format_duration(long seconds, char *buf, size_t sz)
+{
+	int d = (int)(seconds / 86400);
+	int h = (int)((seconds % 86400) / 3600);
+	int m = (int)((seconds % 3600) / 60);
+	int s = (int)(seconds % 60);
+
+	if (d > 0)
+		snprintf(buf, sz, "%dd %dh %dm", d, h, m);
+	else if (h > 0)
+		snprintf(buf, sz, "%dh %dm", h, m);
+	else if (m > 0)
+		snprintf(buf, sz, "%dm %ds", m, s);
+	else
+		snprintf(buf, sz, "%ds", s);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Unix socket helpers for daemon control                            */
+/* ------------------------------------------------------------------ */
+
+/* Connect to daemon control socket. Returns fd, or -1 on error. */
+static int connect_control_socket(void)
+{
+	struct sockaddr_un addr;
+	int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, LHSRD_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* Send a command and receive response. Returns malloc'd string or NULL. */
+static char *control_query(const char *cmd)
+{
+	int fd = connect_control_socket();
+	if (fd < 0)
+		return NULL;
+
+	write(fd, cmd, strlen(cmd));
+
+	char *resp = malloc(65536);
+	if (!resp) {
+		close(fd);
+		return NULL;
+	}
+
+	ssize_t n = read(fd, resp, 65535);
+	close(fd);
+
+	if (n <= 0) {
+		free(resp);
+		return NULL;
+	}
+	resp[n] = '\0';
+	return resp;
+}
+
+/* ------------------------------------------------------------------ */
 
 /*
  * Read superblock from device at given sector offset.

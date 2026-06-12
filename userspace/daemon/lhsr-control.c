@@ -29,6 +29,7 @@
 #include "lhsrd.h"
 #include "lhsr-trend.h"
 #include "lhsr-control.h"
+#include "lhsr-health.h"
 #include "../../lib/raid_engine.h"
 
 /* Maximum JSON response size */
@@ -75,6 +76,8 @@ static char *json_disk(char *p, char *end, int idx, struct disk_health *d)
 		"      \"index\": %d,\n"
 		"      \"device\": \"%s\",\n"
 		"      \"health\": %d,\n"
+		"      \"health_score\": %d,\n"
+		"      \"health_label\": \"%s\",\n"
 		"      \"temperature\": %d,\n"
 		"      \"reallocated\": %d,\n"
 		"      \"pending\": %d,\n"
@@ -82,7 +85,9 @@ static char *json_disk(char *p, char *end, int idx, struct disk_health *d)
 		"      \"failed\": %d,\n"
 		"      \"trend_warning\": \"%s\"\n"
 		"    }",
-		idx, d->device_path, d->health, d->temperature,
+		idx, d->device_path, d->health, d->health_score,
+		lhsr_health_label(d->health_score),
+		d->temperature,
 		d->smart_reallocated, d->smart_pending,
 		d->smart_uncorrectable, d->failed, warn);
 	return p;
@@ -90,12 +95,20 @@ static char *json_disk(char *p, char *end, int idx, struct disk_health *d)
 
 /*
  * Build a JSON string for one trend entry.
+ * Includes current SMART values from dh for cross-referencing.
  */
-static char *json_trend(char *p, char *end, const char *device, struct lhsr_trend *t)
+static char *json_trend(char *p, char *end, const char *device,
+			struct lhsr_trend *t, struct disk_health *dh)
 {
 	p += snprintf(p, end - p,
 		"    {\n"
 		"      \"device\": \"%s\",\n"
+		"      \"health_score\": %d,\n"
+		"      \"health_label\": \"%s\",\n"
+		"      \"temperature\": %d,\n"
+		"      \"reallocated\": %d,\n"
+		"      \"pending\": %d,\n"
+		"      \"uncorrectable\": %d,\n"
 		"      \"data_points\": %d,\n"
 		"      \"reallocated_slope\": %.2f,\n"
 		"      \"pending_slope\": %.2f,\n"
@@ -107,6 +120,10 @@ static char *json_trend(char *p, char *end, const char *device, struct lhsr_tren
 		"      \"temperature_warn\": %d\n"
 		"    }",
 		device,
+		dh->health_score, lhsr_health_label(dh->health_score),
+		dh->temperature,
+		dh->smart_reallocated, dh->smart_pending,
+		dh->smart_uncorrectable,
 		t->data_points,
 		t->reallocated_slope,
 		t->pending_slope,
@@ -199,13 +216,17 @@ char *lhsr_control_build_trends(struct daemon_state *st)
 	int first = 1;
 	for (int i = 0; i < st->num_disks; i++) {
 		struct lhsr_trend trend;
-		if (lhsr_trend_query(st->disks[i].device_path, &trend) == 0) {
-			if (!first) {
-				p += snprintf(p, end - p, ",\n");
-			}
-			first = 0;
-			p = json_trend(p, end, st->disks[i].device_path, &trend);
+		/* Always emit an entry (even if no trend data) */
+		if (!first) {
+			p += snprintf(p, end - p, ",\n");
 		}
+		first = 0;
+		if (lhsr_trend_query(st->disks[i].device_path, &trend) < 0) {
+			/* No trend data yet — emit current values only */
+			memset(&trend, 0, sizeof(trend));
+		}
+		p = json_trend(p, end, st->disks[i].device_path, &trend,
+			       &st->disks[i]);
 	}
 
 	p += snprintf(p, end - p,
