@@ -6,6 +6,59 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [2.0.0] — 2026-06-11 — Phase 2: Write-Intent Bitmap (Incremental Rebuild)
+
+### Added
+- **Write-Intent Bitmap (WIB)**: Persistent on-disk bitmap tracking written chunks
+  (1MB granularity). Stored in superblock metadata area on each disk. On-disk format
+  reuses `struct lhsr_bitmap_page` (seq + CRC32c + bits) from write-hole journal.
+  New functions: `lhsr_wib_init/destroy/set/clear/test/clear_all/flush/load/write_page`
+  plus helpers `lhsr_wib_nbits/npages/page_sector` (~550 lines total).
+- **Superblock v2**: On-disk superblock bumped to version 2. `LHSR_META2_SECTORS`
+  macro for dynamic metadata reservation (base + WIB pages). v1 superblocks rejected
+  at assembly with clear error message.
+- **Incremental rebuild**: In `rebuild_work()`, RAID1 rebuild checks WIB and skips
+  clean chunks. Only dirty (written) regions are copied. RAID5/6 always reconstruct
+  from parity (conservative — WIB bits never cleared in RAID5/6 write path).
+- **WIB in write paths**: Both mirror and RAID5/6 write paths call `lhsr_wib_set()`
+  on every write to mark the affected chunk dirty.
+
+### Fixed
+- **CRC32c seed mismatch**: `lhsr_wib_load()` used `crc32c(~0, ...)` but write path
+  used `__crc32c_le(0, ...)` — different seeds produce different CRC values. Fixed
+  both to use `__crc32c_le(0, ...)` consistently.
+- **Cosmetic rebuild message**: "Rebuild complete: %llu sectors copied" changed to
+  "sectors processed" because `rebuild_verified` includes WIB-skipped regions, not
+  just actually copied sectors.
+
+### Verified
+- **RAID1 WIB rebuild test (VM, 2026-06-11)**: 2×100MB loopback devices, LHSR mirror.
+  1. Write dirty/clean/dirty pattern: 2MB at offset 0, skip 2MB, 1MB at offset 4MB
+  2. SHA256 baseline recorded: `003545fc...`
+  3. Fail disk 0 → array DEGRADED, reads failover to disk 1
+  4. Start rebuild → dmesg shows WIB-aware skip messages:
+     `"rebuild: skip sector X (clean WIB bit, already handled by live write)"`
+  5. Rebuild complete: status `OK 2/2 err=0 fail=0`
+  6. SHA256 verify: **PASS** — checksum matches baseline
+  7. Zero dmesg errors, warnings, call traces, or BUGs
+- **RAID5 smoke test (VM, 2026-06-11)**: 3×64MB loopback devices, 4MB write at 1MB
+  offset, SHA256 read-back verify **PASS**.
+
+### Changed
+- `ROADMAP.md`: Phase 2 marked ✅ COMPLETE. Timeline updated (Phase 2 took 2 days
+  vs estimated 2-3 weeks).
+- `PRODUCTION_READINESS.md`: Feature #7 (incremental rebuild) updated from
+  ❌ VAPORWARE to ✅ FUNCTIONAL. New Phase 2 testing section.
+- Version in module: `dm-lhsr.ko` now prints "1.4.0" on load (was 1.3.0 in Phase 0).
+
+### Documentation
+- `include/lhsr.h`: WIB constants (chunk size, page size, sectors per page, etc.)
+  and `LHSR_META2_SECTORS` macro documented.
+- `kernel/dm-lhsr/dm_lhsr.h`: WIB fields in `struct lhsr_array` documented with
+  locking rules.
+
+---
+
 ## [1.5.0] — 2026-06-08 — Phase 1: dm-integrity Stacking (Persistent Checksums)
 
 ### Added
@@ -213,10 +266,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 | Phase | Feature | Status |
 |-------|---------|--------|
-| 0 | Honest foundation | Phase 0 (current) |
-| 1 | Persistent checksums | Planned |
-| 2 | Incremental rebuild | Planned |
-| 3 | Daemon refactor | Planned |
+| 0 | Honest foundation | ✅ Complete |
+| 1 | Persistent checksums | ✅ Complete |
+| 2 | Incremental rebuild | ✅ Complete |
+| 3 | Daemon refactor | Up next |
 | 4 | Predictive failure | Planned |
 | 5 | Recovery tools | Planned |
 | 6 | SHR userspace | Not yet scoped |

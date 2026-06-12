@@ -56,10 +56,13 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/slab.h>
+#include <linux/mm.h>
 #include <linux/device-mapper.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
+#include <linux/crc32c.h>	/* crc32c() / __crc32c_le() */
 #include <linux/crc32.h>
+#include <linux/bitmap.h>
 #include <linux/ktime.h>
 #include <linux/spinlock.h>
 #include <linux/mutex.h>
@@ -86,6 +89,16 @@ static int lhsr_bitmap_load(struct lhsr_array *arr);
 static int lhsr_bitmap_recover(struct lhsr_array *arr);
 static int lhsr_bitmap_set(struct lhsr_array *arr, sector_t chunk_start);
 static int lhsr_bitmap_clear(struct lhsr_array *arr, sector_t chunk_start);
+
+/* Write-intent bitmap (WIB) functions */
+static int lhsr_wib_init(struct lhsr_array *arr);
+static void lhsr_wib_destroy(struct lhsr_array *arr);
+static int lhsr_wib_load(struct lhsr_array *arr);
+static int __maybe_unused lhsr_wib_flush(struct lhsr_array *arr);
+static void lhsr_wib_set(struct lhsr_array *arr, sector_t sector);
+static void lhsr_wib_clear(struct lhsr_array *arr, sector_t sector);
+static int lhsr_wib_test(struct lhsr_array *arr, sector_t sector);
+static void lhsr_wib_clear_all(struct lhsr_array *arr);
 
 /* RAID5/6 RMW synchronous worker */
 static void lhsr_rmw_worker(struct work_struct *work);
@@ -1451,7 +1464,7 @@ static void rebuild_work(struct work_struct *work)
 	}
 
 	if (arr->rebuild_disk >= arr->disks) {
-		DMINFO("Rebuild complete: %llu sectors copied", arr->rebuild_verified);
+		DMINFO("Rebuild complete: %llu sectors processed", arr->rebuild_verified);
 		arr->rebuild_state = LHSR_REBUILD_COMPLETE;
 		lhsr_update_disk_state(arr, arr->rebuild_disk, LHSR_DISK_HEALTHY);
 		lhsr_failed_disks_set(arr,
@@ -1488,7 +1501,7 @@ static void rebuild_work(struct work_struct *work)
 
 	/* Check if done */
 	if (offset >= arr->disk_sectors) {
-		DMINFO("Rebuild complete: %llu sectors copied", arr->rebuild_verified);
+		DMINFO("Rebuild complete: %llu sectors processed", arr->rebuild_verified);
 		arr->rebuild_state = LHSR_REBUILD_COMPLETE;
 		lhsr_update_disk_state(arr, arr->rebuild_disk, LHSR_DISK_HEALTHY);
 		lhsr_failed_disks_set(arr,
@@ -1501,6 +1514,29 @@ static void rebuild_work(struct work_struct *work)
 	/* Limit block size to not exceed device */
 	if (offset + (block_size >> SECTOR_SHIFT) > arr->disk_sectors)
 		block_size = (arr->disk_sectors - offset) << SECTOR_SHIFT;
+
+	/*
+	 * Check write-intent bitmap (WIB): skip this block if it was
+	 * never written to since last resync.  For RAID1, both mirrors
+	 * have identical data for unwritten regions, so no copy needed.
+	 *
+	 * For RAID5/6, every region needs reconstruction from parity
+	 * on dead-disk replacement.  The WIB check is conservative:
+	 * WIB bits are never cleared by writes in the RAID5/6 path,
+	 * so the check always falls through to reconstruction.
+	 *
+	 * If WIB is absent (v1 array or alloc failure), this check
+	 * always returns "needs copy" and we fall through.
+	 */
+	if (arr->wib_pages && arr->raid_type < LHSR_RAID5 &&
+	    !lhsr_wib_test(arr, offset)) {
+		DMDEBUG("rebuild: skip sector %llu (clean WIB bit, "
+			"already handled by live write)", (u64)offset);
+		arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
+		arr->rebuild_verified += (block_size >> SECTOR_SHIFT);
+		queue_delayed_work(arr->rebuild_wq, &arr->rebuild_work, HZ / 10);
+		return;
+	}
 
 	/*
 	 * RAID5/6: reconstruct stripe via XOR/GF from all non-failed disks.
@@ -1530,6 +1566,9 @@ static void rebuild_work(struct work_struct *work)
 		if (lhsr_bitmap_clear(arr, region_align))
 			DMWARN("rebuild: bitmap_clear failed at sector %llu",
 			       (u64)offset);
+
+		/* Mark block as processed in WIB (so rebuild doesn't redo it) */
+		lhsr_wib_clear(arr, offset);
 
 		arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
 		arr->rebuild_verified += (block_size >> SECTOR_SHIFT);
@@ -1646,6 +1685,9 @@ static void rebuild_work(struct work_struct *work)
 	if (ret != 0) {
 		DMERR("Rebuild write failed at offset 0x%llx",
 		      (u64)offset << SECTOR_SHIFT);
+	} else {
+		/* Clear WIB bit — block is now correct on target */
+		lhsr_wib_clear(arr, offset);
 	}
 
 	arr->rebuild_offset += (block_size >> SECTOR_SHIFT);
@@ -1698,6 +1740,16 @@ static int lhsr_rebuild_start(struct lhsr_array *arr, unsigned int disk_idx)
 			return -EINVAL;
 		}
 	}
+
+	/*
+	 * Initialize and load write-intent bitmap (WIB).
+	 * If WIB loads successfully, rebuild can skip clean regions
+	 * (never-written blocks).  If WIB is absent (v1 array or
+	 * alloc failure), fall through with conservative behavior
+	 * (always-copy).
+	 */
+	if (lhsr_wib_init(arr))
+		DMWARN("rebuild: WIB init failed, will do full copy");
 
 	arr->rebuild_state = LHSR_REBUILD_RUNNING;
 	arr->rebuild_disk = disk_idx;
@@ -1940,15 +1992,27 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			size = s;
 	}
 
-	/* Reserve space at end of device for bitmap + superblock metadata */
-	if (size > LHSR_META_SECTORS * 2) {
-		size -= LHSR_META_SECTORS;
-	} else {
-		DMERR("Device too small for metadata (%llu sectors, need %u)",
-		      (u64)size, LHSR_META_SECTORS);
-		ti->error = "Device too small";
-		r = -EINVAL;
-		goto bad;
+	/* Reserve space at end of device for metadata (write-hole bitmap +
+	 * superblock + write-intent bitmap).  WIB size depends on disk size,
+	 * so we estimate using the raw device size before subtraction. */
+	{
+		/* WIB sectors for this raw device size (rounded up to pages) */
+		unsigned int wib_sectors = max(1U,
+			((unsigned int)(size / LHSR_WIB_CHUNK_SECTORS) +
+			 LHSR_WIB_BITS_PER_PAGE - 1) /
+			LHSR_WIB_BITS_PER_PAGE) * LHSR_WIB_PAGE_SECTORS;
+		unsigned int meta_sectors = LHSR_META_BASE_SECTORS + wib_sectors;
+
+		if (size > meta_sectors * 2) {
+			size -= meta_sectors;
+		} else {
+			DMERR("Device too small for v2 metadata "
+			      "(%llu sectors, need %u)",
+			      (u64)size, meta_sectors);
+			ti->error = "Device too small";
+			r = -EINVAL;
+			goto bad;
+		}
 	}
 
 	if (size < 2048) {
@@ -2079,6 +2143,16 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	r = lhsr_bitmap_recover(arr);
 	if (r)
 		DMWARN("ctr: Bitmap recovery failed (%d), continuing", r);
+
+	/* Initialize write-intent bitmap (WIB) for incremental rebuild.
+	 * This allocates memory and tries to load from disk.
+	 * Failure is non-fatal — rebuild falls back to full copy. */
+	r = lhsr_wib_init(arr);
+	if (r) {
+		DMERR("ctr: Failed to initialize WIB (%d), rebuild will do full copy", r);
+		ti->error = "Failed to initialize WIB";
+		goto bad;
+	}
 
 	ti->private = arr;
 	ti->len = size;
@@ -2219,6 +2293,9 @@ static void lhsr_dtr(struct dm_target *ti)
 		arr->rebuild_wq = NULL;
 		DMINFO("dtr: Rebuild stopped");
 	}
+
+	/* Flush and free write-intent bitmap (WIB) */
+	lhsr_wib_destroy(arr);
 
 	/* Flush and free write-hole journal bitmap */
 	lhsr_bitmap_destroy(arr);
@@ -2863,6 +2940,453 @@ out:
 	return 0;  /* Non-fatal: data is safe even if some stripes skipped */
 }
 
+/* =====================================================================
+ * Write-intent bitmap (WIB) — persistent on-disk bitmap for incremental
+ * rebuild optimization.
+ *
+ * The WIB tracks which 1MB data regions have been written to since the
+ * last rebuild/resync.  On rebuild, regions whose WIB bit is CLEAR can
+ * be skipped because all surviving disks have identical data for those
+ * regions (they were never modified).
+ *
+ * Each bit covers LHSR_WIB_CHUNK_SECTORS (2048 sectors = 1MB) of data.
+ * The WIB is stored on disk per-device in the extended metadata area:
+ *   disk_offset + disk_sectors + LHSR_META_BASE_SECTORS + page_idx * 8
+ *
+ * Page format: struct lhsr_bitmap_page (seq + CRC32c + bits array).
+ * The same page format is shared with the write-hole journal for code
+ * reuse and consistent recovery on re-assembly.
+ *
+ * Bit semantics:
+ *   SET   = region was written to since last resync → needs copy on rebuild
+ *   CLEAR = region is clean (no writes) → safe to skip during rebuild
+ *
+ * On rebuild start, WIB is loaded from disk.  After rebuild completes,
+ * all bits are cleared.  During normal operation, writes set WIB bits
+ * which are periodically flushed to all disks.
+ *
+ * If WIB is absent (v1 array, alloc failure, or load failure), the
+ * rebuild falls back to conservative always-copy behavior.
+ * ===================================================================== */
+
+/* ---------------------------------------------------------------
+ * Sector offset of the p-th WIB page on disk @disk
+ * WIB lives in the extended metadata area after write-hole bitmap
+ * and superblock.
+ * --------------------------------------------------------------- */
+static inline sector_t lhsr_wib_page_sector(struct lhsr_array *arr,
+					    unsigned int page_idx,
+					    unsigned int disk)
+{
+	return arr->disk_offset[disk] + arr->disk_sectors
+		+ LHSR_META_BASE_SECTORS
+		+ (sector_t)page_idx * LHSR_WIB_PAGE_SECTORS;
+}
+
+/* ---------------------------------------------------------------
+ * Total number of WIB bits needed to cover the data area
+ * --------------------------------------------------------------- */
+static inline unsigned int lhsr_wib_nbits(struct lhsr_array *arr)
+{
+	return (unsigned int)(arr->disk_sectors / LHSR_WIB_CHUNK_SECTORS) + 1;
+}
+
+/* ---------------------------------------------------------------
+ * Number of pages needed for lhsr_wib_nbits() bits
+ * --------------------------------------------------------------- */
+static inline unsigned int lhsr_wib_npages(struct lhsr_array *arr)
+{
+	return max(1U, (lhsr_wib_nbits(arr) + LHSR_WIB_BITS_PER_PAGE - 1)
+		 / LHSR_WIB_BITS_PER_PAGE);
+}
+
+/* ---------------------------------------------------------------
+ * Write a dirty WIB page to all non-failed disks (sync write).
+ * Returns 0 on success (or partial failure), -EIO if ALL disks fail.
+ * --------------------------------------------------------------- */
+static int lhsr_wib_write_page(struct lhsr_array *arr, unsigned int page_idx)
+{
+	struct lhsr_bitmap_page *page_data;
+	unsigned int d;
+	int ret = 0, any_written = 0;
+
+	if (!arr->wib_pages || page_idx >= arr->wib_npages)
+		return -EINVAL;
+
+	page_data = (struct lhsr_bitmap_page *)kmap_local_page(
+		arr->wib_pages[page_idx]);
+
+	/* Fill in header: bump seq, compute CRC32c */
+	arr->wib_seqs[page_idx]++;
+	page_data->seq = arr->wib_seqs[page_idx];
+	page_data->crc32 = 0;
+	page_data->crc32 = __crc32c_le(0, (const unsigned char *)page_data, 4096);
+	kunmap_local(page_data);
+
+	/* Write to all non-failed disks */
+	for (d = 0; d < arr->disks; d++) {
+		blk_status_t st;
+		sector_t sector;
+
+		if (!arr->disk[d])
+			continue;
+		if (lhsr_failed_disks_get(arr) & (1 << d))
+			continue;
+
+		sector = lhsr_wib_page_sector(arr, page_idx, d);
+		st = lhsr_submit_bio_sync(arr->disk[d], arr->wib_pages[page_idx],
+					  4096, sector,
+					  REQ_OP_WRITE | REQ_SYNC);
+		if (st != BLK_STS_OK) {
+			DMERR("WIB: write page %u to disk %u failed", page_idx, d);
+			ret = -EIO;
+		} else {
+			any_written = 1;
+		}
+	}
+
+	/* Clear dirty flag regardless — if all disks failed, we'll retry
+	 * on next set/clear, but flagging it dirty forever is worse */
+	clear_bit(0, &arr->wib_flags[page_idx]);
+
+	return any_written ? 0 : (ret ? ret : -EIO);
+}
+
+/* ---------------------------------------------------------------
+ * Set the WIB bit for the 1MB region containing @sector.
+ * Marks the page dirty so it gets flushed to disk.
+ *
+ * Called from the write path: every write to user data sets the
+ * corresponding WIB bit to indicate this region needs re-replication
+ * during rebuild.
+ * --------------------------------------------------------------- */
+static void lhsr_wib_set(struct lhsr_array *arr, sector_t sector)
+{
+	unsigned int bit;
+	unsigned int page_idx;
+	unsigned int bit_in_page;
+	struct lhsr_bitmap_page *wib;
+
+	if (!arr->wib_pages)
+		return;
+
+	bit = (unsigned int)(sector / LHSR_WIB_CHUNK_SECTORS);
+	if (bit >= arr->wib_nbits)
+		return;
+
+	page_idx = bit / LHSR_WIB_BITS_PER_PAGE;
+	bit_in_page = bit % LHSR_WIB_BITS_PER_PAGE;
+
+	if (page_idx >= arr->wib_npages)
+		return;
+
+	wib = (struct lhsr_bitmap_page *)page_address(arr->wib_pages[page_idx]);
+	set_bit(bit_in_page, (unsigned long *)wib->bits);
+	/* Mark page dirty so it gets flushed to disk */
+	set_bit(0, &arr->wib_flags[page_idx]);
+}
+
+/* ---------------------------------------------------------------
+ * Clear the WIB bit for the 1MB region containing @sector.
+ * Marks the page dirty so the clear persists on disk.
+ *
+ * Called when a rebuild completes copying this region (or when the
+ * entire rebuild finishes and all bits are reset).
+ * --------------------------------------------------------------- */
+static void lhsr_wib_clear(struct lhsr_array *arr, sector_t sector)
+{
+	unsigned int bit;
+	unsigned int page_idx;
+	unsigned int bit_in_page;
+	struct lhsr_bitmap_page *wib;
+
+	if (!arr->wib_pages)
+		return;
+
+	bit = (unsigned int)(sector / LHSR_WIB_CHUNK_SECTORS);
+	if (bit >= arr->wib_nbits)
+		return;
+
+	page_idx = bit / LHSR_WIB_BITS_PER_PAGE;
+	bit_in_page = bit % LHSR_WIB_BITS_PER_PAGE;
+
+	if (page_idx >= arr->wib_npages)
+		return;
+
+	wib = (struct lhsr_bitmap_page *)page_address(arr->wib_pages[page_idx]);
+	clear_bit(bit_in_page, (unsigned long *)wib->bits);
+	set_bit(0, &arr->wib_flags[page_idx]);
+}
+
+/* ---------------------------------------------------------------
+ * Test the WIB bit for the 1MB region containing @sector.
+ * Returns 1 if bit is SET (region was written to, needs copy),
+ * 0 if CLEAR (clean region, can skip during rebuild).
+ * If WIB is absent, returns 1 (conservative: always copy).
+ * --------------------------------------------------------------- */
+static int lhsr_wib_test(struct lhsr_array *arr, sector_t sector)
+{
+	unsigned int bit;
+	unsigned int page_idx;
+	unsigned int bit_in_page;
+	struct lhsr_bitmap_page *wib;
+
+	if (!arr->wib_pages)
+		return 1;
+
+	bit = (unsigned int)(sector / LHSR_WIB_CHUNK_SECTORS);
+	if (bit >= arr->wib_nbits)
+		return 1;
+
+	page_idx = bit / LHSR_WIB_BITS_PER_PAGE;
+	bit_in_page = bit % LHSR_WIB_BITS_PER_PAGE;
+
+	if (page_idx >= arr->wib_npages)
+		return 1;
+
+	wib = (struct lhsr_bitmap_page *)page_address(arr->wib_pages[page_idx]);
+	return test_bit(bit_in_page, (unsigned long *)wib->bits) ? 1 : 0;
+}
+
+/* ---------------------------------------------------------------
+ * Clear ALL WIB bits (called after rebuild completes/resets).
+ * Marks all pages dirty so the clear persists on disk.
+ * --------------------------------------------------------------- */
+static void lhsr_wib_clear_all(struct lhsr_array *arr)
+{
+	unsigned int p;
+
+	if (!arr->wib_pages)
+		return;
+
+	for (p = 0; p < arr->wib_npages; p++) {
+		memset(page_address(arr->wib_pages[p]) +
+		       LHSR_BITMAP_HEADER_BYTES, 0,
+		       4096 - LHSR_BITMAP_HEADER_BYTES);
+		set_bit(0, &arr->wib_flags[p]);
+	}
+}
+
+/* ---------------------------------------------------------------
+ * Flush all dirty WIB pages to disk.
+ * Returns 0 if all writes succeeded, -EIO on any failure.
+ * --------------------------------------------------------------- */
+static int __maybe_unused lhsr_wib_flush(struct lhsr_array *arr)
+{
+	unsigned int p;
+	int ret = 0;
+
+	if (!arr->wib_pages)
+		return 0;
+
+	for (p = 0; p < arr->wib_npages; p++) {
+		if (test_bit(0, &arr->wib_flags[p])) {
+			int err = lhsr_wib_write_page(arr, p);
+			if (err)
+				ret = err;
+		}
+	}
+	return ret;
+}
+
+/* ---------------------------------------------------------------
+ * Allocate WIB pages and try to load from disk.
+ *
+ * If this is a fresh array (no on-disk WIB yet), zero-initialize
+ * all pages (all bits CLEAR = no dirty regions).
+ *
+ * If loading from disk succeeds, the on-disk state is restored.
+ * If loading fails, pages are zeroed and we proceed with clean WIB.
+ * Returns 0 on success, -ENOMEM on allocation failure.
+ * --------------------------------------------------------------- */
+static int lhsr_wib_init(struct lhsr_array *arr)
+{
+	unsigned int npages;
+	unsigned int p;
+
+	if (arr->wib_pages) {
+		/* Already initialized — just zero out bits for new rebuild cycle */
+		lhsr_wib_clear_all(arr);
+		DMINFO("WIB: re-initialized %u pages", arr->wib_npages);
+		return 0;
+	}
+
+	npages = lhsr_wib_npages(arr);
+
+	arr->wib_pages = kvzalloc(npages * sizeof(struct page *), GFP_KERNEL);
+	arr->wib_flags = kvzalloc(npages * sizeof(unsigned long), GFP_KERNEL);
+	arr->wib_seqs = kvzalloc(npages * sizeof(u64), GFP_KERNEL);
+
+	if (!arr->wib_pages || !arr->wib_flags || !arr->wib_seqs) {
+		DMERR("WIB: failed to allocate metadata arrays");
+		goto err_free;
+	}
+
+	for (p = 0; p < npages; p++) {
+		arr->wib_pages[p] = alloc_page(GFP_KERNEL);
+		if (!arr->wib_pages[p]) {
+			DMERR("WIB: failed to alloc page %u/%u", p, npages);
+			goto err_free;
+		}
+	}
+
+	arr->wib_npages = npages;
+	arr->wib_nbits = lhsr_wib_nbits(arr);
+
+	DMINFO("WIB: %u pages, %u bits for %llu sectors",
+	       npages, arr->wib_nbits, (u64)arr->disk_sectors);
+
+	/* Try to load from disk — if no on-disk WIB (new array or v1
+	 * conversion), zero-init is correct (all clean = no rebuild needed) */
+	if (lhsr_wib_load(arr) != 0) {
+		DMINFO("WIB: no on-disk state found, starting clean");
+		lhsr_wib_clear_all(arr);
+	}
+
+	return 0;
+
+err_free:
+	lhsr_wib_destroy(arr);
+	return -ENOMEM;
+}
+
+/* ---------------------------------------------------------------
+ * Load WIB from all disks — for each page, pick the copy with the
+ * highest valid sequence number (same approach as write-hole journal).
+ *
+ * Returns 0 on success (or partial load), negative on error.
+ * If no disk has valid WIB data (new array), returns -ENODATA.
+ * --------------------------------------------------------------- */
+static int lhsr_wib_load(struct lhsr_array *arr)
+{
+	unsigned int p;
+	int ret = -ENODATA;
+
+	if (!arr->wib_pages)
+		return -EINVAL;
+
+	for (p = 0; p < arr->wib_npages; p++) {
+		struct lhsr_bitmap_page *dst;
+		u64 best_seq = 0;
+		unsigned int best_disk = arr->disks;
+		bool any_valid = false;
+		unsigned int d;
+
+		dst = (struct lhsr_bitmap_page *)kmap_local_page(
+			arr->wib_pages[p]);
+
+		for (d = 0; d < arr->disks; d++) {
+			struct page *tmp_page;
+			struct lhsr_bitmap_page *tmp;
+			u32 expected_crc;
+			blk_status_t st;
+
+			if (!arr->disk[d])
+				continue;
+
+			tmp_page = alloc_page(GFP_KERNEL);
+			if (!tmp_page)
+				continue;
+
+			st = lhsr_submit_bio_sync(arr->disk[d], tmp_page,
+						  4096,
+						  lhsr_wib_page_sector(arr, p, d),
+						  REQ_OP_READ | REQ_SYNC);
+			if (st != BLK_STS_OK) {
+				__free_page(tmp_page);
+				continue;
+			}
+
+			tmp = (struct lhsr_bitmap_page *)kmap_local_page(tmp_page);
+
+			/* All zeros = uninitialized / never written */
+			if (tmp->seq == 0) {
+				kunmap_local(tmp);
+				__free_page(tmp_page);
+				continue;
+			}
+
+			/* Verify CRC32c — must match __crc32c_le(0, ...) used in write */
+			expected_crc = tmp->crc32;
+			tmp->crc32 = 0;
+			if (__crc32c_le(0, (const unsigned char *)tmp, 4096) != expected_crc) {
+				DMWARN("WIB: page %u disk %u: CRC mismatch", p, d);
+				kunmap_local(tmp);
+				__free_page(tmp_page);
+				continue;
+			}
+
+			if (tmp->seq > best_seq) {
+				best_seq = tmp->seq;
+				best_disk = d;
+			}
+
+			any_valid = true;
+			kunmap_local(tmp);
+			__free_page(tmp_page);
+		}
+
+		if (any_valid && best_disk < arr->disks) {
+			/* Re-read the best copy into our page */
+			blk_status_t st;
+
+			st = lhsr_submit_bio_sync(arr->disk[best_disk],
+						  arr->wib_pages[p],
+						  4096,
+						  lhsr_wib_page_sector(arr, p, best_disk),
+						  REQ_OP_READ | REQ_SYNC);
+			if (st == BLK_STS_OK) {
+				arr->wib_seqs[p] = best_seq;
+				clear_bit(0, &arr->wib_flags[p]);
+				DMDEBUG("WIB: page %u loaded from disk %u seq %llu",
+					p, best_disk, (u64)best_seq);
+				ret = 0;
+			}
+		} else {
+			/* No valid copy — zero this page */
+			memset(dst, 0, 4096);
+			arr->wib_seqs[p] = 0;
+			clear_bit(0, &arr->wib_flags[p]);
+		}
+
+		kunmap_local(dst);
+	}
+
+	return ret;
+}
+
+/* ---------------------------------------------------------------
+ * Destroy WIB: flush dirty pages to disk, then free all memory.
+ * --------------------------------------------------------------- */
+static void lhsr_wib_destroy(struct lhsr_array *arr)
+{
+	unsigned int p;
+
+	if (!arr->wib_pages)
+		goto out_free_meta;
+
+	/* Flush dirty pages before freeing */
+	for (p = 0; p < arr->wib_npages; p++) {
+		if (arr->wib_pages[p]) {
+			if (test_bit(0, &arr->wib_flags[p]))
+				lhsr_wib_write_page(arr, p);
+			__free_page(arr->wib_pages[p]);
+		}
+	}
+
+	kvfree(arr->wib_pages);
+
+out_free_meta:
+	kvfree(arr->wib_flags);
+	kvfree(arr->wib_seqs);
+
+	arr->wib_pages = NULL;
+	arr->wib_flags = NULL;
+	arr->wib_seqs = NULL;
+	arr->wib_npages = 0;
+	arr->wib_nbits = 0;
+}
+
 /* Synchronous RMW worker — executes on ordered rmw_wq (one at a time) */
 static void lhsr_rmw_worker(struct work_struct *work)
 {
@@ -3344,6 +3868,14 @@ passthrough_single:
 				bio->bi_status = mctx->status ? mctx->status : BLK_STS_RESOURCE;
 				bio_endio(bio);
 				kfree(mctx);
+			} else {
+				/*
+				 * Mark this region in the write-intent bitmap (WIB)
+				 * so rebuild knows it was touched and needs to be
+				 * re-replicated if a disk fails.
+				 */
+				if (arr->wib_pages)
+					lhsr_wib_set(arr, offset);
 			}
 			}
 
@@ -3405,6 +3937,10 @@ passthrough_single:
 			rmw->chunk_start = chunk_start;
 			rmw->chunk_bytes = chunk_bytes;
 			rmw->offset_in_chunk = (unsigned int)(offset % chunk_sects);
+
+			/* Mark this region in WIB so rebuild knows it was touched */
+			if (arr->wib_pages)
+				lhsr_wib_set(arr, offset);
 
 			INIT_WORK(&rmw->work, lhsr_rmw_worker);
 			queue_work(arr->rmw_wq, &rmw->work);

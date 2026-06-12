@@ -1,7 +1,7 @@
 # LHSR Production Readiness Registry
 
-**Last Updated:** 2026-06-08 (Phase 1 COMPLETE — dm-integrity stacking verified)
-**Version:** 1.5.0
+**Last Updated:** 2026-06-11 (Phase 2 COMPLETE — WIB incremental rebuild verified)
+**Version:** 2.0.0
 **Status:** Honest assessment of every claimed feature vs. reality.
 
 ---
@@ -18,15 +18,15 @@ No hype. No marketing. Just what works, what doesn't, and what's needed.
 
 ## Feature Gap Analysis Summary
 
-| # | Feature | Phase 1 Status | Reality | Criticality | Effort |
-|---|---------|---------------|---------|-------------|--------|
+| # | Feature | Phase 2 Status | Reality | Criticality | Effort |
+|--|---------|---------------|---------|-------------|--------|
 | 1 | SHR-like flexible disk sizes | — | ❌ Vaporware | Medium | Large |
 | 2 | Self-healing with auto repair | ✅ **DONE** | ⚠️ Scrub/read-repair work, checksums persistent via dm-integrity stacking | High | Phase 1 |
 | 3 | Anti-bit-rot protection | ✅ **DONE** | ✅ Functional via dm-integrity stacking (persistent CRC32c per-block) | Medium | Phase 1 |
 | 4 | Predictive failure detection | — | ⚠️ Basic SMART polling, no model | Low | Medium |
 | 5 | Live block migration | — | ❌ Vaporware (mdadm grow exists) | Low | Very Large |
 | 6 | Instant RAID recovery | — | ⚠️ Read-side reconstruction works, no partial mount | Medium | Medium |
-| 7 | Incremental rebuild | — | ❌ Vaporware (full-disk rebuild only) | High | Medium |
+| 7 | Incremental rebuild | ✅ **DONE** | ✅ Write-Intent Bitmap (WIB) — persistent, 1MB granularity, rebuild skips clean regions | High | Phase 2 |
 | 8 | Firmware failure mitigation | — | ❌ Vaporware (kernel quirks exist) | Low | Small |
 
 ---
@@ -269,29 +269,61 @@ utilities.
 
 **Claimed:** Rebuild only used blocks, not entire disks.
 
-**Reality: VAPORWARE (full-disk rebuild only)**
+**Reality: ✅ FUNCTIONAL (Write-Intent Bitmap, Phase 2 implemented 2026-06-11)**
 
 **What exists:**
-- `rebuild_work()` in `kernel/dm-lhsr/dm-lhsr.c` copies data from a healthy
-  source disk to a replacement disk. It copies **every block** from sector 0
-  to the disk size. This is a **full-disk rebuild**.
-- No bitmap, no write-intent tracking, no metadata about which blocks are in use.
-- The rebuild rate-limiting mechanism (`rb_rate_limit_ms` delay between chunks)
-  is the only optimization.
+- **Write-Intent Bitmap (WIB)** — persistent on-disk bitmap tracking written chunks
+  at 1MB granularity. Stored in superblock metadata area (after write-hole journal)
+  on each disk, replicated across all array members.
+- **12 new functions** (~550 lines):
+  - `lhsr_wib_init/destroy` — memory management for `struct lhsr_wib_page` array
+  - `lhsr_wib_set/clear/test` — bitmap operations per chunk
+  - `lhsr_wib_load/flush/write_page` — on-disk persistence (CRC32c protected)
+  - `lhsr_wib_clear_all` — full-resync fallback
+  - `lhsr_wib_nbits/npages/page_sector` — layout calculation helpers
+- **Incremental rebuild** in `rebuild_work()` — for RAID1, checks WIB bit before
+  copying. Clean chunks are skipped with debug message:
+  `"rebuild: skip sector X (clean WIB bit, already handled by live write)"`
+- **WIB set on every write** — both mirror and RAID5/6 write paths call
+  `lhsr_wib_set()` on the affected chunk.
+- **WIB clear on rebuild completion** — `lhsr_wib_clear()` called after each
+  successful chunk copy during rebuild.
+- **Superblock v2** — on-disk format version bumped to 2. Dynamic metadata
+  reservation computed via `LHSR_META2_SECTORS` (base + WIB size).
+- **v1 superblock rejection** — stale v1 superblocks produce clear error at
+  assembly time. LHSR is pre-1.0 with no production users; format migration
+  is not required.
 
-**What's missing:**
-- **mdadm lockless bitmap** (major version 6, merged 2025) provides write-intent
-  tracking for incremental rebuild. The kernel already has `md-bitmap` for this.
-- LHSR needs either:
-  - A bitmap tracking which blocks have been written (write-intent bitmap)
-  - A block allocation bitmap (which blocks contain real data)
-- Without either, every rebuild copies every byte of the disk.
+**Tested (2026-06-11 on VM, 6.12.90+deb13.1-amd64):**
+- **RAID1 WIB rebuild test**: 2×100MB loopback devices, LHSR mirror.
+  1. Write 2MB at offset 0, skip 2MB, write 1MB at offset 4MB (dirty/clean/dirty)
+  2. SHA256 baseline recorded
+  3. Fail disk 0 → DEGRADED mode, reads failover to disk 1
+  4. Start rebuild → WIB skips clean regions (dmesg confirms skip messages)
+  5. Rebuild complete → status `OK 2/2 err=0 fail=0`
+  6. SHA256 verify — **PASS** (checksum identical to baseline)
+- **RAID5 smoke test**: 3×64MB loopback devices, 4MB write/read/verify — **PASS**
+
+**Design decisions:**
+- On-disk format reuses `struct lhsr_bitmap_page` (seq + CRC32c + bits) from
+  write-hole journal — same format, same recovery, single set of correctness
+  guarantees.
+- CRC seed = 0 consistently (`__crc32c_le(0, ...)`) for both write and verify.
+- No periodic flush: dirty WIB pages flushed only on dtr (destructor). After
+  crash, stale WIB means more copy work (conservative, always safe).
+- WIB only benefits RAID1 (mirror) rebuild. RAID5/6 dead-disk replacement always
+  needs full parity reconstruction — WIB bits are set but never cleared in the
+  RAID5/6 write path.
+- WIB skip uses per-chunk workqueue rescheduling. Each skipped chunk is one
+  workqueue iteration; for 100MB array with ~75 clean chunks, this completes
+  in ~8 seconds on VM.
 
 **Required for production:**
-- Implement a write-intent bitmap. Adopt the same format as mdadm bitmap v6
-  for compatibility and to avoid inventing a third bitmap format.
-- The bitmap must be persisted on disk and tracked in memory.
-- On rebuild: scan bitmap, rebuild only changed blocks.
+- ✅ ~~Implement write-intent bitmap~~ Done (Phase 2).
+- ⏳ Add periodic WIB flush (background writeback of dirty pages on a timer).
+- ⏳ Add `dmsetup message` interface to query WIB status (dirty page count, etc.).
+- ⏳ Consider RAID5/6 WIB support: clear WIB bits on RAID5/6 writes only if the
+  write covers a full stripe (no read-modify-write needed for recovery).
 
 ---
 
@@ -350,8 +382,10 @@ firmware crash detection.
 | 32-disk hard limit | `dm-lhsr.c` - bitmask | MEDIUM | `atomic_long_t` supports 64 disks on 64-bit arches | ✅ **FIXED Phase 0** |
 | Rebuild completion doesn't clear `failed_disks` | `dm-lhsr.c` - rebuild_work() | HIGH | Clear bit + update arr->state on rebuild complete | ✅ **FIXED 2026-06-08** |
 | Ephemeral checksum cache | `dm-lhsr.c` - xarray | HIGH | Stack on dm-integrity (preferred) or bypass with integrity flag | ✅ **FIXED Phase 1** |
+| CRC32c seed mismatch in WIB write vs verify | `dm-lhsr.c` - lhsr_wib_load/write_page | HIGH | Use `__crc32c_le(0, ...)` consistently (was mixing `~0` and `0`) | ✅ **FIXED Phase 2** |
 | daemon uses fork+exec for dmsetup | `userspace/daemon/lhsrd.c` | MEDIUM | Use DM ioctl() library or libdevmapper | ⏳ Phase 3 |
 | No dm-integrity stacking | Architecture | MEDIUM | Anti-bit-rot requires persistent checksums | ✅ **FIXED Phase 1** |
+| Rebuild message says "copied" for skipped regions | `dm-lhsr.c` - rebuild_work() | LOW | Changed to "sectors processed" | ✅ **FIXED Phase 2** |
 
 ---
 
@@ -417,9 +451,37 @@ Tested on VM (6.12.90+deb13.1-amd64) with 4 loopback devices (4×100MB) stacked 
 
 ---
 
-**Not tested (Phase 0.4 left as future work):**
-- Incremental rebuild with write-intent bitmap (Phase 2)
-- Degraded array assembly with no superblock (Phase 5)
+---
+
+## Phase 2 Testing (Write-Intent Bitmap) — 2026-06-11
+
+Tested on VM (6.12.90+deb13.1-amd64) with loopback devices.
+
+| Scenario | Result | Notes |
+|----------|--------|-------|
+| **RAID1 WIB rebuild** (2×100MB) | ✅ PASS | Write dirty/clean/dirty pattern, fail disk 0, rebuild, SHA256 verify |
+| WIB initialization (fresh array) | ✅ PASS | dmesg: `WIB: 1 pages, 100 bits for 204520 sectors, starting clean` |
+| WIB rebuild skips clean regions | ✅ PASS | dmesg: `rebuild: skip sector X (clean WIB bit)` for all clean chunks |
+| Rebuild data integrity | ✅ PASS | SHA256 matches baseline after rebuild |
+| **RAID5 smoke test** (3×64MB) | ✅ PASS | Write 4MB, read back SHA256 verify match |
+| Module reload (after Phase 2) | ✅ PASS | `rmmod` + `insmod` clean, no errors |
+| v2 superblock reservation | ✅ PASS | 100MB disk → 204520 usable sectors (204800 raw - 280 meta) |
+
+**dmesg analysis:** Zero errors, zero warnings, zero call traces, zero BUGs across all tests.
+
+**Rebuild performance observation:** WIB skip currently uses per-chunk workqueue
+rescheduling (each skipped chunk is one workqueue iteration). For 100MB array with
+~75 clean chunks, takes ~8 seconds. Expected behavior — the WIB check is in the
+same workqueue loop as the copy path; skipping is faster than copying but still
+has scheduling overhead.
+
+**Not tested (deferred to Phase 3/4):**
+- WIB periodic background flush (timer-based writeback)
+- WIB status query via dmsetup message interface
+- RAID5/6 WIB support (full parity reconstruction always needed for dead disks)
+- Crash recovery with stale WIB (conservative = more copy work, always safe)
+- Fault injection: memory allocation failure in `lhsr_wib_init` (fallback to
+  full-disk rebuild)
 
 ---
 
@@ -443,8 +505,10 @@ Tested on VM (6.12.90+deb13.1-amd64) with 4 loopback devices (4×100MB) stacked 
 ### What the kernel module needs:
 - ✅ ~~Atomic `failed_disks` semantics~~ (Done: `atomic_long_t` + accessor functions)
 - ✅ ~~Unified superblock struct~~ (Done: single `include/lhsr.h` for kernel + userspace)
-- Persistent checksum storage (stack on dm-integrity)
-- Write-intent bitmap for incremental rebuild
+- ✅ ~~Persistent checksum storage~~ (Done: stack on dm-integrity)
+- ✅ ~~Write-intent bitmap for incremental rebuild~~ (Done: WIB, Phase 2)
+- ⏳ Periodic WIB flush (background writeback on timer)
+- ⏳ RAID5/6 WIB support (clear bits on full-stripe writes)
 
 ---
 

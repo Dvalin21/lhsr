@@ -29,8 +29,10 @@
 /* Workqueue timeout in jiffies (5 seconds) */
 #define LHSR_WORKQUEUE_TIMEOUT (5 * HZ)
 
-/* Scrubber block size (128 KB) */
-#define LHSR_SCRUB_BLOCK_SIZE (128 * 1024)
+/* Scrubber block size (128 KB = 2^17 bytes = 256 sectors) */
+#define LHSR_SCRUB_BLOCK_SIZE      (128 * 1024)
+#define LHSR_SCRUB_BLOCK_SIZE_BITS 17		/* log2 of block size in bytes */
+#define LHSR_SCRUB_BLOCK_SECTORS   (LHSR_SCRUB_BLOCK_SIZE >> SECTOR_SHIFT)
 
 /* Write-hole journal — dirty stripe bitmap page (on-disk format) */
 struct lhsr_bitmap_page {
@@ -130,6 +132,23 @@ struct lhsr_array {
 	unsigned long bitmap_flags[LHSR_BITMAP_PAGES];	/* Bit 0 = dirty */
 	u64 bitmap_seqs[LHSR_BITMAP_PAGES];		/* Current seq per page */
 	atomic_t bitmap_recovering;			/* 1 = recovery in progress */
+
+	/* Write-intent bitmap (WIB) — persistent on-disk bitmap for
+	 * incremental rebuild.  Tracks which 1MB regions were written to
+	 * since last rebuild/resync.  On rebuild, regions whose WIB bit
+	 * is CLEAR can be skipped (all surviving disks have identical data).
+	 *
+	 * Allocated in constructor; freed in lhsr_dtr().
+	 * Stored on disk in extended metadata area (v2 superblock format).
+	 * Pages use same seq+CRC32c format as write-hole journal.
+	 *
+	 * See include/lhsr.h for on-disk layout and constants.
+	 */
+	struct page **wib_pages;			/* Array of page ptrs, NULL when absent */
+	unsigned long *wib_flags;			/* Per-page flag bits (bit 0 = dirty) */
+	u64 *wib_seqs;					/* Per-page sequence numbers */
+	unsigned int wib_npages;			/* Number of allocated pages */
+	unsigned int wib_nbits;				/* Total number of valid bits */
 };
 
 /* Accessor helpers for failed_disks bitmask (concurrent hot-path field) */
