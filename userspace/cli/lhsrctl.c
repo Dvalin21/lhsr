@@ -1085,88 +1085,8 @@ static const char *raid_type_table_name(unsigned int t)
 	}
 }
 
-/*
- * Create a sparse file + loop device as placeholder for a missing disk.
- * Returns the loop device path (caller must free).
- */
-static char *create_missing_placeholder(unsigned int disk_idx,
-					uint64_t total_sectors,
-					const char *array_uuid_str)
-{
-	char path[256];
-	char loop_dev[64];
-	char cmd[1024];
-	char *result = NULL;
-	int ret;
-
-	snprintf(path, sizeof(path), "/tmp/lhsr_missing_%s_disk%u.img",
-		 array_uuid_str, disk_idx);
-
-	/* Create sparse file of the right size */
-	snprintf(cmd, sizeof(cmd),
-		 "dd if=/dev/zero of='%s' bs=512 count=0 seek=%" PRIu64 " 2>/dev/null",
-		 path, total_sectors);
-	ret = system(cmd);
-	if (ret != 0) {
-		fprintf(stderr, "  Warning: Failed to create placeholder %s\n", path);
-		return NULL;
-	}
-
-	/* Set up loop device */
-	snprintf(cmd, sizeof(cmd),
-		 "losetup -f --show '%s'", path);
-	/* Use pipe + popen as this is safe (no shell injection: path is controlled) */
-	FILE *fp = popen(cmd, "r");
-	if (!fp) {
-		fprintf(stderr, "  Warning: Failed to create loop device for %s\n", path);
-		unlink(path);
-		return NULL;
-	}
-	if (fgets(loop_dev, sizeof(loop_dev), fp)) {
-		/* Strip newline */
-		size_t len = strlen(loop_dev);
-		if (len > 0 && loop_dev[len - 1] == '\n')
-			loop_dev[len - 1] = '\0';
-		result = strdup(loop_dev);
-	}
-	pclose(fp);
-
-	if (result)
-		printf("  Created placeholder loop device: %s -> %s\n", result, path);
-	else
-		unlink(path);
-
-	return result;
-}
-
-/* Helpers for tracking placeholders we created (so we can clean up) */
-#define MAX_PLACEHOLDERS 32
-static struct {
-	char *loop_dev;
-	char *backing_file;
-} placeholders[MAX_PLACEHOLDERS];
-static int placeholder_count = 0;
-
-static void cleanup_placeholders(void)
-{
-	int i;
-	char cmd[1024];
-
-	for (i = 0; i < placeholder_count; i++) {
-		if (placeholders[i].loop_dev) {
-			/* Detach loop device */
-			snprintf(cmd, sizeof(cmd), "losetup -d '%s' 2>/dev/null",
-				 placeholders[i].loop_dev);
-			system(cmd);
-			free(placeholders[i].loop_dev);
-		}
-		if (placeholders[i].backing_file) {
-			unlink(placeholders[i].backing_file);
-			free(placeholders[i].backing_file);
-		}
-	}
-	placeholder_count = 0;
-}
+/* Placeholder path for missing disks (reads zeros, discards writes) */
+#define MISSING_DISK_PLACEHOLDER  "/dev/zero"
 
 /* Command recover */
 static int cmd_recover(int argc, char **argv)
@@ -1197,9 +1117,6 @@ static int cmd_recover(int argc, char **argv)
 		fprintf(stderr, "Error: Out of memory\n");
 		return 1;
 	}
-
-	/* Register cleanup on exit */
-	atexit(cleanup_placeholders);
 
 	/* Phase 1: Scan all provided devices */
 	printf("Scanning %d device(s)...\n\n", dev_count);
@@ -1286,7 +1203,6 @@ static int cmd_recover(int argc, char **argv)
 		unsigned int parity = (arr->raid_type == LHSR_RAID5) ? 1 :
 				     (arr->raid_type == LHSR_RAID6) ? 2 : 0;
 		unsigned int min_healthy = arr->disk_count - parity;
-		unsigned int healthy = 0;
 		unsigned int present = 0;
 		unsigned int online = 0;
 		char uuid_str[32];
@@ -1316,12 +1232,10 @@ static int cmd_recover(int argc, char **argv)
 				if (arr->disk_online[d])
 					online++;
 			}
-			if (arr->disk_present[d] && arr->disk_online[d])
-				healthy++;
 		}
 
 		printf("  Disks present: %u/%u\n", present, arr->disk_count);
-		printf("  Disks healthy: %u/%u\n", healthy, arr->disk_count);
+		printf("  Disks healthy: %u/%u\n", online, arr->disk_count);
 
 		if (present < min_healthy) {
 			printf("\n  ERROR: Insufficient healthy disks for assembly.\n");
@@ -1356,9 +1270,14 @@ static int cmd_recover(int argc, char **argv)
 		 * Table format:
 		 *  0 <size> lhsr <type> <dev1> <offset1> <dev2> <offset2> ...
 		 *
-		 * For missing disks: create a sparse loop device placeholder.
-		 * The kernel module detects these via superblock disk_state.
+		 * For missing disks: use /dev/zero as a placeholder.
+		 * /dev/zero reads return zeros, writes are discarded.
+		 * Replace the /dev/zero entry with a real device when
+		 * the replacement disk is connected, then use:
+		 *   dmsetup load <name> --table '<new_table_line>'
+		 *   dmsetup resume <name>
 		 */
+
 		printf("\n  Assembly command:\n");
 
 		/* Build the full table line */
@@ -1387,26 +1306,7 @@ static int cmd_recover(int argc, char **argv)
 			if (arr->disk_present[d]) {
 				dev_path = arr->disks[d].path;
 			} else {
-				/* Create a placeholder loop device */
-				char *loop = create_missing_placeholder(
-					d, arr->total_sectors, uuid_str);
-				if (loop) {
-					dev_path = loop;
-					if (placeholder_count < MAX_PLACEHOLDERS) {
-						char backing[256];
-						snprintf(backing, sizeof(backing),
-							 "/tmp/lhsr_missing_%s_disk%u.img",
-							 uuid_str, d);
-						placeholders[placeholder_count].loop_dev = strdup(loop);
-						placeholders[placeholder_count].backing_file = strdup(backing);
-						placeholder_count++;
-					}
-				} else {
-					fprintf(stderr, "  ERROR: Cannot create placeholder for missing disk %d\n", d);
-					free(scanned);
-					cleanup_placeholders();
-					return 1;
-				}
+				dev_path = MISSING_DISK_PLACEHOLDER;
 			}
 
 			n = snprintf(table_line + pos, table_len - pos,
@@ -1416,7 +1316,6 @@ static int cmd_recover(int argc, char **argv)
 			if (pos >= table_len - 1) {
 				fprintf(stderr, "  ERROR: Table line too long\n");
 				free(scanned);
-				cleanup_placeholders();
 				return 1;
 			}
 		}
