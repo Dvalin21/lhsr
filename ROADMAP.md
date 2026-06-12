@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-12 (Phase 4 COMPLETE — Predictive failure health score, lhsrctl status/predict, Prometheus metrics)
+**Last Updated:** 2026-06-12 (Phase 4 COMPLETE — bug fix + test, Phase 5 IN PROGRESS)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -327,6 +327,17 @@ Disk: /dev/sdb
 | `userspace/daemon/Makefile` | MODIFIED | +1 |
 | `userspace/cli/lhsrctl.c` | MODIFIED | +400 |
 
+### Bugs fixed during testing
+- **Slow shutdown blocked on pthread_join()**: Monitor and health threads slept for 60-300s after `running=0` was set. `pthread_join()` in main thread blocked for the full interval. Fixed with `pthread_cancel()` before each `pthread_join()`, plus `pthread_cleanup_push/pop` handlers to safely release the mutex if a thread is cancelled while holding the lock. Shutdown now completes in ~40ms. (`lhsrd.c` +14/-2)
+
+### Test coverage
+- ✅ Integrated end-to-end tests on VM (`lhsr-dev`, 6.12.90+deb13.1-amd64):
+  - Daemon start, JSON status file (15s cycle), control socket ping/pong
+  - `lhsrctl status` (reads JSON), `lhsrctl predict` (socket query)
+  - Prometheus metrics at `/var/lib/lhsrd/metrics.prom`
+  - Clean shutdown (37-59ms) with PID file and socket cleanup
+- ✅ Unit test for health score computation: `make test-health` (31/31 boundary cases across all penalty types, combined scenarios, and label thresholds)
+
 ### Deliverables
 - ✅ Composite health score (0-100) with weighted penalties
 - ✅ `lhsrctl status` reads daemon JSON status file, displays formatted output
@@ -336,33 +347,47 @@ Disk: /dev/sdb
 - ✅ Control socket trend response includes current values for cross-referencing
 - ✅ Zero new compiler warnings on any target
 - ✅ All targets build clean: kernel module, daemon, CLI, recovery tool
+- ✅ Shutdown bug found and fixed (pthread_cancel + cleanup handlers)
+- ✅ Health score unit test (31/31 passing)
 
 ---
 
-## Phase 5: Instant Recovery Tools (2 weeks)
+## Phase 5: Recovery Tools — IN PROGRESS (2026-06-12)
 
-### 5.1 Degraded array assembly
-- Allow `dmsetup create` with fewer disks than required for full redundancy
-- Missing disks are reconstructed on-the-fly from parity/mirror
-- Read-only mount in degraded mode
+**Duration:** Estimated 2 weeks
 
-### 5.2 Metadata reconstruction
-- If primary superblock is corrupt, try backup superblock
-- If both are corrupt, scan all disks for valid metadata and reconstruct
-- Write reconstructed superblock to all disks
+**What changed:** Userspace recovery tools to find, assemble, and recover LHSR arrays after disk failure.
 
-### 5.3 Scan and recover
-- `lhsr scan --deep`: Scan all connected disks for LHSR superblocks
-  and display possible array configurations
-- `lhsr recover`: Assemble the most complete array possible from available disks
-- `lhsr reconstruct`: Given N-1 disks, reconstruct data for the missing disk
-  (RAID5/6 only)
+### Implementation plan
+
+#### 5.1 Enhanced superblock scan (`lhsr-scan --deep`)
+- Scan ALL metadata sectors (not just primary/backup positions) for LHSR_MAGIC
+- Auto-detect block devices from `/dev/sd*` and `/dev/disk/by-id/`
+- JSON output format for machine parsing (in addition to human-readable)
+- Detect corruption patterns: checksum mismatch, stale generations, orphaned superblocks
+
+#### 5.2 Array assembly recovery (`lhsrctl recover`)
+- Integrate with libdevmapper (`lhsr_dm_create()` from daemon library)
+- Given N disks, determine best array configuration from superblock metadata
+- Generate and execute `dmsetup create` command
+- Support degraded mode (missing disks) via kernel module changes
+
+#### 5.3 `lhsrctl reconstruct` command
+- Reconstruct data for replacement disk from N-1 surviving disks (RAID5/6)
+- Write reconstructed data + superblock to new disk
+- Hot-add to existing array
+
+#### 5.4 Kernel: degraded assembly support
+- Allow `dmsetup create` with fewer disks than `disk_count`
+- Missing disks: read returns zeros, writes discarded
+- Array marked degraded-read-only until fully populated
 
 ### Deliverables
-- Degraded mount (read-only)
-- Metadata reconstruction from backup superblock
-- Deep scan tool
-- Recovery guide updated with new capabilities
+- Deep scan tool with JSON output
+- Recovery assembly command
+- Data reconstruction for replacement disks
+- Degraded kernel assembly (read-only)
+- Updated recovery procedure documentation
 
 ---
 

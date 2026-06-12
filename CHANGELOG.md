@@ -54,15 +54,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   `control_query`), file reader, and duration formatter. `cmd_status()` and
   `cmd_predict()` replaced with real implementations.
 
+### Fixed
+- **Slow daemon shutdown blocked on pthread_join()**: Monitor thread (60s sleep)
+  and health monitor thread (300s sleep) would block shutdown for the full
+  interval after SIGTERM because `pthread_join()` waited for the sleeping thread.
+  Fixed: `pthread_cancel()` before each `pthread_join()`, plus `pthread_cleanup_push/pop`
+  handlers to safely release mutex if thread is cancelled while holding the lock.
+  Shutdown now completes in 37-59ms instead of up to 300s. (`lhsrd.c` +14/-2)
+
+### Test
+- **Health score unit test**: `tests/test-health.c` with 31/31 boundary cases
+  covering all penalty types (reallocated, pending, uncorrectable, temperature,
+  errors), combined penalties, clamped extremes, and all label thresholds
+  (OK/WARNING/CRITICAL/FAILING). Run with `make test-health`.
+
 ### Build
 - Zero new compiler warnings on any target (`-Wall -Wextra -O2 -g`).
 - All targets build clean: kernel module (dm-lhsr.ko), daemon (lhsrd), CLI
   (lhsrctl), recovery tool (lhsr-scan).
 
 ### Documentation
-- `ROADMAP.md`: Phase 4 marked ✅ COMPLETE. Duration updated to 1 session (was
-  estimated 2 weeks). New Phase 4 completion section with health score model,
-  output examples, and file summary. Timeline summary updated.
+- `ROADMAP.md`: Phase 4 marked ✅ COMPLETE. Bug fix and test coverage documented.
+  Duration updated to 1 session (was estimated 2 weeks). Phase 5 section updated
+  with detailed implementation plan.
 - `CHANGELOG.md`: This entry.
 
 ---
