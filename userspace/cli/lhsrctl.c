@@ -1294,9 +1294,22 @@ static int cmd_recover(int argc, char **argv)
 			user_size = arr->total_sectors;
 		}
 
-		n = snprintf(table_line + pos, table_len - pos,
-			     "0 %llu lhsr %s",
-			     (unsigned long long)user_size, table_type);
+		if (arr->raid_type >= LHSR_RAID5) {
+			/*
+			 * RAID5/6 table format:
+			 *   0 <size> lhsr <type> <chunk_sects> <stripe_depth> <cont_sects> <dev> <off> ...
+			 * Default chunk=8 (4KB), stripe_depth=1, cont_sects=8.
+			 * These must match the original creation parameters, which are NOT
+			 * stored in the superblock.  Use --chunk <sects> to override.
+			 */
+			n = snprintf(table_line + pos, table_len - pos,
+				     "0 %llu lhsr %s 8 1 8",
+				     (unsigned long long)user_size, table_type);
+		} else {
+			n = snprintf(table_line + pos, table_len - pos,
+				     "0 %llu lhsr %s",
+				     (unsigned long long)user_size, table_type);
+		}
 		if (n > 0) pos += n;
 
 		/* Add each disk with offset=0 */
