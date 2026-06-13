@@ -25,6 +25,7 @@
 #include <sys/un.h>
 
 #include "../../lib/raid_engine.h"
+#include "shr.h"
 
 /*
  * Superblock struct for recovery scanning.
@@ -89,6 +90,9 @@ static void format_duration(long seconds, char *buf, size_t sz);
 static int connect_control_socket(void);
 static char *control_query(const char *cmd);
 
+/* Forward declarations from subcommand files */
+int cmd_shr_plan(int argc, char **argv);
+
 /* Command options */
 enum {
 	CMD_NONE = 0,
@@ -104,6 +108,7 @@ enum {
 	CMD_BITROT_LOG,
 	CMD_RECOVER,
 	CMD_RECONSTRUCT,
+	CMD_SHR,
 };
 
 /* Usage */
@@ -130,6 +135,7 @@ static void usage(const char *prog)
 		"  disk-health <device> <index>  Query disk health\n"
 		"  recover <device>...          Scan and assemble LHSR arrays\n"
 		"  reconstruct [opts] <dev>...   Reconstruct missing RAID5/6 disk from N-1\n"
+		"  shr plan [opts] <dev>...     Compute SHR layout for variable-size disks\n"
 		"  message <device> <msg> [args] Send message to kernel\n"
 		"\n"
 		"RAID Types:\n"
@@ -1924,6 +1930,8 @@ int main(int argc, char **argv)
 		cmd = CMD_RECOVER;
 	} else if (strcmp(argv[1], "reconstruct") == 0) {
 		cmd = CMD_RECONSTRUCT;
+	} else if (strcmp(argv[1], "shr") == 0) {
+		cmd = CMD_SHR;
 	} else if (strcmp(argv[1], "message") == 0) {
 		ret = cmd_message(argc, argv);
 	} else {
@@ -2003,6 +2011,15 @@ int main(int argc, char **argv)
 		break;
 	case CMD_RECONSTRUCT:
 		ret = cmd_reconstruct(argc, argv);
+		break;
+	case CMD_SHR:
+		/* Parse shr subcommands: "lhsrctl shr plan [opts] <devices...>" */
+		if (argc < 4) {
+			fprintf(stderr, "Usage: %s shr plan [--parity 1|2] [--lhsr|--mdadm] <device>...\n", PROGNAME);
+			ret = 1;
+		} else {
+			ret = cmd_shr_plan(argc - 2, argv + 2);
+		}
 		break;
 	default:
 		usage(basename(argv[0]));

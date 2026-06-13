@@ -7,8 +7,8 @@ LDFLAGS += -lpthread
 
 all: lhsrctl
 
-lhsrctl: lhsrctl.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ lhsrctl.c ../../lib/liblhsr.a
+lhsrctl: lhsrctl.c shr.c shr.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ lhsrctl.c shr.c ../../lib/liblhsr.a
 
 clean:
 	rm -f lhsrctl
