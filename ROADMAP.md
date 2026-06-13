@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-13 (Phase 5 COMPLETE — recovery tools, kernel degraded mode, recovery docs)
+**Last Updated:** 2026-06-13 (Phase 5 COMPLETE, Phase 6 SCOPED)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -469,24 +469,45 @@ Options:
 
 ---
 
-## Phase 6: SHR Userspace (NOT YET SCOPED)
+## Phase 6: SHR Userspace
 
-Synology Hybrid RAID support is a userspace feature that partitions disks and
-stacks mdadm arrays. It does NOT belong in the kernel module.
+**Status:** Scoping document complete — see `docs/plans/2026-06-13-shr-userspace-design.md`
+
+Synology Hybrid RAID support is a userspace feature that partitions disks of
+varying sizes into equal-sized chunks, creates RAID arrays per tier (mdadm or
+LHSR), and merges them with LVM. It does NOT belong in the kernel module.
 
 ### Approach
 1. Write a tool that takes N disks of varying sizes
-2. Computes the optimal layout:
-   - Partition disks into equal-sized chunks (size = smallest disk or divisor)
-   - Create mdadm RAID arrays from same-sized chunks
-   - Merge arrays with LVM (or LHSR in spanning mode)
-3. Stack LHSR self-healing on top of mdadm RAID
+2. Computes the optimal layout via greedy tiering algorithm:
+   - Partition disks into equal-sized chunks (size = smallest disk remaining)
+   - Create RAID5/6 arrays from same-sized chunks (one per tier)
+   - Merge tiers with LVM
+3. Stack LHSR self-healing on top of each tier (optional, default mdadm)
 
-### This is NOT YET SCOPED
-- No implementation plan exists
-- No resources allocated
-- Listed for completeness only
-- Requires significant userspace engineering
+### Design Decisions (from scoping document)
+- **v1 is plan-only**: The `shr plan` command computes the layout and prints
+  the sgdisk + mdadm/LHSR commands. User executes them manually. No rollback
+  problem.
+- **No auto-rebalance**: Adding disks to an existing layout is manual in v1.
+- **mdadm default, LHSR optional**: `--lhsr` flag for self-healing tiers.
+- **Zero kernel changes**: SHR is purely a userspace tool.
+
+### Effort
+- ~2000 lines, ~11 sessions (2-3 weeks) for full tool with LHSR support
+- ~500 lines, ~3-4 sessions for `shr plan` only (layout calculator + command printer)
+
+### Key Risks
+1. Partition alignment on 4K drives (mitigated by 2048-sector default)
+2. LVM metadata corruption if a tier fails (document recovery, don't automate)
+3. Rollback complexity in v1 avoided by plan-only approach
+
+### Deliverables
+- ✅ Scoping/design document (`docs/plans/2026-06-13-shr-userspace-design.md`)
+- ⏳ Phase 6.1: `lhsrctl shr plan` — layout calculator + command generator
+- ⏳ Phase 6.2: `lhsrctl shr create` — automatic partitioning + tier creation + LVM setup
+- ⏳ Phase 6.3: `lhsrctl shr status` — show current SHR layout from metadata
+- ⏳ Phase 6.4: Integration testing with loopback devices of different sizes
 
 ---
 
@@ -516,9 +537,10 @@ architecture-level feature for the DM target. It is NOT trivial.
 | 2 | Incremental rebuild | **2 days** (est. 2-3 weeks) | Phase 0 |
 | 3 | Daemon refactor | **1 day** (est. 2-3 weeks) | Phase 0 |
 | 4 | Predictive failure | **1 session** (est. 2 weeks) | Phase 3 |
-| 5 | Recovery tools | 2 weeks | Phase 0 |
+| 5 | Recovery tools + kernel degraded mode | 2 weeks | Phase 0 |
+| 6 | SHR userspace (plan-only v1) | ~1 week (mdadm), ~2-3 weeks (LHSR) | Phase 0 |
 
-**Estimated total for Phases 0-5:** 7-10 weeks (~2 months) with one developer (Phases 2 and 3 faster than estimated because 3.1 and 3.2 were already implemented).
+**Estimated total for Phases 0-5:** 7-10 weeks (~2 months) with one developer.
 
 ---
 

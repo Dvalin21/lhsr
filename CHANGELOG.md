@@ -148,6 +148,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [6.0.0] — 2026-06-13 — Phase 6: SHR Userspace Scoping
+
+### Added
+- `docs/plans/2026-06-13-shr-userspace-design.md`: Full design and scoping
+  document for the SHR (Synology Hybrid RAID) userspace tool. Covers:
+  - Data structures: `shr_partition`, `shr_tier`, `shr_disk`, `shr_layout`
+  - Greedy tiering algorithm for partitioning variable-size disks
+  - LVM + mdadm stacking diagram and implementation
+  - LHSR integration (per-tier self-healing via `--lhsr` flag)
+  - Tool interface: `lhsrctl shr plan`, `lhsrctl shr create`, `lhsrctl shr status`
+  - Failure modes: single/multiple disk loss, disk addition, replacement
+  - Effort estimate: ~2000 lines, ~11 sessions for full tool
+  - Build/not-build analysis with recommendation
+
+### Changed
+- `ROADMAP.md`: Phase 6 reclassified from "NOT YET SCOPED" to scoped with
+  design decisions, deliverables, and effort estimate.
+
+---
+
 ## [4.0.0] — 2026-06-12 — Phase 4: Predictive Failure Health Score, CLI Integration
 
 ### Added
