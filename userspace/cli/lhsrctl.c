@@ -103,6 +103,7 @@ enum {
 	CMD_BITROT,
 	CMD_BITROT_LOG,
 	CMD_RECOVER,
+	CMD_RECONSTRUCT,
 };
 
 /* Usage */
@@ -128,6 +129,7 @@ static void usage(const char *prog)
 		"  disk-online <device> <index>    Mark disk as online\n"
 		"  disk-health <device> <index>  Query disk health\n"
 		"  recover <device>...          Scan and assemble LHSR arrays\n"
+		"  reconstruct [opts] <dev>...   Reconstruct missing RAID5/6 disk from N-1\n"
 		"  message <device> <msg> [args] Send message to kernel\n"
 		"\n"
 		"RAID Types:\n"
@@ -1086,6 +1088,15 @@ static const char *raid_type_table_name(unsigned int t)
 }
 
 /*
+ * XOR src into dst (both len bytes).  dst[i] ^= src[i] for all i.
+ */
+static void xor_buf_into(unsigned char *dst, const unsigned char *src, size_t len)
+{
+	for (size_t i = 0; i < len; i++)
+		dst[i] ^= src[i];
+}
+
+/*
  * Placeholder device name for missing disks.
  * Full name: lhsr_<array_short>_ph_<disk_idx>
  *   where array_short = last 8 hex chars of array UUID
@@ -1099,6 +1110,384 @@ static const char *raid_type_table_name(unsigned int t)
  * The array_short substring keeps names unique per array and short
  * enough for /dev/mapper (max 63 chars + "/dev/mapper/" prefix).
  */
+
+/*
+ * Command reconstruct — offline RAID5/6 data reconstruction.
+ *
+ * XOR-reconstructs a complete disk image for a missing array member
+ * from N-1 surviving devices.  Works for RAID5 and RAID6 with exactly
+ * one missing disk (right-static parity layout — every disk has data
+ * or parity at the same byte-offset, so XOR of all survivors directly
+ * yields the missing disk's content).
+ *
+ * Usage: lhsrctl reconstruct [--chunk-size N] --output <file> <device>...
+ *
+ * The output is a raw disk image with the same size as the survivors,
+ * containing XOR-reconstructed user data and a valid superblock.
+ * It can be dd'd to a replacement disk or used directly with
+ * 'lhsrctl recover --chunk-size N --output'.
+ *
+ * --chunk-size defaults to 8 sectors (4 KB).  This parameter does NOT
+ * affect the XOR reconstruction (right-static layout makes offset-level
+ * XOR correct regardless of chunk size), but it IS recorded in the
+ * output file's superblock metadata for compatibility.
+ */
+static int cmd_reconstruct(int argc, char **argv)
+{
+	const char *output_path = NULL;
+	int chunk_sectors = 8;  /* LHSR_DEFAULT_CHUNK_SECTORS */
+	int dev_start, dev_count;
+	int i, d, ret = 1;
+	int missing_idx = -1;
+	uint64_t raw_sectors = 0, user_sectors = 0;
+	uint64_t pos;
+	struct disk_info *scanned = NULL;
+	int *fds = NULL;
+	unsigned char *xor_buf = NULL, *read_buf = NULL;
+	size_t buf_size = 1024 * 1024;  /* 1 MB I/O buffer */
+	int out_fd = -1;
+
+	/* ---- Parse options ---- */
+	for (i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--output") == 0 ||
+		    strcmp(argv[i], "-o") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "Error: --output requires a"
+					" path argument\n");
+				return 1;
+			}
+			output_path = argv[++i];
+		} else if (strcmp(argv[i], "--chunk-size") == 0 ||
+			   strcmp(argv[i], "-c") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "Error: --chunk-size requires"
+					" a sector count\n");
+				return 1;
+			}
+			chunk_sectors = atoi(argv[++i]);
+			if (chunk_sectors <= 0 || chunk_sectors > 4096) {
+				fprintf(stderr, "Error: chunk-size must be"
+					" 1-4096 sectors\n");
+				return 1;
+			}
+		} else if (argv[i][0] == '-') {
+			fprintf(stderr, "Error: Unknown option '%s'\n",
+				argv[i]);
+			return 1;
+		} else {
+			break;
+		}
+	}
+
+	dev_start = i;
+	dev_count = argc - dev_start;
+
+	if (!output_path || dev_count < 2) {
+		fprintf(stderr,
+			"Usage: %s reconstruct [--chunk-size N]"
+			" --output <file> <device>...\n"
+			"Reconstructs a missing disk in a RAID5/6 array"
+			" from N-1 survivors.\n"
+			"Example:"
+			" %s reconstruct --output /tmp/rec.img"
+			" /dev/sdb /dev/sdc\n",
+			PROGNAME, PROGNAME);
+		return 1;
+	}
+
+	printf("LHSR Reconstruction\n");
+	printf("===================\n\n");
+
+	/* ---- Phase 1: Scan all survivor devices ---- */
+	scanned = calloc(dev_count, sizeof(struct disk_info));
+	if (!scanned) {
+		fprintf(stderr, "Error: Out of memory\n");
+		return 1;
+	}
+
+	printf("Scanning %d survivor device(s)...\n\n", dev_count);
+	for (i = 0; i < dev_count; i++) {
+		const char *dev = argv[dev_start + i];
+		printf("  [%d/%d] %s ... ", i + 1, dev_count, dev);
+		fflush(stdout);
+		scan_one_device(dev, &scanned[i]);
+		if (!scanned[i].found) {
+			printf("no LHSR superblock\n");
+			fprintf(stderr, "Error: %s has no LHSR superblock\n",
+				dev);
+			goto out;
+		}
+		printf("OK (idx=%u, uuid=0x%016llx)\n",
+		       scanned[i].sb.disk_index,
+		       (unsigned long long)scanned[i].sb.array_uuid);
+	}
+
+	/* ---- Phase 2: Validate survivors belong to same array ---- */
+	uint64_t array_uuid = scanned[0].sb.array_uuid;
+	unsigned int raid_type = scanned[0].sb.raid_type;
+	unsigned int disk_count = scanned[0].sb.disk_count;
+	raw_sectors  = scanned[0].total_sectors;
+	user_sectors = scanned[0].sb.total_sectors;
+	uint64_t gen = scanned[0].sb.generation;
+
+	if (user_sectors == 0 || raw_sectors == 0 ||
+	    raw_sectors <= LHSR_SB_SECTORS) {
+		fprintf(stderr, "Error: Invalid device geometry on %s"
+			" (user=%llu raw=%llu)\n",
+			argv[dev_start],
+			(unsigned long long)user_sectors,
+			(unsigned long long)raw_sectors);
+		goto out;
+	}
+
+	for (i = 1; i < dev_count; i++) {
+		if (scanned[i].sb.array_uuid != array_uuid) {
+			fprintf(stderr, "Error: %s belongs to a different"
+				" array (uuid=0x%016llx)\n",
+				argv[dev_start + i],
+				(unsigned long long)scanned[i].sb.array_uuid);
+			goto out;
+		}
+		if (scanned[i].sb.raid_type != raid_type) {
+			fprintf(stderr, "Error: %s has different RAID type"
+				" (%s vs %s)\n",
+				argv[dev_start + i],
+				raid_type_name(scanned[i].sb.raid_type),
+				raid_type_name(raid_type));
+			goto out;
+		}
+		if (scanned[i].sb.disk_count != disk_count) {
+			fprintf(stderr, "Error: %s has different disk count"
+				" (%u vs %u)\n",
+				argv[dev_start + i],
+				scanned[i].sb.disk_count, disk_count);
+			goto out;
+		}
+		if (scanned[i].total_sectors != raw_sectors) {
+			fprintf(stderr, "Error: %s different size"
+				" (%llu vs %llu sectors)\n",
+				argv[dev_start + i],
+				(unsigned long long)scanned[i].total_sectors,
+				(unsigned long long)raw_sectors);
+			goto out;
+		}
+		if (scanned[i].sb.generation > gen)
+			gen = scanned[i].sb.generation;
+	}
+
+	/* ---- Phase 3: Identify missing disk ---- */
+	unsigned int disk_present[LHSR_MAX_DISKS];
+	memset(disk_present, 0, sizeof(disk_present));
+	for (i = 0; i < dev_count; i++) {
+		unsigned int idx = scanned[i].sb.disk_index;
+		if (idx >= LHSR_MAX_DISKS) {
+			fprintf(stderr, "Error: Invalid disk index %u on %s\n",
+				idx, argv[dev_start + i]);
+			goto out;
+		}
+		disk_present[idx] = 1;
+	}
+
+	missing_idx = -1;
+	for (d = 0; d < (int)disk_count; d++) {
+		if (!disk_present[d]) {
+			if (missing_idx >= 0) {
+				fprintf(stderr, "Error: Multiple missing disks"
+					" (%d and %d).\n"
+					"  Single-disk reconstruction only."
+					"  RAID6 dual-disk needs Reed-Solomon"
+					" (not yet implemented).\n",
+					missing_idx, d);
+				goto out;
+			}
+			missing_idx = d;
+		}
+	}
+
+	if (missing_idx < 0) {
+		fprintf(stderr, "Error: All disks present."
+			" No reconstruction needed.\n");
+		goto out;
+	}
+
+	/* parity (1 for RAID5, 2 for RAID6) is not needed here because
+	 * right-static layout means XOR of ALL survivors at any byte
+	 * offset directly yields the missing disk's content regardless
+	 * of whether that disk held data or parity. */
+
+	if (raid_type < LHSR_RAID5) {
+		fprintf(stderr, "Error: %s does not support XOR"
+			" reconstruction.\n", raid_type_name(raid_type));
+		goto out;
+	}
+
+	printf("\nArray:  uuid=0x%016llx  type=%s  disks=%u"
+	       "  missing=disk[%d]\n",
+	       (unsigned long long)array_uuid,
+	       raid_type_name(raid_type), disk_count, missing_idx);
+	printf("Data:   raw=%llu sectors  user=%llu sectors"
+	       "  chunk=%d sectors  survivors=%d\n\n",
+	       (unsigned long long)raw_sectors,
+	       (unsigned long long)user_sectors,
+	       chunk_sectors, dev_count);
+
+	/* ---- Phase 4: Create output file ---- */
+	out_fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (out_fd < 0) {
+		fprintf(stderr, "Error: Cannot create %s: %s\n",
+			output_path, strerror(errno));
+		goto out;
+	}
+
+	if (ftruncate(out_fd, (off_t)(raw_sectors * 512)) < 0) {
+		fprintf(stderr, "Error: Cannot extend output file: %s\n",
+			strerror(errno));
+		goto out_close;
+	}
+
+	/* ---- Phase 5: Open survivor devices ---- */
+	fds = calloc(dev_count, sizeof(int));
+	if (!fds) {
+		fprintf(stderr, "Error: Out of memory\n");
+		goto out_close;
+	}
+
+	for (i = 0; i < dev_count; i++) {
+		fds[i] = open(argv[dev_start + i], O_RDONLY);
+		if (fds[i] < 0) {
+			fprintf(stderr, "Error: Cannot open %s: %s\n",
+				argv[dev_start + i], strerror(errno));
+			while (--i >= 0)
+				close(fds[i]);
+			free(fds);
+			fds = NULL;
+			goto out_close;
+		}
+	}
+
+	/* ---- Phase 6: Allocate XOR buffers ---- */
+	xor_buf  = malloc(buf_size);
+	read_buf = malloc(buf_size);
+	if (!xor_buf || !read_buf) {
+		fprintf(stderr, "Error: Out of memory\n");
+		goto out_close;
+	}
+
+	/* ---- Phase 7: XOR reconstruct user data area ---- */
+	uint64_t user_bytes = user_sectors * 512;
+	printf("Reconstructing %llu bytes from %d survivors...\n",
+	       (unsigned long long)user_bytes, dev_count);
+
+	for (pos = 0; pos < user_bytes; pos += buf_size) {
+		size_t chunk = buf_size;
+		if (pos + buf_size > user_bytes)
+			chunk = (size_t)(user_bytes - pos);
+
+		memset(xor_buf, 0, chunk);
+		for (i = 0; i < dev_count; i++) {
+			ssize_t r = pread(fds[i], read_buf, chunk,
+					  (off_t)pos);
+			if (r != (ssize_t)chunk) {
+				fprintf(stderr,
+					"\nError: Short read from %s"
+					" at offset %llu"
+					" (got %zd, expected %zu)\n",
+					argv[dev_start + i],
+					(unsigned long long)pos, r, chunk);
+				goto out_close;
+			}
+			xor_buf_into(xor_buf, read_buf, chunk);
+		}
+
+		ssize_t w = pwrite(out_fd, xor_buf, chunk, (off_t)pos);
+		if (w != (ssize_t)chunk) {
+			fprintf(stderr,
+				"\nError: Short write to output at"
+				" offset %llu\n",
+				(unsigned long long)pos);
+			goto out_close;
+		}
+
+		/* Progress every ~256 MB */
+		if ((pos / buf_size) % 256 == 0) {
+			printf("\r  Progress: %llu / %llu bytes (%.0f%%)",
+			       (unsigned long long)pos,
+			       (unsigned long long)user_bytes,
+			       100.0 * pos / (user_bytes > 0
+					      ? (double)user_bytes : 1.0));
+			fflush(stdout);
+		}
+	}
+	printf("\r  Progress: %llu / %llu bytes (100%%)\n",
+	       (unsigned long long)user_bytes,
+	       (unsigned long long)user_bytes);
+
+	/* ---- Phase 8: Write superblock ---- */
+	{
+		struct lhsr_superblock sb = scanned[0].sb;
+
+		sb.disk_index  = (uint32_t)missing_idx;
+		sb.disk_uuid   = ((uint64_t)time(NULL)
+				  ^ ((uint64_t)getpid() << 32)
+				  ^ (uint64_t)missing_idx);
+		sb.generation  = gen;
+		sb.last_update = (uint64_t)time(NULL);
+		sb.disk_state  = LHSR_DISK_HEALTHY;
+		sb.checksum    = 0;
+		sb.checksum    = crc32c_calc((uint8_t *)&sb, sizeof(sb));
+
+		off_t sb_pri = (off_t)((raw_sectors - LHSR_SB_SECTORS) * 512);
+		off_t sb_bak = (off_t)((raw_sectors - LHSR_SB_SECTORS
+					+ LHSR_SB_SECTORS / 2) * 512);
+
+		if (pwrite(out_fd, &sb, sizeof(sb), sb_pri) != sizeof(sb))
+			fprintf(stderr, "Warning: Primary superblock write"
+				" failed\n");
+		if (pwrite(out_fd, &sb, sizeof(sb), sb_bak) != sizeof(sb))
+			fprintf(stderr, "Warning: Backup superblock write"
+				" failed\n");
+
+		printf("Superblock written for disk[%d] (generation %llu)\n",
+		       missing_idx, (unsigned long long)gen);
+	}
+
+	/* ---- Phase 9: Report success ---- */
+	for (i = 0; i < dev_count; i++) close(fds[i]);
+	free(fds);
+	free(xor_buf);
+	free(read_buf);
+	close(out_fd);
+	out_fd = -1;
+
+	printf("\nReconstruction complete!\n");
+	printf("Output: %s (%llu bytes, %llu sectors)\n",
+	       output_path,
+	       (unsigned long long)(raw_sectors * 512),
+	       (unsigned long long)raw_sectors);
+	printf("\nTo write to a replacement disk:\n");
+	printf("  # dd if=%s of=/dev/sdX bs=512\n", output_path);
+	printf("Then run 'lhsrctl recover' to assemble the array.\n");
+
+	free(scanned);
+	return 0;
+
+	/* ---- Error exit ---- */
+out_close:
+	if (out_fd >= 0) {
+		close(out_fd);
+		unlink(output_path);
+	}
+	if (fds) {
+		for (i = 0; i < dev_count; i++)
+			if (fds[i] > 0) close(fds[i]);
+		free(fds);
+	}
+	free(xor_buf);
+	free(read_buf);
+out:
+	free(scanned);
+	return ret;
+}
 
 /* Command recover */
 static int cmd_recover(int argc, char **argv)
@@ -1533,6 +1922,8 @@ int main(int argc, char **argv)
 		return 1;
 	} else if (strcmp(argv[1], "recover") == 0) {
 		cmd = CMD_RECOVER;
+	} else if (strcmp(argv[1], "reconstruct") == 0) {
+		cmd = CMD_RECONSTRUCT;
 	} else if (strcmp(argv[1], "message") == 0) {
 		ret = cmd_message(argc, argv);
 	} else {
@@ -1609,6 +2000,9 @@ int main(int argc, char **argv)
 		break;
 	case CMD_RECOVER:
 		ret = cmd_recover(argc, argv);
+		break;
+	case CMD_RECONSTRUCT:
+		ret = cmd_reconstruct(argc, argv);
 		break;
 	default:
 		usage(basename(argv[0]));

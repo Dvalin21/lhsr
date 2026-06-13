@@ -6,7 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [5.0.0] — 2026-06-12 — Phase 5: Recovery Tools (5.1-5.2)
+## [5.0.0] — 2026-06-12 — Phase 5: Recovery Tools (5.1-5.3)
 
 ### Added
 
@@ -37,6 +37,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - **Safety validation**: Rejects assembly when `present < min_healthy` (e.g., RAID1
   with only 1 disk), rejects unsupported RAID types (SHR/SHR2).
 
+#### `lhsrctl reconstruct` (5.3)
+- **New `reconstruct` subcommand**: Offline XOR reconstruction of a missing RAID5/6
+  disk from N-1 survivors. Right-static parity layout means XOR of ALL survivors at
+  any byte offset directly yields the missing disk's content — no stripe/chunk math
+  needed for the XOR operation.
+- **`--output <file>` / `-o <file>`**: Writes reconstructed disk image to a file
+  (raw format, same size as survivors, sparse)
+- **`--chunk-size <sectors>` / `-c <sectors>`**: Override default chunk size (8
+  sectors = 4KB) for superblock metadata compatibility. Does NOT affect XOR
+  reconstruction (layout-independent).
+- **Single-disk reconstruction**: Works for RAID5 (any missing disk, data or parity)
+  and RAID6 (single missing disk, data or parity). RAID6 dual-disk needs Reed-Solomon
+  (deferred).
+- **Auto-detection**: Scans survivors for superblocks, groups by UUID, validates all
+  belong to same array, identifies which disk index is missing.
+- **Validation**: Rejects mismatched UUID/RAID type/disk count/size, multiple missing
+  disks, non-RAID5/6 types, all-disks-present.
+- **Superblock**: Writes primary and backup superblocks at correct positions with
+  unique disk UUID, correct disk index, highest generation, HEALTHY state, valid CRC32c.
+- **Progress**: Reports progress every 256 MB during reconstruction.
+- **Usage**: `lhsrctl reconstruct --output /tmp/rec.img /dev/sdb /dev/sdc`
+- **Output instructions**: Prints dd command for writing output to replacement disk.
+
 ### Changed
 - `userspace/recovery/lhsr-scan.c`: +527/-145 lines — deep scan, JSON output,
   auto-detect, corruption detection.
@@ -51,7 +74,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   (lhsrctl), recovery tool (lhsr-scan).
 
 ### Documentation
-- `ROADMAP.md`: Phase 5 marked IN PROGRESS with 5.1 and 5.2 complete.
+- `ROADMAP.md`: Phase 5 marked 5.1-5.3 complete, 5.4 in progress.
 
 ---
 

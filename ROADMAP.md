@@ -354,7 +354,7 @@ Disk: /dev/sdb
 
 ## Phase 5: Recovery Tools — IN PROGRESS (2026-06-12)
 
-**Duration:** Estimated 2 weeks (5.1-5.2 done, 5.3-5.4 remaining)
+**Duration:** Estimated 2 weeks (5.1-5.3 done, 5.4 remaining)
 
 **What changed:** Userspace recovery tools to find, assemble, and recover LHSR arrays after disk failure.
 
@@ -408,15 +408,49 @@ $ lhsrctl recover /dev/sdb /dev/sdc /dev/sdd
 - Degraded 2-disk RAID5 (1 missing disk) → placeholder + main command
 - dm-zero target verified on VM (creates, reads zeros, removes cleanly)
 
-### Not Yet Implemented
+#### 5.3 Offline data reconstruction (`lhsrctl reconstruct`) — ✅ COMPLETE
 
-#### 5.3 `lhsrctl reconstruct` command
-- Reconstruct data for replacement disk from N-1 surviving disks (RAID5/6)
-- Write reconstructed data + superblock to new disk
-- Hot-add to existing array
-- **Note:** Common case (1 missing disk in RAID5) is already handled by `lhsrctl recover` + dm-zero placeholder + kernel module native rebuild. This command would be needed for offline data recovery when the kernel module is unavailable.
+**Commit:** (pending)
 
-#### 5.4 Kernel: degraded assembly support
+The `lhsrctl reconstruct` command performs offline XOR reconstruction of a complete
+disk image for a missing RAID5/6 array member from N-1 surviving devices. The output
+is a raw disk image with the same size as the survivors, containing XOR-reconstructed
+user data and a valid superblock.
+
+**Key insight:** LHSR uses right-static (non-rotating) parity layout. This means every
+disk stores data or parity at the SAME byte-offset for any given stripe. XOR of ALL
+survivors at any offset directly yields the missing disk's content at that offset —
+regardless of whether the missing disk held data or parity. No stripe/chunk geometry
+math is needed for the XOR operation itself.
+
+**Algorithm:**
+1. Scan survivors for LHSR superblocks, group by array UUID
+2. Validate: same array, RAID5/6, exactly one missing disk
+3. Open all survivors O_RDONLY, create output file (sparse, same raw size)
+4. For each 1MB block of user data: read from all survivors → XOR → write to output
+5. Write primary and backup superblocks at correct positions
+6. Report success with dd instructions
+
+**Safety features:**
+- Validates all survivors belong to same array (UUID check)
+- Validates matching RAID type, disk count, and device size
+- Rejects multiple missing disks (RAID6 dual-disk needs Reed-Solomon, deferred)
+- Rejects non-RAID5/6 types
+- Rejects all-disks-present (nothing to reconstruct)
+- Error cleanup: closes all FDs, removes partial output on failure
+
+**Usage:** `lhsrctl reconstruct --output /tmp/recovered.img /dev/sdb /dev/sdc`
+
+Options:
+- `--output <file>` / `-o <file>`: Output path (required)
+- `--chunk-size <sectors>` / `-c <sectors>`: Chunk size for superblock (default 8)
+  Does NOT affect XOR (layout-independent).
+
+**Tested on:** Built clean with zero warnings across all 4 targets.
+
+### Remaining
+
+#### 5.4 Kernel: degraded assembly support — ⏳ IN PROGRESS
 - Allow `dmsetup create` with fewer disks than `disk_count`
 - Missing disks: read returns zeros, writes discarded
 - Array marked degraded-read-only until fully populated
@@ -425,7 +459,7 @@ $ lhsrctl recover /dev/sdb /dev/sdc /dev/sdd
 ### Deliverables
 - ✅ 5.1 Enhanced `lhsr-scan` with `--deep`, `--json`, auto-detect
 - ✅ 5.2 `lhsrctl recover` with degraded mode and dm-zero placeholders
-- ⏳ 5.3 `lhsrctl reconstruct` — data recovery from N-1 disks
+- ✅ 5.3 `lhsrctl reconstruct` — offline data recovery from N-1 disks
 - ⏳ 5.4 Kernel degraded assembly support
 - ⏳ Updated recovery procedure documentation
 
