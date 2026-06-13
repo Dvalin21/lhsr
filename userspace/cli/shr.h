@@ -111,4 +111,13 @@ void shr_print_plan(const struct shr_layout *layout,
 void shr_print_commands(const struct shr_layout *layout,
 			const char * const *disk_paths, int use_lhsr);
 
+/*
+ * Execute the SHR layout: partition disks, create RAID arrays,
+ * set up LVM.  This is DESTRUCTIVE — all data on the specified
+ * devices will be lost.
+ *
+ * Returns 0 on success, 1 on error.
+ */
+int cmd_shr_create(int argc, char **argv);
+
 #endif /* LHSR_SHR_H */

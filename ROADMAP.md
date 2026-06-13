@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-13 (Phase 5 COMPLETE, Phase 6 SCOPED)
+**Last Updated:** 2026-06-12 (Phase 5 COMPLETE, Phase 6.1 COMPLETE)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -504,7 +504,7 @@ LHSR), and merges them with LVM. It does NOT belong in the kernel module.
 
 ### Deliverables
 - ✅ Scoping/design document (`docs/plans/2026-06-13-shr-userspace-design.md`)
-- ⏳ Phase 6.1: `lhsrctl shr plan` — layout calculator + command generator
+- ✅ Phase 6.1: `lhsrctl shr plan` — layout calculator + command generator
 - ⏳ Phase 6.2: `lhsrctl shr create` — automatic partitioning + tier creation + LVM setup
 - ⏳ Phase 6.3: `lhsrctl shr status` — show current SHR layout from metadata
 - ⏳ Phase 6.4: Integration testing with loopback devices of different sizes

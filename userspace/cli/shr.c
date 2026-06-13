@@ -1,12 +1,12 @@
 /*
- * LHSR SHR (Synology Hybrid RAID) — Plan Subcommand
+ * LHSR SHR (Synology Hybrid RAID) — Plan and Create Subcommands
  *
  * Computes the optimal partition layout for N disks of varying sizes,
  * using the greedy tiering algorithm: smallest-disk-first, one RAID
- * tier per iteration.  Prints the plan and the sgdisk + mdadm/dmsetup
- * + LVM commands to execute it.
+ * tier per iteration.
  *
- * This is a planning tool only — it does NOT touch any block device.
+ * "shr plan"  — prints the plan and shell commands (no disk writes)
+ * "shr create" — executes partitioning, RAID creation, and LVM setup
  *
  * "Bad programmers worry about the code. Good programmers worry about
  *  data structures and their relationships."         — Linus Torvalds
@@ -19,8 +19,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <ctype.h>
+#include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <linux/fs.h>
@@ -115,8 +118,11 @@ int shr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
 	/* Populate disk info — note: sizes must already be sorted */
 	for (i = 0; i < disk_count; i++) {
 		layout->disks[i].total_sectors = sizes[i];
-		/* Reserve GPT at front */
-		layout->disks[i].available_sectors = sizes[i] - alignment;
+		/* Reserve GPT at front AND back (alignment sectors each) */
+		if (sizes[i] > alignment * 2)
+			layout->disks[i].available_sectors = sizes[i] - alignment * 2;
+		else
+			layout->disks[i].available_sectors = 0;
 		disk_offset[i] = alignment;
 		layout->total_raw_sectors += sizes[i];
 	}
@@ -293,8 +299,7 @@ void shr_print_plan(const struct shr_layout *layout,
 
 		/* Show unused space */
 		if (layout->disks[i].available_sectors > layout->alignment) {
-			uint64_t unused = layout->disks[i].available_sectors;
-			unused -= layout->alignment;
+			uint64_t unused = layout->disks[i].available_sectors - layout->alignment;
 			printf("  (%llu unused)",
 			       (unsigned long long)unused);
 			total_unused += unused;
@@ -645,6 +650,553 @@ int cmd_shr_plan(int argc, char **argv)
 	printf("Execution Commands");
 	printf("\n==================\n");
 	shr_print_commands(&layout, disk_paths, use_lhsr);
+
+	ret = 0;
+
+out:
+	free(sizes);
+	free(disk_paths);
+	return ret;
+}
+
+/* ===================================================================
+ * Phase 6.2 — "lhsrctl shr create"
+ *
+ * Executes the SHR layout: partitions disks, creates RAID arrays
+ * (mdadm or LHSR dmsetup), sets up LVM.
+ *
+ * This is DESTRUCTIVE. All data on the specified disks will be lost.
+ * =================================================================== */
+
+/* ---- helpers ---- */
+
+static int shr_run_cmd(const char *fmt, ...)
+{
+	char cmd[4096];
+	va_list ap;
+	int ret;
+
+	va_start(ap, fmt);
+	vsnprintf(cmd, sizeof(cmd), fmt, ap);
+	va_end(ap);
+
+	printf("  $ %s\n", cmd);
+	fflush(stdout);
+
+	ret = system(cmd);
+	if (ret == -1) {
+		fprintf(stderr, "  Error: fork failed\n");
+		return -1;
+	}
+	if (!WIFEXITED(ret) || WEXITSTATUS(ret) != 0) {
+		fprintf(stderr, "  Error: exit code %d\n",
+			WIFEXITED(ret) ? WEXITSTATUS(ret) : -1);
+		return -1;
+	}
+	return 0;
+}
+
+/* Build partition device path from a base device and partition number.
+ * Handles both /dev/sda → /dev/sda1 and /dev/loop5 → /dev/loop5p1. */
+static char *shr_get_part_dev(const char *dev, int part_num,
+			      char *buf, size_t sz)
+{
+	size_t len = strlen(dev);
+	char fmt[16];
+
+	if (len > 0 && isdigit((unsigned char)dev[len - 1]))
+		snprintf(fmt, sizeof(fmt), "%%sp%%d");
+	else
+		snprintf(fmt, sizeof(fmt), "%%s%%d");
+	snprintf(buf, sz, fmt, dev, part_num);
+	return buf;
+}
+
+/* Poll for partition device to appear, up to timeout_ms.
+ * If part_num is 0, poll for the base device path directly. */
+static int shr_wait_for_part(const char *dev, int part_num, int timeout_ms)
+{
+	char pdev[512];
+	struct stat st;
+	int waited = 0;
+
+	if (part_num > 0)
+		shr_get_part_dev(dev, part_num, pdev, sizeof(pdev));
+	else
+		snprintf(pdev, sizeof(pdev), "%s", dev);
+
+	while (waited < timeout_ms) {
+		if (stat(pdev, &st) == 0 && S_ISBLK(st.st_mode))
+			return 0;
+		usleep(100000); /* 100ms */
+		waited += 100;
+	}
+	fprintf(stderr, "  Error: %s did not appear after %d ms\n",
+		pdev, timeout_ms);
+	return -1;
+}
+
+/* ---- validation ---- */
+
+/* Check that a device path is safe to pass to shell commands.
+ * Must exist, be a block device, not contain shell metacharacters. */
+static int shr_validate_device(const char *dev)
+{
+	struct stat st;
+	const char *p;
+
+	if (stat(dev, &st) < 0) {
+		fprintf(stderr, "Error: cannot access %s: %s\n",
+			dev, strerror(errno));
+		return -1;
+	}
+	if (!S_ISBLK(st.st_mode)) {
+		fprintf(stderr, "Error: %s is not a block device\n", dev);
+		return -1;
+	}
+	/* Reject shell metacharacters in device path */
+	for (p = dev; *p; p++) {
+		if (!isalnum((unsigned char)*p) && *p != '/' &&
+		    *p != '-' && *p != '_' && *p != '.') {
+			fprintf(stderr, "Error: invalid character in device path '%s'\n",
+				dev);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* Warn that a disk already has partitions or md superblock.
+ * Returns non-zero if we should abort. */
+static int shr_warn_used_device(const char *dev)
+{
+	char pdev[512];
+	struct stat st;
+	int i;
+
+	/* Check for existing partition devices */
+	for (i = 1; i <= 4; i++) {
+		shr_get_part_dev(dev, i, pdev, sizeof(pdev));
+		if (stat(pdev, &st) == 0) {
+			fprintf(stderr, "Warning: %s already has partitions "
+				"(e.g. %s)\n", dev, pdev);
+			fprintf(stderr, "  Use --force to override, or wipe first.\n");
+			return -1;
+		}
+	}
+	/* Check if device is mounted */
+	{
+		FILE *fp;
+		char line[1024];
+		int mounted = 0;
+
+		fp = fopen("/proc/mounts", "r");
+		if (fp) {
+			while (fgets(line, sizeof(line), fp)) {
+				if (strstr(line, dev)) {
+					mounted = 1;
+					break;
+				}
+			}
+			fclose(fp);
+		}
+		if (mounted) {
+			fprintf(stderr, "Error: %s appears to be mounted\n", dev);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+/* ---- execution steps ---- */
+
+/* Step 1: Partition all disks with sgdisk */
+static int shr_create_partitions(struct shr_layout *layout,
+				 const char **disk_paths)
+{
+	unsigned int i, j;
+
+	printf("\n--- Step 1: Partition disks ---\n");
+
+	for (i = 0; i < layout->disk_count; i++) {
+		const char *dev = disk_paths[i];
+		unsigned int pn = 1;
+
+		/* Wipe existing partition table */
+		printf("\n# Disk %u: %s\n", i, dev);
+		if (shr_run_cmd("sgdisk --zap-all '%s'", dev) < 0)
+			return -1;
+
+		/* Create partitions for each tier this disk participates in */
+		for (j = 0; j < layout->partition_count; j++) {
+			uint64_t size;
+
+			if (layout->partitions[j].disk_idx != i)
+				continue;
+
+			size = layout->partitions[j].size_sectors;
+			if (shr_run_cmd("sgdisk --new=%u:0:+%llus "
+					"--typecode=%u:fd00 '%s'",
+					pn, (unsigned long long)size,
+					pn, dev) < 0)
+				return -1;
+			pn++;
+		}
+	}
+	return 0;
+}
+
+/* Step 2: Wait for partition table re-read and partition devices */
+static int shr_create_wait_partitions(struct shr_layout *layout,
+				      const char **disk_paths)
+{
+	unsigned int i;
+
+	printf("\n--- Step 2: Wait for partitions ---\n");
+
+	for (i = 0; i < layout->disk_count; i++) {
+		const char *dev = disk_paths[i];
+		unsigned int pn;
+		unsigned int j;
+
+		/* Count partitions on this disk */
+		unsigned int pcount = 0;
+		for (j = 0; j < layout->partition_count; j++) {
+			if (layout->partitions[j].disk_idx == i)
+				pcount++;
+		}
+		if (pcount == 0)
+			continue;
+
+		/* Re-read partition table */
+		printf("  Re-reading partition table on %s ...\n", dev);
+		fflush(stdout);
+
+		if (shr_run_cmd("partprobe '%s' 2>/dev/null || "
+				"blockdev --rereadpt '%s' 2>/dev/null || "
+				"partx -a '%s' 2>/dev/null",
+				dev, dev, dev) < 0) {
+			fprintf(stderr, "  Warning: partition re-read failed "
+				"for %s, trying partx -a\n", dev);
+			shr_run_cmd("partx -a '%s'", dev);
+		}
+
+		/* Wait for each partition device to appear */
+		for (pn = 1; pn <= pcount; pn++) {
+			if (shr_wait_for_part(dev, pn, 5000) < 0)
+				return -1;
+		}
+	}
+	return 0;
+}
+
+/* Step 3: Create RAID arrays (mdadm or LHSR dmsetup) */
+static int shr_create_raid(struct shr_layout *layout,
+			   const char **disk_paths, int use_lhsr)
+{
+	unsigned int i, j;
+	char cmd[16384];
+
+	printf("\n--- Step 3: Create RAID arrays ---\n");
+
+	for (i = 0; i < layout->tier_count; i++) {
+		struct shr_tier *t = &layout->tiers[i];
+		int raid_level = (t->raid_type == 2) ? 5 : 6;
+
+		if (use_lhsr) {
+			/* LHSR: dmsetup create */
+			int pos;
+
+			pos = snprintf(cmd, sizeof(cmd),
+				"dmsetup create shr_tier_%u --table "
+				"\"0 %llu lhsr raid%c 8 1 8",
+				i, (unsigned long long)t->usable_sectors,
+				raid_level + '0');
+
+			for (j = 0; j < layout->partition_count; j++) {
+				char pdev[512];
+				if (layout->partitions[j].tier != i)
+					continue;
+				unsigned int di = layout->partitions[j].disk_idx;
+				unsigned int pn = layout->partitions[j].tier + 1;
+				shr_get_part_dev(disk_paths[di], pn, pdev, sizeof(pdev));
+				pos += snprintf(cmd + pos, sizeof(cmd) - pos,
+						" %s 0", pdev);
+				if ((size_t)pos >= sizeof(cmd) - 64) {
+					fprintf(stderr, "Error: dmsetup table too long\n");
+					return -1;
+				}
+			}
+			snprintf(cmd + pos, sizeof(cmd) - pos, "\"");
+			if (shr_run_cmd("%s", cmd) < 0)
+				return -1;
+		} else {
+			/* mdadm: build member list */
+			int pos = 0;
+
+			pos = snprintf(cmd, sizeof(cmd),
+				"mdadm --create /dev/md/shr_tier_%u "
+				"--level=%d --raid-devices=%u --bitmap=none",
+				i, raid_level, t->partition_count);
+
+			for (j = 0; j < layout->partition_count; j++) {
+				char pdev[512];
+				if (layout->partitions[j].tier != i)
+					continue;
+				unsigned int di = layout->partitions[j].disk_idx;
+				unsigned int pn = layout->partitions[j].tier + 1;
+				shr_get_part_dev(disk_paths[di], pn, pdev, sizeof(pdev));
+				pos += snprintf(cmd + pos, sizeof(cmd) - pos,
+						" %s", pdev);
+				if ((size_t)pos >= sizeof(cmd) - 64) {
+					fprintf(stderr, "Error: mdadm command too long\n");
+					return -1;
+				}
+			}
+			if (shr_run_cmd("%s", cmd) < 0)
+				return -1;
+
+			/* Wait for md device to appear */
+			char mddev[64];
+			snprintf(mddev, sizeof(mddev), "/dev/md/shr_tier_%u", i);
+			shr_wait_for_part(mddev, 0, 5000);
+		}
+	}
+	return 0;
+}
+
+/* Step 4: LVM — PVs, VG, LV */
+static int shr_create_lvm(struct shr_layout *layout, int use_lhsr)
+{
+	unsigned int i;
+
+	printf("\n--- Step 4: LVM setup ---\n");
+
+	for (i = 0; i < layout->tier_count; i++) {
+		if (use_lhsr) {
+			if (shr_run_cmd("pvcreate /dev/mapper/shr_tier_%u",
+					i) < 0)
+				return -1;
+		} else {
+			if (shr_run_cmd("pvcreate /dev/md/shr_tier_%u",
+					i) < 0)
+				return -1;
+		}
+	}
+
+	/* Create VG on first tier */
+	printf("\n# Creating volume group 'shr_vg' ...\n");
+	if (use_lhsr) {
+		if (shr_run_cmd("vgcreate shr_vg /dev/mapper/shr_tier_0") < 0)
+			return -1;
+	} else {
+		if (shr_run_cmd("vgcreate shr_vg /dev/md/shr_tier_0") < 0)
+			return -1;
+	}
+
+	/* Extend VG with remaining tiers */
+	for (i = 1; i < layout->tier_count; i++) {
+		if (use_lhsr) {
+			if (shr_run_cmd("vgextend shr_vg /dev/mapper/shr_tier_%u",
+					i) < 0)
+				return -1;
+		} else {
+			if (shr_run_cmd("vgextend shr_vg /dev/md/shr_tier_%u",
+					i) < 0)
+				return -1;
+		}
+	}
+
+	/* Create LV spanning all available space */
+	printf("\n# Creating logical volume ...\n");
+	if (shr_run_cmd("lvcreate -l 100%%FREE -n shr_vol shr_vg") < 0)
+		return -1;
+
+	return 0;
+}
+
+/* ---- entry point ---- */
+
+int cmd_shr_create(int argc, char **argv)
+{
+	uint64_t *sizes = NULL;
+	const char **disk_paths = NULL;
+	unsigned int disk_count = 0;
+	int parity = 1;
+	int use_lhsr = 0;
+	int force = 0;
+	int ret = 1;
+	int opt_consumed = 1; /* skip "create" */
+	char confirm[64];
+	unsigned int i;
+	struct shr_layout layout;
+
+	/* Parse options: --parity N, --lhsr, --mdadm, --force */
+	for (i = 1; i < (unsigned int)argc; i++) {
+		if (strcmp(argv[i], "--parity") == 0 && i + 1 < (unsigned int)argc) {
+			parity = atoi(argv[++i]);
+			if (parity != 1 && parity != 2) {
+				fprintf(stderr, "Error: parity must be 1 or 2\n");
+				return 1;
+			}
+			opt_consumed += 2;
+		} else if (strcmp(argv[i], "--lhsr") == 0) {
+			use_lhsr = 1;
+			opt_consumed++;
+		} else if (strcmp(argv[i], "--mdadm") == 0) {
+			use_lhsr = 0;
+			opt_consumed++;
+		} else if (strcmp(argv[i], "--force") == 0) {
+			force = 1;
+			opt_consumed++;
+		} else if (argv[i][0] == '-') {
+			fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
+			fprintf(stderr, "Usage: lhsrctl shr create [--parity 1|2] "
+				"[--lhsr|--mdadm] [--force] <device>...\n");
+			return 1;
+		}
+	}
+
+	disk_count = argc - opt_consumed;
+	if (disk_count < 3) {
+		fprintf(stderr, "Error: SHR requires at least 3 disks\n");
+		fprintf(stderr, "Usage: lhsrctl shr create [--parity 1|2] "
+			"[--lhsr|--mdadm] [--force] <device>...\n");
+		return 1;
+	}
+
+	/* Validate all devices */
+	for (i = 0; i < disk_count; i++) {
+		const char *dev = argv[opt_consumed + i];
+		if (shr_validate_device(dev) < 0)
+			return 1;
+	}
+
+	sizes = calloc(disk_count, sizeof(uint64_t));
+	disk_paths = calloc(disk_count, sizeof(char *));
+	if (!sizes || !disk_paths) {
+		fprintf(stderr, "Error: out of memory\n");
+		goto out;
+	}
+
+	/* Read device sizes */
+	printf("Scanning devices ...\n");
+	for (i = 0; i < disk_count; i++) {
+		int fd;
+		uint64_t sz;
+		const char *dev = argv[opt_consumed + i];
+
+		disk_paths[i] = dev;
+		fd = open(dev, O_RDONLY);
+		if (fd < 0) {
+			fprintf(stderr, "Error: cannot open %s: %s\n",
+				dev, strerror(errno));
+			goto out;
+		}
+		if (ioctl(fd, BLKGETSIZE64, &sz) < 0) {
+			fprintf(stderr, "Error: cannot get size of %s: %s\n",
+				dev, strerror(errno));
+			close(fd);
+			goto out;
+		}
+		close(fd);
+		sizes[i] = sz / 512;
+	}
+
+	/* Sort by size ascending for algorithm */
+	qsort(sizes, disk_count, sizeof(uint64_t), cmp_u64_asc);
+
+	/* Compute layout */
+	if (shr_plan_layout(sizes, disk_count, parity, 0, 0, &layout) < 0)
+		goto out;
+
+	/* Print plan */
+	shr_print_plan(&layout, disk_paths);
+
+	/* Pre-flight checks */
+	printf("\n--- Pre-flight checks ---\n");
+	for (i = 0; i < disk_count; i++) {
+		if (shr_warn_used_device(disk_paths[i]) < 0) {
+			if (!force) {
+				fprintf(stderr, "Use --force to override.\n");
+				goto out;
+			}
+			fprintf(stderr, "  (--force override)\n");
+		}
+	}
+
+	/* Confirmation */
+	printf("\n============================================================\n");
+	printf("  DESTRUCTIVE OPERATION — ALL DATA ON THESE DISKS WILL BE LOST\n");
+	printf("============================================================\n");
+	printf("Type 'YES' to proceed, anything else to abort: ");
+	fflush(stdout);
+	if (!fgets(confirm, sizeof(confirm), stdin)) {
+		fprintf(stderr, "Aborted.\n");
+		goto out;
+	}
+	/* Remove trailing newline */
+	{
+		size_t clen = strlen(confirm);
+		if (clen > 0 && confirm[clen - 1] == '\n')
+			confirm[clen - 1] = '\0';
+	}
+	if (strcmp(confirm, "YES") != 0) {
+		printf("Aborted.\n");
+		goto out;
+	}
+
+	printf("\nExecuting SHR layout ...\n");
+
+	/* Step 1: Partition disks */
+	if (shr_create_partitions(&layout, disk_paths) < 0) {
+		fprintf(stderr, "\nFAILED at Step 1 (partitioning).\n"
+			"Rollback: run `sgdisk --zap-all` on each device.\n");
+		goto out;
+	}
+
+	/* Step 2: Wait for partitions */
+	if (shr_create_wait_partitions(&layout, disk_paths) < 0) {
+		fprintf(stderr, "\nFAILED at Step 2 (partition re-read).\n"
+			"Rollback: partitions may exist; check with sgdisk --print.\n"
+			"Run `partx -a` on each device manually.\n");
+		goto out;
+	}
+
+	/* Step 3: Create RAID arrays */
+	if (shr_create_raid(&layout, disk_paths, use_lhsr) < 0) {
+		fprintf(stderr, "\nFAILED at Step 3 (RAID creation).\n"
+			"Rollback: wipe partition superblocks with "
+			"`mdadm --zero-superblock` on each partition.\n");
+		goto out;
+	}
+
+	/* Step 4: LVM setup */
+	if (shr_create_lvm(&layout, use_lhsr) < 0) {
+		fprintf(stderr, "\nFAILED at Step 4 (LVM setup).\n"
+			"Rollback:\n"
+			"  lvremove shr_vg/shr_vol\n"
+			"  vgremove shr_vg\n"
+			"  pvremove on each RAID device\n"
+			"  mdadm --stop /dev/md/shr_tier_*\n");
+		goto out;
+	}
+
+	/* Success */
+	printf("\n============================================================\n");
+	printf("  SHR LAYOUT CREATED SUCCESSFULLY\n");
+	printf("============================================================\n");
+	printf("\nVolume Group:   shr_vg");
+	printf("\nLogical Volume: shr_vg/shr_vol");
+	printf("\n");
+	if (use_lhsr)
+		printf("\nRAID mode: LHSR (self-healing via dmsetup)\n");
+	else
+		printf("\nRAID mode: mdadm\n");
+	printf("\nFormat and mount:\n");
+	printf("  # mkfs.ext4 /dev/shr_vg/shr_vol\n");
+	printf("  # mount /dev/shr_vg/shr_vol /mnt/storage\n");
+	printf("\n");
 
 	ret = 0;
 
