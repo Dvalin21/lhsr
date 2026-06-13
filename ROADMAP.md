@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-12 (Phase 4 COMPLETE — bug fix + test, Phase 5 IN PROGRESS)
+**Last Updated:** 2026-06-13 (Phase 5 COMPLETE — recovery tools + kernel degraded mode)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -450,17 +450,21 @@ Options:
 
 ### Remaining
 
-#### 5.4 Kernel: degraded assembly support — ⏳ IN PROGRESS
+#### 5.4 Kernel: degraded assembly support — ✅ COMPLETE
 - Allow `dmsetup create` with fewer disks than `disk_count`
-- Missing disks: read returns zeros, writes discarded
-- Array marked degraded-read-only until fully populated
-- **Note:** Partial support exists (kernel constructor accepts `/dev/mapper/<dm-zero>` as any disk), but dedicated degraded mode with size reduction and read-only enforcement is not implemented.
+  - Superblock-based expansion: constructor reads `disk_count` from surviving superblocks
+  - `total_disks=N` keyword: specifies full disk count when no valid superblock exists
+- Missing disks: reads reconstruct from parity (RAID5/6) or failover (RAID1), zeros for fresh arrays
+- Writes silently discarded: bio completed with `BLK_STS_IOERR`
+- Array marked `DEGRADED` in status/table, writes rejected until fully populated (reload table)
+- Destructor safely skips NULL disk slots (no crash on removal)
+- RAID1 read paths strengthened with explicit NULL-disk guards
 
 ### Deliverables
 - ✅ 5.1 Enhanced `lhsr-scan` with `--deep`, `--json`, auto-detect
 - ✅ 5.2 `lhsrctl recover` with degraded mode and dm-zero placeholders
 - ✅ 5.3 `lhsrctl reconstruct` — offline data recovery from N-1 disks
-- ⏳ 5.4 Kernel degraded assembly support
+- ✅ 5.4 Kernel degraded assembly support — dedicated mode with `total_disks=N`, parity reconstruction reads, write rejection, NULL-disk-safe destructor
 - ⏳ Updated recovery procedure documentation
 
 ---

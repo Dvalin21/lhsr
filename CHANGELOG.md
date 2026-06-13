@@ -6,7 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [5.0.0] — 2026-06-12 — Phase 5: Recovery Tools (5.1-5.3)
+## [5.1.0] — 2026-06-13 — Phase 5: Recovery Tools + Kernel Degraded Mode (5.1-5.4)
 
 ### Added
 
@@ -75,6 +75,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Documentation
 - `ROADMAP.md`: Phase 5 marked 5.1-5.3 complete, 5.4 in progress.
+
+---
+
+## [5.1.0] — 2026-06-13 — Phase 5.4: Kernel Degraded Assembly Support
+
+### Added
+
+#### `total_disks=N` keyword for degraded arrays
+- New trailing keyword `total_disks=N` alongside `integrity` and `degraded`.
+- When degraded mode is requested and NO valid superblock exists on any provided
+  disk, `total_disks=N` specifies the full array membership count so the kernel
+  can expand `arr->disks` to the correct size and mark missing positions as failed.
+- Parsing accepts 1 through `LHSR_MAX_DISKS` (32), returns `-EINVAL` gracefully
+  on invalid values.
+
+#### Constructor degraded expansion (two sources)
+- **Superblock-based**: Reads `disk_count` from first valid surviving superblock.
+  Works for existing arrays where one or more disks are missing.
+- **Keyword-based**: Falls back to `total_disks=N` when NO superblock has a valid
+  `disk_count` (e.g., creating a degraded array for the first time, or all
+  superblocks are corrupt).
+- Both paths: expand `arr->disks`, set NULL on missing `disk[]` and `dm_devs[]`,
+  set `failed_disks` bits, recompute `arr->size` from correct data-disk count,
+  keep `arr->degraded = true`.
+
+#### Fixed degraded fallback (was clearing `arr->degraded`)
+- Previously: `degraded` flag + no superblock → `arr->degraded = false` (broken).
+- Now: `arr->degraded = true` is preserved. Writes are rejected. Status correctly
+  reports `DEGRADED`. The caller is warned to provide `total_disks=N` if full
+  expansion is desired.
+
+#### Fixed destructor NULL-disk crash
+- `lhsr_dtr` iterated `arr->disks` to write superblocks on removal. If a slot
+  had `disk[i] = NULL` (degraded missing disk), `lhsr_write_superblock(NULL, ...)`
+  would dereference the NULL pointer and crash.
+- **Fix**: Added `if (!arr->disk[i]) continue;` at the start of the loop.
+
+#### RAID1 read path NULL-disk hardening
+- Primary read path: added `&& arr->disk[arr->primary_disk]` guard.
+- Failover scan: added `&& arr->disk[i]` guard per candidate.
+- Belt-and-suspenders: `failed_disks` bits are set for missing disks, but the
+  explicit NULL checks protect against any desync.
+
+### Changed
+- `kernel/dm-lhsr/dm-lhsr.c`: +97/−22 lines — keyword parsing, degraded expansion
+  refactor, fallback fix, destructor skip, RAID1 guards, log fix.
+- `ROADMAP.md`: Phase 5.4 marked ✅ COMPLETE.
+
+### Build
+- Zero warnings on the kernel module target (`make -C ... M=... modules`).
+- Zero warnings across all 4 targets (module, daemon, CLI, recovery tool).
 
 ---
 

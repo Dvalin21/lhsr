@@ -126,6 +126,7 @@ struct lhsr_array {
 
 	/* dm-integrity stacking (persistent checksums) */
 	bool integrity_below;				/* Stacked on dm-integrity devices */
+	bool degraded;					/* Assembled with fewer disks than disk_count */
 
 	/* Write-hole journal — dirty stripe bitmap */
 	struct page *bitmap_pages[LHSR_BITMAP_PAGES];	/* In-memory pages */

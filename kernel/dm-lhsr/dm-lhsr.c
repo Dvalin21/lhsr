@@ -1775,6 +1775,67 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	sector_t size = 0;
 	int r = 0;
 	bool integrity_below = false;
+	bool degraded = false;
+	unsigned int total_disks = 0;
+
+	DMINFO("ctr: Entered with %u args", argc);
+	for (i = 0; i < argc; i++)
+		DMINFO("ctr: argv[%u]=[%s]", i, argv[i]);
+
+	/*
+	 * Trailing keywords "integrity", "degraded", and "total_disks=N"
+	 * — can appear in any order.  Strip them BEFORE any argc-dependent
+	 * calculations.
+	 *
+	 *   "integrity": dm-integrity devices are stacked below.  When set,
+	 *   LHSR skips its own checksum cache and relies on dm-integrity's
+	 *   persistent per-block checksums.
+	 *
+	 *   "degraded": This table maps fewer than disk_count devices.
+	 *   The kernel determines the true disk count from the superblock
+	 *   on the provided devices (or total_disks=N) and marks missing
+	 *   positions as failed.  Writes are rejected; reads are served
+	 *   via parity reconstruction or mirror failover.
+	 *
+	 *   "total_disks=N": Required when degraded mode is specified and
+	 *   NO valid superblock exists on any provided disk (e.g. creating
+	 *   a degraded array for the first time, or all superblocks are
+	 *   corrupt).  Specifies the total number of disks the array
+	 *   should have, so the kernel can expand to the correct count.
+	 */
+	{
+		bool changed;
+		do {
+			changed = false;
+			if (argc >= 2 && strcmp(argv[argc - 1], "integrity") == 0) {
+				argc--;
+				integrity_below = true;
+				changed = true;
+				DMINFO("ctr: integrity-below flag set");
+			}
+			if (argc >= 2 && strcmp(argv[argc - 1], "degraded") == 0) {
+				argc--;
+				degraded = true;
+				changed = true;
+				DMINFO("ctr: degraded flag set");
+			}
+			if (argc >= 2 && strncmp(argv[argc - 1], "total_disks=", 12) == 0) {
+				const char *val = argv[argc - 1] + 12;
+				unsigned int tmp;
+				int rv;
+				argc--;
+				rv = kstrtouint(val, 0, &tmp);
+				if (rv || tmp < 1 || tmp > LHSR_MAX_DISKS) {
+					DMERR("ctr: invalid total_disks='%s'", val);
+					ti->error = "Invalid total_disks value";
+					return -EINVAL;
+				}
+				total_disks = tmp;
+				changed = true;
+				DMINFO("ctr: total_disks=%u flag set", total_disks);
+			}
+		} while (changed);
+	}
 
 	/* Prevent new devices during module exit */
 	if (lhsr_module_exiting) {
@@ -1783,24 +1844,7 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -EBUSY;
 	}
 
-	DMINFO("ctr: argc=%u", argc);
-	for (i = 0; i < argc; i++)
-		DMINFO("ctr: argv[%u]=[%s]", i, argv[i]);
-
-	/*
-	 * Check for optional trailing "integrity" flag — indicates dm-integrity
-	 * devices are stacked below.  When set, LHSR skips its own ephemeral
-	 * checksum cache and relies on dm-integrity's persistent per-block
-	 * checksums for data integrity verification.
-	 *
-	 * This MUST be checked BEFORE any argc-dependent calculations so the
-	 * device count and argument positions remain correct.
-	 */
-	if (argc >= 2 && strcmp(argv[argc - 1], "integrity") == 0) {
-		argc--;
-		integrity_below = true;
-		DMINFO("ctr: integrity-below flag set");
-	}
+	DMINFO("ctr: After keyword stripping: argc=%u", argc);
 
 	/* Validate argument count based on raid type */
 	/* Format: type [device offset] [device offset] ... */
@@ -1870,7 +1914,7 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "Mirror requires exactly 2 disks";
 		return -EINVAL;
 	}
-	if (raid_type >= LHSR_RAID5 && num_disks < 3) {
+	if (raid_type >= LHSR_RAID5 && num_disks < 3 && !degraded) {
 		DMERR("RAID5/6 requires at least 3 disks, got %u", num_disks);
 		ti->error = "RAID5/6 requires at least 3 disks";
 		return -EINVAL;
@@ -1892,6 +1936,7 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	/* Initialize all fields */
 	arr->integrity_below = integrity_below;
+	arr->degraded = degraded;
 	arr->uuid = fast_hash_32(raid_type);
 	arr->raid_type = raid_type;
 	arr->disks = num_disks;
@@ -2082,8 +2127,90 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 			arr->generation = sb->generation;
 	}
 
+	/* In degraded mode, expand to the full disk count from the superblock.
+	 * The user has provided fewer device pairs than disk_count, which means
+	 * one or more disks are missing (e.g., failed and removed).  We read
+	 * disk_count from the surviving superblock(s), expand arr->disks, and
+	 * mark every unpopulated position in failed_disks so the I/O path
+	 * treats them as missing (reconstructing reads, rejecting writes).
+	 */
+	if (degraded) {
+		unsigned int full_count = 0;
+		unsigned int expand_to = 0;
+
+		/* Find the true disk_count from the first valid superblock.
+		 * If superblocks are present this gives us the authoritative
+		 * disk count and overrides any total_disks=N keyword. */
+		for (i = 0; i < num_disks; i++) {
+			if (lhsr_validate_superblock(&arr->sbs[i]) == 0 &&
+			    arr->sbs[i].disk_count > full_count)
+				full_count = arr->sbs[i].disk_count;
+		}
+
+		/* Determine whether we need to expand arr->disks */
+		if (full_count > num_disks)
+			expand_to = full_count;
+		else if (total_disks > num_disks)
+			expand_to = total_disks;
+
+		if (expand_to > 0) {
+			unsigned int old_disks = num_disks;
+
+			DMINFO("Degraded: expanding from %u to %u disks (from %s)",
+			       old_disks, expand_to,
+			       full_count > num_disks ? "superblock" : "total_disks=N");
+
+			/* Mark every position >= num_disks as failed/missing */
+			for (i = num_disks; i < expand_to; i++) {
+				arr->disk[i] = NULL;
+				arr->dm_devs[i] = NULL;
+				arr->disk_offset[i] = 0;
+				memset(&arr->sbs[i], 0, sizeof(arr->sbs[i]));
+				lhsr_failed_disks_set(arr,
+					lhsr_failed_disks_get(arr) | (1 << i));
+			}
+
+			arr->disks = expand_to;
+			arr->degraded = true;
+
+			/* Recompute user-visible size with correct disk count.
+			 * Initial size was computed with old_disks only. */
+			size = arr->disk_sectors;
+			if (arr->raid_type >= LHSR_RAID5) {
+				unsigned int pd = (arr->raid_type == LHSR_RAID5) ? 1 : 2;
+				unsigned int dd = arr->disks - pd;
+				size = size * dd;
+			}
+			arr->size = size;
+
+			DMINFO("Degraded mode: %u of %u disks present, size=%llu",
+			       old_disks, expand_to, (u64)size);
+		} else if (full_count > 0 && full_count == num_disks) {
+			DMINFO("Degraded flag set but all disks present — array is healthy");
+			arr->degraded = false;
+		} else if (total_disks > 0 && total_disks == num_disks) {
+			DMINFO("total_disks=%u matches provided disks — array is healthy",
+			       total_disks);
+			arr->degraded = false;
+		} else {
+			/*
+			 * No superblock and no total_disks=N available.
+			 * Keep arr->degraded = true so writes are rejected
+			 * and status correctly reports DEGRADED, but we
+			 * cannot expand because the expected disk count is
+			 * unknown.  The caller should provide total_disks=N
+			 * if they know the full array membership count.
+			 */
+			DMWARN("Degraded flag set but no superblock with disk_count "
+			       "and no total_disks=N — keeping %u disks, writes "
+			       "will be rejected until array is fully populated",
+			       num_disks);
+			arr->degraded = true;
+		}
+	}
+
 	/* Recover failed disks from superblock state */
-	for (i = 0; i < num_disks; i++) {
+	for (i = 0; i < arr->disks; i++) {
 		if (arr->sbs[i].disk_state >= LHSR_DISK_DEGRADED)
 			lhsr_failed_disks_set(arr, lhsr_failed_disks_get(arr) | (1 << i));
 	}
@@ -2176,11 +2303,12 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	DMINFO("Created LHSR: type=%u size=%llu", raid_type, size);
 
-	/* Log RAID level info */
+	/* Log RAID level info.
+	 * Use arr->disks (post-expansion) for accurate count in degraded mode. */
 	if (raid_type == LHSR_RAID5) {
-		DMINFO("RAID5 configured: %u data + 1 parity", num_disks - 1);
+		DMINFO("RAID5 configured: %u data + 1 parity", arr->disks - 1);
 	} else if (raid_type == LHSR_RAID6) {
-		DMINFO("RAID6 configured: %u data + 2 parity", num_disks - 2);
+		DMINFO("RAID6 configured: %u data + 2 parity", arr->disks - 2);
 	}
 
 	return 0;
@@ -2246,10 +2374,16 @@ static void lhsr_dtr(struct dm_target *ti)
 
 	DMDEBUG("dtr: Writing superblocks for %u disks", arr->disks);
 
-	/* Write updated superblocks for all disks before destroying */
+	/* Write updated superblocks for all disks before destroying.
+	 * NULL disk entries (degraded-mode missing slots) are skipped. */
 	arr->generation++;
 	for (i = 0; i < arr->disks; i++) {
 		struct lhsr_superblock *sb = &arr->sbs[i];
+
+		if (!arr->disk[i]) {
+			DMDEBUG("dtr: Disk %u is NULL (degraded missing slot), skipping", i);
+			continue;
+		}
 
 		DMINFO("dtr: Processing disk %u", i);
 		sb->last_update = ktime_get_real_seconds();
@@ -3652,6 +3786,21 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 	 * FLUSH handling: forward REQ_OP_FLUSH to all working member disks.
 	 * num_flush_bios = 1 ensures DM serializes flush requests.
 	 */
+	/*
+	 * Degraded mode: reject non-read, non-flush I/O.
+	 * Reads are safe (reconstructed from parity/mirrors).  FLUSH is harmless.
+	 * Writes, discards, and any other non-read-op are unsafe: with missing
+	 * disks we cannot maintain parity consistency or mirror replication.
+	 */
+	if (arr->degraded && bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_FLUSH) {
+		DMDEBUG("Degraded: rejecting %s I/O at sector %llu",
+			bio_op(bio) == REQ_OP_DISCARD ? "DISCARD" : "WRITE",
+			(u64)(bio->bi_iter.bi_sector - ti->begin));
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return DM_MAPIO_SUBMITTED;
+	}
+
 	if (bio_op(bio) == REQ_OP_FLUSH) {
 		struct lhsr_mirror_ctx *mctx;
 		unsigned int i, working = 0;
@@ -4185,8 +4334,11 @@ passthrough_single:
 	}
 	}
 
-	/* Read: try primary, failover to any working disk */
-	if (!(lhsr_failed_disks_get(arr) & (1 << arr->primary_disk))) {
+	/* Read: try primary, failover to any working disk.
+	 * Degraded-mode NULL disk slots are checked via failed_disks AND
+	 * the explicit !arr->disk[] guard (belt-and-suspenders). */
+	if (!(lhsr_failed_disks_get(arr) & (1 << arr->primary_disk)) &&
+	    arr->disk[arr->primary_disk]) {
 		bio_set_dev(bio, arr->disk[arr->primary_disk]);
 		bio->bi_iter.bi_sector = offset + arr->disk_offset[arr->primary_disk];
 		if (lhsr_setup_io_tracking(bio, ti) < 0) {
@@ -4203,7 +4355,8 @@ passthrough_single:
 		for (i = 0; i < arr->disks; i++) {
 			if (i == arr->primary_disk)
 				continue;
-			if (!(lhsr_failed_disks_get(arr) & (1 << i))) {
+			if (!(lhsr_failed_disks_get(arr) & (1 << i)) &&
+			    arr->disk[i]) {
 				DMINFO("Failover read from disk %u to disk %u",
 				       arr->primary_disk, i);
 				bio_set_dev(bio, arr->disk[i]);
@@ -4241,15 +4394,30 @@ static void lhsr_status(struct dm_target *ti, status_type_t type, unsigned int f
 	switch (type) {
 	case STATUSTYPE_INFO:
 		if (arr->raid_type == LHSR_RAID0) {
-			sz += scnprintf(result + sz, maxlen - sz, "OK %u/%llu",
-				       arr->disks, arr->size);
+			const char *state = (arr->degraded || lhsr_failed_disks_get(arr)) ? "DEGRADED" : "OK";
+			sz += scnprintf(result + sz, maxlen - sz, "%s %u/%llu",
+				       state, arr->disks, arr->size);
 		} else if (arr->raid_type == LHSR_RAID1) {
 			unsigned int healthy = (lhsr_failed_disks_get(arr) == 0) ? arr->disks : arr->disks - 1;
-			const char *state = (lhsr_failed_disks_get(arr) == 0) ? "OK" : "DEGRADED";
+			const char *state = (arr->degraded || lhsr_failed_disks_get(arr)) ? "DEGRADED" : "OK";
 			sz += scnprintf(result + sz, maxlen - sz, "%s %u/%u err=%u fail=%d",
 				       state, healthy, arr->disks,
 				       atomic_read(&arr->io_errors),
 				       atomic_read(&arr->failovers));
+		} else if (arr->raid_type >= LHSR_RAID5) {
+			unsigned long failed = lhsr_failed_disks_get(arr);
+			const char *raid_name = arr->raid_type == LHSR_RAID5 ? "RAID5" : "RAID6";
+			const char *state = arr->degraded ? "DEGRADED" :
+					   failed ? "DEGRADED" : "OK";
+			unsigned int healthy = 0;
+			{ unsigned int j;
+			for (j = 0; j < arr->disks; j++) {
+				if (!(failed & (1 << j)) && arr->disk[j])
+					healthy++;
+			} }
+			sz += scnprintf(result + sz, maxlen - sz, "%s %s %u/%u err=%u",
+				       state, raid_name, healthy, arr->disks,
+				       atomic_read(&arr->io_errors));
 		}
 		if (arr->scrub_state != LHSR_SCRUB_IDLE) {
 			const char *state_str = "IDLE";
@@ -4269,9 +4437,10 @@ static void lhsr_status(struct dm_target *ti, status_type_t type, unsigned int f
 		}
 		break;
 	case STATUSTYPE_TABLE:
-		sz += scnprintf(result + sz, maxlen - sz, "UUID=%llx RAID=%u DISKS=%u INTEGRITY=%d",
+		sz += scnprintf(result + sz, maxlen - sz,
+			       "UUID=%llx RAID=%u DISKS=%u INTEGRITY=%d DEGRADED=%d",
 			       arr->uuid, arr->raid_type, arr->disks,
-			       arr->integrity_below);
+			       arr->integrity_below, arr->degraded);
 		if (arr->raid_type >= LHSR_RAID5) {
 			const char *raid_name = arr->raid_type == LHSR_RAID5 ? "RAID5" : "RAID6";
 			sz += scnprintf(result + sz, maxlen - sz, " TYPE=%s", raid_name);
