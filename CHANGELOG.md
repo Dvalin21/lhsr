@@ -6,7 +6,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [5.1.0] — 2026-06-13 — Phase 5: Recovery Tools + Kernel Degraded Mode (5.1-5.4)
+## [5.1.0] — 2026-06-13 — Phase 5: Recovery Tools + Kernel Degraded Mode + Recovery Docs (5.1-5.5)
 
 ### Added
 
@@ -126,6 +126,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ### Build
 - Zero warnings on the kernel module target (`make -C ... M=... modules`).
 - Zero warnings across all 4 targets (module, daemon, CLI, recovery tool).
+
+---
+
+## [5.2.0] — 2026-06-13 — Phase 5.5: Recovery Procedure Documentation
+
+### Added
+- `RECOVERY.md`: Complete disk failure recovery guide covering 5 scenarios:
+  - **Scenario A**: Single disk failed, array still intact — online replacement
+  - **Scenario B**: Array won't assemble (too few disks) — `lhsrctl recover` + `degraded` mode with `total_disks=N`
+  - **Scenario C**: Offline reconstruction — `lhsrctl reconstruct` for dead disks
+  - **Scenario D**: Fresh array with missing disks — `degraded + total_disks=N`
+  - **Scenario E**: Multiple failures / RAID6 dual failure — limitations
+- Full end-to-end RAID5 disk failure walkthrough from failure to recovery
+- Recovery tools quick reference table
+- Superblock layout appendix (key fields for recovery)
+- All `dmsetup create` table format details explained field-by-field
+
+### Changed
+- `ROADMAP.md`: Phase 5.5 marked ✅ COMPLETE.
 
 ---
 

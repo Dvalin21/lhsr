@@ -132,6 +132,7 @@ sudo cp userspace/daemon/lhsrd /usr/local/bin/
 
 | Document | Contents |
 |----------|----------|
+| [RECOVERY.md](RECOVERY.md) | Step-by-step disk failure recovery guide (5 scenarios + walkthrough) |
 | [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) | Honest gap analysis — what works, what doesn't |
 | [ROADMAP.md](ROADMAP.md) | Phased implementation plan |
 | [docs/technical-specification.md](docs/technical-specification.md) | Original spec (needs update to match reality) |

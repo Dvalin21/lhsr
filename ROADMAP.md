@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-13 (Phase 5 COMPLETE — recovery tools + kernel degraded mode)
+**Last Updated:** 2026-06-13 (Phase 5 COMPLETE — recovery tools, kernel degraded mode, recovery docs)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -465,7 +465,7 @@ Options:
 - ✅ 5.2 `lhsrctl recover` with degraded mode and dm-zero placeholders
 - ✅ 5.3 `lhsrctl reconstruct` — offline data recovery from N-1 disks
 - ✅ 5.4 Kernel degraded assembly support — dedicated mode with `total_disks=N`, parity reconstruction reads, write rejection, NULL-disk-safe destructor
-- ⏳ Updated recovery procedure documentation
+- ✅ 5.5 Recovery procedure documentation — `RECOVERY.md` covering 5 scenarios + full walkthrough
 
 ---
 
