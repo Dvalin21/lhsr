@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-12 (Phase 5 COMPLETE, Phase 6.1 COMPLETE)
+**Last Updated:** 2026-06-13 (Phase 6.2 COMPLETE)
 **Based on:** PRODUCTION_READINESS.md (gap analysis registry)
 
 ---
@@ -486,9 +486,9 @@ LHSR), and merges them with LVM. It does NOT belong in the kernel module.
 3. Stack LHSR self-healing on top of each tier (optional, default mdadm)
 
 ### Design Decisions (from scoping document)
-- **v1 is plan-only**: The `shr plan` command computes the layout and prints
-  the sgdisk + mdadm/LHSR commands. User executes them manually. No rollback
-  problem.
+- **v1 includes create**: Beyond the scoping doc, `shr create` was added in v1
+  because the layout computation is the hard part — executing sgdisk+mdadm+LVM
+  is straightforward and eliminates copy-paste errors.
 - **No auto-rebalance**: Adding disks to an existing layout is manual in v1.
 - **mdadm default, LHSR optional**: `--lhsr` flag for self-healing tiers.
 - **Zero kernel changes**: SHR is purely a userspace tool.
@@ -505,7 +505,7 @@ LHSR), and merges them with LVM. It does NOT belong in the kernel module.
 ### Deliverables
 - ✅ Scoping/design document (`docs/plans/2026-06-13-shr-userspace-design.md`)
 - ✅ Phase 6.1: `lhsrctl shr plan` — layout calculator + command generator
-- ⏳ Phase 6.2: `lhsrctl shr create` — automatic partitioning + tier creation + LVM setup
+- ✅ Phase 6.2: `lhsrctl shr create` — automatic partitioning + tier creation + LVM setup
 - ⏳ Phase 6.3: `lhsrctl shr status` — show current SHR layout from metadata
 - ⏳ Phase 6.4: Integration testing with loopback devices of different sizes
 

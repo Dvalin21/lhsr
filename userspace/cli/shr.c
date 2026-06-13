@@ -868,6 +868,20 @@ static int shr_create_wait_partitions(struct shr_layout *layout,
 		if (pcount == 0)
 			continue;
 
+		/* Check if the first partition device already exists
+		 * (e.g. loop devices with losetup -P auto-create them).
+		 * If so, skip re-read entirely. */
+		{
+			char first_part[512];
+			struct stat st;
+			shr_get_part_dev(dev, 1, first_part, sizeof(first_part));
+			if (stat(first_part, &st) == 0 && S_ISBLK(st.st_mode)) {
+				printf("  Partition %s already exists, skipping re-read\n",
+				       first_part);
+				goto wait_phase;
+			}
+		}
+
 		/* Re-read partition table */
 		printf("  Re-reading partition table on %s ...\n", dev);
 		fflush(stdout);
@@ -881,6 +895,7 @@ static int shr_create_wait_partitions(struct shr_layout *layout,
 			shr_run_cmd("partx -a '%s'", dev);
 		}
 
+wait_phase:
 		/* Wait for each partition device to appear */
 		for (pn = 1; pn <= pcount; pn++) {
 			if (shr_wait_for_part(dev, pn, 5000) < 0)
