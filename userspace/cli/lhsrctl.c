@@ -1085,8 +1085,20 @@ static const char *raid_type_table_name(unsigned int t)
 	}
 }
 
-/* Placeholder path for missing disks (reads zeros, discards writes) */
-#define MISSING_DISK_PLACEHOLDER  "/dev/zero"
+/*
+ * Placeholder device name for missing disks.
+ * Full name: lhsr_<array_short>_ph_<disk_idx>
+ *   where array_short = last 8 hex chars of array UUID
+ * dm-zero table: "0 <sectors> zero"  (reads zeros, discards writes)
+ *
+ * These MUST be created before the main dmsetup create command:
+ *   dmsetup create <name> --table '0 <sectors> zero'
+ * And removed after teardown:
+ *   dmsetup remove <name>
+ *
+ * The array_short substring keeps names unique per array and short
+ * enough for /dev/mapper (max 63 chars + "/dev/mapper/" prefix).
+ */
 
 /* Command recover */
 static int cmd_recover(int argc, char **argv)
@@ -1264,20 +1276,6 @@ static int cmd_recover(int argc, char **argv)
 			continue;
 		}
 
-		/*
-		 * Build the dmsetup create command.
-		 *
-		 * Table format:
-		 *  0 <size> lhsr <type> <dev1> <offset1> <dev2> <offset2> ...
-		 *
-		 * For missing disks: use /dev/zero as a placeholder.
-		 * /dev/zero reads return zeros, writes are discarded.
-		 * Replace the /dev/zero entry with a real device when
-		 * the replacement disk is connected, then use:
-		 *   dmsetup load <name> --table '<new_table_line>'
-		 *   dmsetup resume <name>
-		 */
-
 		printf("\n  Assembly command:\n");
 
 		/* Build the full table line */
@@ -1285,6 +1283,7 @@ static int cmd_recover(int argc, char **argv)
 		int pos = 0;
 		int table_len = sizeof(table_line);
 		int n;
+		int missing_count = 0;
 
 		/* Size: user-visible capacity for RAID5/6 = data_disks * disk_sectors */
 		uint64_t user_size;
@@ -1312,14 +1311,41 @@ static int cmd_recover(int argc, char **argv)
 		}
 		if (n > 0) pos += n;
 
+		/*
+		 * Build placeholder dm-zero commands for missing disks.
+		 * dm-zero reads zeros for any offset, discards writes.
+		 * Format: dmsetup create <name> --table '0 <sectors> zero'
+		 */
+		char array_short[16];
+		if (missing_count > 0 || true) {
+			snprintf(array_short, sizeof(array_short), "%s",
+				 uuid_str + strlen(uuid_str) - 8);
+		}
+		for (d = 0; d < (int)arr->disk_count; d++) {
+			if (arr->disk_present[d])
+				continue;
+			if (missing_count == 0)
+				printf("\n  Missing disk placeholder(s) (run these first):\n");
+			char ph_name[64];
+			snprintf(ph_name, sizeof(ph_name), "lhsr_%s_ph_%u",
+				 array_short, d);
+			printf("  # dmsetup create %s --table '0 %llu zero'\n",
+			       ph_name, (unsigned long long)arr->total_sectors);
+			missing_count++;
+		}
+
 		/* Add each disk with offset=0 */
 		for (d = 0; d < (int)arr->disk_count; d++) {
-			const char *dev_path;
+			char dev_path[256];
 
 			if (arr->disk_present[d]) {
-				dev_path = arr->disks[d].path;
+				strncpy(dev_path, arr->disks[d].path, sizeof(dev_path) - 1);
 			} else {
-				dev_path = MISSING_DISK_PLACEHOLDER;
+				char ph_name[64];
+				snprintf(ph_name, sizeof(ph_name), "lhsr_%s_ph_%u",
+					 array_short, d);
+				snprintf(dev_path, sizeof(dev_path), "/dev/mapper/%s",
+					 ph_name);
 			}
 
 			n = snprintf(table_line + pos, table_len - pos,
@@ -1333,6 +1359,8 @@ static int cmd_recover(int argc, char **argv)
 			}
 		}
 
+		if (missing_count)
+			printf("\n  Main assembly command (run after placeholders):\n");
 		printf("  # dmsetup create %s --table '%s'\n", dev_name, table_line);
 
 		printf("\n  To verify before creating:\n");

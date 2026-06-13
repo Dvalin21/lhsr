@@ -6,6 +6,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [5.0.0] — 2026-06-12 — Phase 5: Recovery Tools (5.1-5.2)
+
+### Added
+
+#### Enhanced `lhsr-scan` (5.1)
+- **`--deep` flag**: Scans last ~2048 sectors at 16-sector granularity for orphaned
+  superblocks (beyond primary/backup positions). Catches superblocks from partial
+  writes, misaligned devices, or manual dd.
+- **`--json` / `-j` flag**: Machine-parseable JSON output with per-disk superblock
+  array including `device`, `total_sectors`, `found`, `superblocks[]` (sector,
+  position, generation, version, raid_type, disk_index, csum_valid), summary
+  object with counts. Corruption detection via `csum_valid` field.
+- **`-v` without device args**: Auto-detects `/dev/sd*`, `/dev/vd*`, `/dev/nvme*`
+  block devices (filters partitions) and scans all of them.
+
+#### `lhsrctl recover` (5.2)
+- **New `recover` subcommand**: Scans provided block devices for LHSR superblocks,
+  cross-references by array UUID, and generates `dmsetup create` commands for
+  assembly.
+- **Per-array output**: UUID, RAID type, disk count, parity, minimum healthy,
+  creation time, generation, per-disk present/online state.
+- **Correct table format**: RAID5/6 includes required `<chunk_sects> <stripe_depth>
+  <cont_sects>` parameters (defaults: 8 1 8 for 4KB chunks).
+- **Degraded mode with dm-zero placeholders**: When fewer than `disk_count`
+  devices provided, generates `dmsetup create` commands for dm-zero placeholder
+  targets (reads zeros, discards writes) for missing disk positions.
+- **Placeholder names**: `lhsr_<array_short>_ph_<disk_idx>` — unique per array and
+  short enough for `/dev/mapper/` limits.
+- **Safety validation**: Rejects assembly when `present < min_healthy` (e.g., RAID1
+  with only 1 disk), rejects unsupported RAID types (SHR/SHR2).
+
+### Changed
+- `userspace/recovery/lhsr-scan.c`: +527/-145 lines — deep scan, JSON output,
+  auto-detect, corruption detection.
+- `userspace/cli/lhsrctl.c`: `cmd_recover()` fully implemented. Removed
+  `create_missing_placeholder()` and `cleanup_placeholders()` (bad approach —
+  required root+losetup). Replaced with dm-zero placeholders (no root needed,
+  proper block devices).
+
+### Build
+- Zero new compiler warnings on any target (`-Wall -Wextra -O2 -g`).
+- All targets build clean: kernel module (dm-lhsr.ko), daemon (lhsrd), CLI
+  (lhsrctl), recovery tool (lhsr-scan).
+
+### Documentation
+- `ROADMAP.md`: Phase 5 marked IN PROGRESS with 5.1 and 5.2 complete.
+
+---
+
 ## [4.0.0] — 2026-06-12 — Phase 4: Predictive Failure Health Score, CLI Integration
 
 ### Added

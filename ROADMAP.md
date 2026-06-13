@@ -354,40 +354,80 @@ Disk: /dev/sdb
 
 ## Phase 5: Recovery Tools — IN PROGRESS (2026-06-12)
 
-**Duration:** Estimated 2 weeks
+**Duration:** Estimated 2 weeks (5.1-5.2 done, 5.3-5.4 remaining)
 
 **What changed:** Userspace recovery tools to find, assemble, and recover LHSR arrays after disk failure.
 
-### Implementation plan
+### Implemented
 
-#### 5.1 Enhanced superblock scan (`lhsr-scan --deep`)
-- Scan ALL metadata sectors (not just primary/backup positions) for LHSR_MAGIC
-- Auto-detect block devices from `/dev/sd*` and `/dev/disk/by-id/`
-- JSON output format for machine parsing (in addition to human-readable)
-- Detect corruption patterns: checksum mismatch, stale generations, orphaned superblocks
+#### 5.1 Enhanced superblock scan (`lhsr-scan --deep`) — ✅ COMPLETE
 
-#### 5.2 Array assembly recovery (`lhsrctl recover`)
-- Integrate with libdevmapper (`lhsr_dm_create()` from daemon library)
-- Given N disks, determine best array configuration from superblock metadata
-- Generate and execute `dmsetup create` command
-- Support degraded mode (missing disks) via kernel module changes
+**Commit:** `434c1d8`
+
+Added three new operating modes to `lhsr-scan`:
+
+1. **`--deep` (deep scan)**: Scans the last ~2048 sectors at 16-sector granularity for orphaned superblocks, in addition to the known primary/backup positions. Catches superblocks from partial writes, misaligned devices, or manual dd operations.
+2. **`--json` / `-j`**: Machine-parseable JSON output with per-disk superblock array. Includes `device`, `total_sectors`, `found`, `superblocks[]` (each with sector, position, generation, version, raid_type, disk_index, csum_valid), `best_generation`, `array_uuid`, `raid_type`. Summary object with `scanned`, `found`, `no_data` counts. Corruption detection via `csum_valid` field.
+3. **`-v` without device args**: Auto-detects `/dev/sd*`, `/dev/vd*`, `/dev/nvme*` block devices (filters out partition siblings) and scans all of them.
+
+Backward compatible: `lhsr-scan /dev/sdb` produces identical output to pre-5.1 version.
+
+**Tested on:** Synthetic 10MB disk image with primary (gen 42) and backup (gen 41) superblocks — both found, checksum status correctly reported, cross-ref shows valid/corrupt counts.
+
+#### 5.2 Array assembly recovery (`lhsrctl recover`) — ✅ COMPLETE
+
+**Commit:** `bcc6f3e`, `46ce533`
+
+The `lhsrctl recover` command scans provided block devices for LHSR superblocks, determines the best array configuration, and generates `dmsetup create` commands for assembly.
+
+**Input:** Device paths on command line:
+```
+$ lhsrctl recover /dev/sdb /dev/sdc /dev/sdd
+```
+
+**Output (per-array):**
+- Array summary: UUID, RAID type, disk count, parity, minimum healthy, creation time, generation
+- Per-disk status: present/online state, generation, disk_state
+- For missing disks: dm-zero placeholder commands to create zero-initialized block devices
+- Main `dmsetup create` command with correct table format:
+  - RAID0/1: `0 <size> lhsr <type> <dev> 0 [<dev> 0...]`
+  - RAID5/6: `0 <size> lhsr <type> <chunk> <stripe_depth> <cont> <dev> 0 [<dev> 0...]`
+  - Defaults: chunk=8 sectors (4KB), stripe_depth=1, cont=8
+
+**Degraded mode:** When fewer than `disk_count` devices are provided, the tool generates dm-zero placeholder commands for missing positions. dm-zero reads zeros and discards writes — the kernel module can use it as a drop-in replacement until a real disk is added via `dmsetup reload` + `dmsetup resume`.
+
+**Safety checks:**
+- Validates `present >= min_healthy` (disk_count - parity) before generating commands
+- RAID1 requires both disks
+- SHR/SHR2 types rejected (no kernel module support)
+- Table line overflow detection
+
+**Tested on:**
+- Single disk (degraded RAID5) → correct `/dev/mapper/lhsr_<uuid>_ph_<idx>` placeholder
+- Full 3-disk RAID5 array → correct table with all 3 devices
+- Degraded 2-disk RAID5 (1 missing disk) → placeholder + main command
+- dm-zero target verified on VM (creates, reads zeros, removes cleanly)
+
+### Not Yet Implemented
 
 #### 5.3 `lhsrctl reconstruct` command
 - Reconstruct data for replacement disk from N-1 surviving disks (RAID5/6)
 - Write reconstructed data + superblock to new disk
 - Hot-add to existing array
+- **Note:** Common case (1 missing disk in RAID5) is already handled by `lhsrctl recover` + dm-zero placeholder + kernel module native rebuild. This command would be needed for offline data recovery when the kernel module is unavailable.
 
 #### 5.4 Kernel: degraded assembly support
 - Allow `dmsetup create` with fewer disks than `disk_count`
 - Missing disks: read returns zeros, writes discarded
 - Array marked degraded-read-only until fully populated
+- **Note:** Partial support exists (kernel constructor accepts `/dev/mapper/<dm-zero>` as any disk), but dedicated degraded mode with size reduction and read-only enforcement is not implemented.
 
 ### Deliverables
-- Deep scan tool with JSON output
-- Recovery assembly command
-- Data reconstruction for replacement disks
-- Degraded kernel assembly (read-only)
-- Updated recovery procedure documentation
+- ✅ 5.1 Enhanced `lhsr-scan` with `--deep`, `--json`, auto-detect
+- ✅ 5.2 `lhsrctl recover` with degraded mode and dm-zero placeholders
+- ⏳ 5.3 `lhsrctl reconstruct` — data recovery from N-1 disks
+- ⏳ 5.4 Kernel degraded assembly support
+- ⏳ Updated recovery procedure documentation
 
 ---
 
