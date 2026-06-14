@@ -93,6 +93,7 @@ static char *control_query(const char *cmd);
 /* Forward declarations from subcommand files */
 int cmd_shr_plan(int argc, char **argv);
 int cmd_shr_create(int argc, char **argv);
+int cmd_shr_status(int argc, char **argv);
 
 /* Command options */
 enum {
@@ -138,6 +139,7 @@ static void usage(const char *prog)
 		"  reconstruct [opts] <dev>...   Reconstruct missing RAID5/6 disk from N-1\n"
 		"  shr plan [opts] <dev>...     Compute SHR layout for variable-size disks\n"
 		"  shr create [opts] <dev>...   Execute SHR layout (DESTRUCTIVE)\n"
+		"  shr status                   Show current SHR topology and health\n"
 		"  message <device> <msg> [args] Send message to kernel\n"
 		"\n"
 		"RAID Types:\n"
@@ -2015,16 +2017,19 @@ int main(int argc, char **argv)
 		ret = cmd_reconstruct(argc, argv);
 		break;
 	case CMD_SHR:
-		/* Parse shr subcommands: "lhsrctl shr plan" or "lhsrctl shr create" */
-		if (argc < 4) {
-			fprintf(stderr, "Usage: %s shr <plan|create> [opts] <device>...\n", PROGNAME);
+		/* Parse shr subcommands: "lhsrctl shr plan|create|status" */
+		if (argc < 3) {
+			fprintf(stderr, "Usage: %s shr <plan|create|status> [opts] <device>...\n", PROGNAME);
 			ret = 1;
 		} else if (strcmp(argv[2], "plan") == 0) {
 			ret = cmd_shr_plan(argc - 2, argv + 2);
 		} else if (strcmp(argv[2], "create") == 0) {
 			ret = cmd_shr_create(argc - 2, argv + 2);
+		} else if (strcmp(argv[2], "status") == 0) {
+			ret = cmd_shr_status(argc - 2, argv + 2);
 		} else {
-			fprintf(stderr, "Unknown shr subcommand '%s'. Use: plan, create\n", argv[2]);
+			fprintf(stderr, "Unknown shr subcommand '%s'. Use: plan, create, status\n",
+				argv[2]);
 			ret = 1;
 		}
 		break;

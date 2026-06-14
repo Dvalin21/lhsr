@@ -26,6 +26,7 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <dirent.h>
 #include <linux/fs.h>
 #include <errno.h>
 
@@ -1219,4 +1220,354 @@ out:
 	free(sizes);
 	free(disk_paths);
 	return ret;
+}
+
+/* ===================================================================
+ * Phase 6.3: shr status — discover and display current SHR layout
+ * =================================================================== */
+
+/* Read a sysfs attribute file into buf.  Returns 0 on success, -1 on error. */
+static int read_sysfs(const char *path, char *buf, size_t bufsz)
+{
+	int fd, n;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	n = read(fd, buf, bufsz - 1);
+	close(fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = '\0';
+	/* Strip trailing newline */
+	if (n > 0 && buf[n - 1] == '\n')
+		buf[n - 1] = '\0';
+	return 0;
+}
+
+/* Run a command and capture its stdout into buf.
+ * Returns exit code (0 on success), -1 on popen failure. */
+static int shr_capture(const char *cmd, char *buf, size_t bufsz)
+{
+	FILE *fp;
+	size_t n;
+
+	fp = popen(cmd, "r");
+	if (!fp)
+		return -1;
+	n = fread(buf, 1, bufsz - 1, fp);
+	if (n > 0 && buf[n - 1] == '\n')
+		buf[n - 1] = '\0';
+	buf[n] = '\0';
+	return pclose(fp);
+}
+
+/* Entry from /dev/md/ directory scan. */
+struct md_entry {
+	char name[64];
+	int md_num;    /* kernel md device number, -1 if unknown */
+};
+
+/* List /dev/md/<name> entries matching a prefix.  Returns count. */
+static int scan_md_devices(const char *prefix,
+			   struct md_entry *entries, int max)
+{
+	DIR *dir;
+	struct dirent *de;
+	int count = 0;
+
+	dir = opendir("/dev/md");
+	if (!dir)
+		return 0;
+
+	while ((de = readdir(dir)) != NULL && count < max) {
+		if (de->d_name[0] == '.')
+			continue;
+		if (strncmp(de->d_name, prefix, strlen(prefix)) != 0)
+			continue;
+		snprintf(entries[count].name, sizeof(entries[count].name),
+			 "%.63s", de->d_name);
+
+		/* Resolve symlink to get md device number */
+		char link[256];
+		char full[512];
+		snprintf(full, sizeof(full), "/dev/md/%s", de->d_name);
+		ssize_t n = readlink(full, link, sizeof(link) - 1);
+		if (n > 0) {
+			link[n] = '\0';
+			const char *p = strrchr(link, '/');
+			if (p) p++;
+			else p = link;
+			if (p[0] == 'm' && p[1] == 'd')
+				entries[count].md_num = atoi(p + 2);
+		}
+		count++;
+	}
+	closedir(dir);
+	return count;
+}
+
+int cmd_shr_status(int argc, char **argv)
+{
+	struct md_entry mdents[16];
+	int ntiers;
+	unsigned int i;
+	int found_lvm = 0;
+
+	(void)argc;
+	(void)argv;
+
+	printf("LHSR SHR Status\n");
+	printf("===============\n\n");
+
+	/* ---- Scan SHR tiers ---- */
+	ntiers = scan_md_devices("shr_tier_", mdents, 16);
+
+	if (ntiers == 0) {
+		printf("No SHR tiers found.\n");
+		printf("  (Looked in /dev/md/ for shr_tier_* devices)\n\n");
+		printf("No LVM VG created by SHR found.\n");
+		printf("Use 'lhsrctl shr create' to create an SHR layout.\n");
+		return 1;
+	}
+
+	printf("Tiers: %d\n\n", ntiers);
+
+	/* ---- Print each tier ---- */
+	for (i = 0; i < (unsigned int)ntiers; i++) {
+		char sysfs[256];
+		char buf[256];
+		char level[64] = "?";
+		int raid_disks = 0;
+		int degraded = 0;
+		uint64_t array_sectors = 0;
+		char sync_action[64] = "?";
+		char sync_progress[256] = "";
+		char metadata[64] = "?";
+		DIR *sdir;
+		struct dirent *de;
+		int member_count = 0;
+
+		printf("  Tier %d\n", (int)i);
+		printf("    Device: /dev/md/%s", mdents[i].name);
+		if (mdents[i].md_num >= 0)
+			printf(" (md%d)", mdents[i].md_num);
+		printf("\n");
+
+		if (mdents[i].md_num < 0)
+			goto skip_sysfs;
+
+		/* Read sysfs attributes */
+		snprintf(sysfs, sizeof(sysfs), "/sys/block/md%d/md/level",
+			 mdents[i].md_num);
+		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+			snprintf(level, sizeof(level), "%.63s", buf);
+
+		snprintf(sysfs, sizeof(sysfs), "/sys/block/md%d/md/raid_disks",
+			 mdents[i].md_num);
+		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+			raid_disks = atoi(buf);
+
+		snprintf(sysfs, sizeof(sysfs), "/sys/block/md%d/md/degraded",
+			 mdents[i].md_num);
+		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+			degraded = atoi(buf);
+
+		snprintf(sysfs, sizeof(sysfs), "/sys/block/md%d/md/array_size",
+			 mdents[i].md_num);
+		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0) {
+			array_sectors = strtoull(buf, NULL, 10);
+		} else {
+			/* Fallback: read block device size */
+			snprintf(sysfs, sizeof(sysfs),
+				 "/sys/block/md%d/size",
+				 mdents[i].md_num);
+			if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+				array_sectors = strtoull(buf, NULL, 10);
+		}
+
+		snprintf(sysfs, sizeof(sysfs),
+			 "/sys/block/md%d/md/sync_action",
+			 mdents[i].md_num);
+		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+			snprintf(sync_action, sizeof(sync_action),
+				 "%.63s", buf);
+
+		snprintf(sysfs, sizeof(sysfs),
+			 "/sys/block/md%d/md/sync_completed",
+			 mdents[i].md_num);
+		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0 && buf[0])
+			snprintf(sync_progress, sizeof(sync_progress),
+				 " (%.127s)", buf);
+
+		snprintf(sysfs, sizeof(sysfs),
+			 "/sys/block/md%d/md/metadata_version",
+			 mdents[i].md_num);
+		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+			snprintf(metadata, sizeof(metadata),
+				 "%.63s", buf);
+
+		printf("    RAID level: %s\n", level);
+		printf("    Disks: %d configured, %d failed\n",
+		       raid_disks, degraded);
+		printf("    Size: %lu sectors (%.1f GiB)\n",
+		       (unsigned long)array_sectors,
+		       (double)array_sectors * 512 / (1024*1024*1024));
+		printf("    Metadata: %s\n", metadata);
+		printf("    Sync: %s%s\n", sync_action, sync_progress);
+
+		/* List member partitions */
+		snprintf(sysfs, sizeof(sysfs),
+			 "/sys/block/md%d/slaves/",
+			 mdents[i].md_num);
+		sdir = opendir(sysfs);
+		if (sdir) {
+			printf("    Members:\n");
+			while ((de = readdir(sdir)) != NULL) {
+				if (de->d_name[0] == '.')
+					continue;
+				printf("      - %s\n", de->d_name);
+				member_count++;
+			}
+			closedir(sdir);
+		}
+		if (member_count == 0)
+			printf("    Members: (none)\n");
+		printf("\n");
+
+skip_sysfs: ;
+	}
+
+	/* ---- Discover LVM and mount topology ---- */
+	printf("LVM\n");
+	printf("---\n");
+
+	{
+		char buf[8192];
+		int rv;
+
+		/* Show VGs */
+		rv = shr_capture(
+			"lvm vgs --noheadings -o vg_name,vg_size,"
+			"pv_count,lv_count 2>/dev/null || true",
+			buf, sizeof(buf));
+		(void)rv;
+
+		if (buf[0] == '\0') {
+			printf("  No LVM VGs found.\n");
+		} else {
+			found_lvm = 1;
+			printf("  VGs:\n");
+			char *line = buf;
+			while (line && *line) {
+				char *nl = strchr(line, '\n');
+				if (nl) *nl = '\0';
+				char *p = line;
+				while (*p == ' ') p++;
+				if (*p) {
+					char vg[64], vsz[64];
+					int pvc = 0, lvc = 0;
+					if (sscanf(p, "%63s %63s %d %d",
+						   vg, vsz, &pvc, &lvc) >= 2) {
+						printf("    %s (%s, %d PVs, "
+						       "%d LVs)\n",
+						       vg, vsz, pvc, lvc);
+					}
+				}
+				if (nl) line = nl + 1;
+				else break;
+			}
+		}
+
+		/* Show LVs with mount point info */
+		if (found_lvm) {
+			rv = shr_capture(
+				"lvm lvs --noheadings -o lv_name,vg_name,"
+				"lv_size,lv_attr 2>/dev/null || true",
+				buf, sizeof(buf));
+			if (buf[0]) {
+				printf("  LVs:\n");
+				char *line = buf;
+				while (line && *line) {
+					char *nl = strchr(line, '\n');
+					if (nl) *nl = '\0';
+					char *p = line;
+					while (*p == ' ') p++;
+					if (*p) {
+						char lv[64], vg[64],
+						     lsz[64], attr[16];
+						if (sscanf(p, "%63s %63s "
+							   "%63s %15s",
+							   lv, vg, lsz,
+							   attr) >= 3) {
+							char mnt[256] = "";
+							char mpt[512];
+							snprintf(mpt, sizeof(mpt),
+								"findmnt -n -o "
+								"TARGET "
+								"/dev/%s/%s "
+								"2>/dev/null "
+								"|| true",
+								vg, lv);
+							shr_capture(mpt, mnt,
+								sizeof(mnt));
+							printf("    %s/%s (%s, "
+							       "attr=%s)",
+							       vg, lv, lsz,
+							       attr);
+							if (mnt[0])
+								printf(" -> %s",
+								       mnt);
+							printf("\n");
+						}
+					}
+					if (nl) line = nl + 1;
+					else break;
+				}
+			}
+		}
+
+		/* Show PVs with type annotation */
+		rv = shr_capture(
+			"lvm pvs --noheadings -o pv_name,vg_name,pv_size "
+			"2>/dev/null || true",
+			buf, sizeof(buf));
+		if (buf[0]) {
+			printf("  PVs:\n");
+			char *line = buf;
+			while (line && *line) {
+				char *nl = strchr(line, '\n');
+				if (nl) *nl = '\0';
+				char *p = line;
+				while (*p == ' ') p++;
+				if (*p) {
+					char pv[256], vg[64], psz[64];
+					if (sscanf(p, "%255s %63s %63s",
+						   pv, vg, psz) >= 1) {
+						const char *type = "unknown";
+						if (strstr(pv, "shr_tier_"))
+							type = "SHR tier";
+						else if (strstr(pv, "md"))
+							type = "md device";
+						printf("    %s -> %s (%s)"
+						       " [%s]\n",
+						       pv,
+						       vg[0] ? vg : "(none)",
+						       psz, type);
+					}
+				}
+				if (nl) line = nl + 1;
+				else break;
+			}
+		}
+	}
+
+	if (!found_lvm && ntiers > 0) {
+		printf("No LVM VG found on SHR tiers.\n");
+		printf("The tiers exist but are not yet part of "
+		       "an LVM volume.\n");
+	}
+
+	printf("\n");
+	return 0;
 }

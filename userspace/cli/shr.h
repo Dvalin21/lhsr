@@ -120,4 +120,15 @@ void shr_print_commands(const struct shr_layout *layout,
  */
 int cmd_shr_create(int argc, char **argv);
 
+/*
+ * Show current SHR status: discover SHR tiers from system state,
+ * display their health, member disks, and any LVM built on top.
+ *
+ * No arguments needed — scans /dev/md/ for shr_tier_* arrays
+ * and checks LVM for VGs/LVs on those arrays.
+ *
+ * Returns 0 on success, 1 on error.
+ */
+int cmd_shr_status(int argc, char **argv);
+
 #endif /* LHSR_SHR_H */
