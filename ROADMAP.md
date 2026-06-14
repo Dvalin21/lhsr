@@ -1,7 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-14 (Phase 6.3 COMPLETE)
-**Based on:** PRODUCTION_READINESS.md (gap analysis registry)
+**Last Updated:** 2026-06-14 (Phase 6.4 COMPLETE)
 
 ---
 
@@ -507,7 +506,14 @@ LHSR), and merges them with LVM. It does NOT belong in the kernel module.
 - ✅ Phase 6.1: `lhsrctl shr plan` — layout calculator + command generator
 - ✅ Phase 6.2: `lhsrctl shr create` — automatic partitioning + tier creation + LVM setup
 - ✅ Phase 6.3: `lhsrctl shr status` — show current SHR layout from metadata
-- ⏳ Phase 6.4: Integration testing with loopback devices of different sizes
+- ✅ Phase 6.4: Integration testing with loopback devices of different sizes
+        - 4 loopbacks (1G + 3×1.6G) → 2-tier RAID5 → LVM VG
+        - `shr create` partitioned 4 disks into 5 total partitions (1+2+2+2)
+        - Both mdadm RAID5 arrays created and running
+        - LVM pools both tiers into single VG (4.10g)
+        - `shr status` shows correct hierarchy, PVs annotated [SHR tier]
+        - mkfs.ext4, mount, 100MB write/read: SHA256 verified PASS
+        - Bugs fixed: paired sort (sizes[]/disk_paths[] sync), --assume-clean
 
 ---
 
