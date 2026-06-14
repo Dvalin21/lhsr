@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <sys/wait.h>
+#include <sys/sysmacros.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <dirent.h>
@@ -1377,7 +1378,11 @@ int cmd_shr_status(int argc, char **argv)
 			 mdents[i].md_num);
 		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0) {
 			array_sectors = strtoull(buf, NULL, 10);
-		} else {
+			/* "default" means full device — read size directly */
+			if (array_sectors == 0 && buf[0] == 'd')
+				array_sectors = 0; /* flag to fall through */
+		}
+		if (array_sectors == 0) {
 			/* Fallback: read block device size */
 			snprintf(sysfs, sizeof(sysfs),
 				 "/sys/block/md%d/size",
@@ -1545,9 +1550,29 @@ skip_sysfs: ;
 					if (sscanf(p, "%255s %63s %63s",
 						   pv, vg, psz) >= 1) {
 						const char *type = "unknown";
-						if (strstr(pv, "shr_tier_"))
-							type = "SHR tier";
-						else if (strstr(pv, "md"))
+						struct stat pv_st;
+						unsigned int j;
+
+						/* Check if PV is a known SHR tier */
+						if (stat(pv, &pv_st) == 0) {
+							for (j = 0; j < (unsigned int)ntiers; j++) {
+								char md_path[128];
+								struct stat md_st;
+								snprintf(md_path, sizeof(md_path),
+									 "/dev/md/%.63s",
+									 mdents[j].name);
+								if (stat(md_path, &md_st) == 0 &&
+								    major(pv_st.st_rdev) ==
+								    major(md_st.st_rdev) &&
+								    minor(pv_st.st_rdev) ==
+								    minor(md_st.st_rdev)) {
+									type = "SHR tier";
+									break;
+								}
+							}
+						}
+						if (strcmp(type, "unknown") == 0 &&
+						    strstr(pv, "md"))
 							type = "md device";
 						printf("    %s -> %s (%s)"
 						       " [%s]\n",
