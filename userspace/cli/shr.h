@@ -25,7 +25,7 @@
 #define SHR_MAX_TIERS        32   /* Maximum RAID tiers */
 #define SHR_MAX_PARTITIONS   256  /* Max partitions across all disks */
 #define SHR_ALIGNMENT        2048 /* Default partition alignment (1 MB) */
-#define SHR_MIN_PARTITION    2097152 /* Default min partition (1 GB) */
+#define SHR_MIN_PARTITION    1048576 /* Default min partition (512 MB) */
 
 /* ===================================================================
  * Data Structures

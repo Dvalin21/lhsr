@@ -46,6 +46,18 @@ static int cmp_u64_asc(const void *a, const void *b)
 	return 0;
 }
 
+/* Paired sort: compare by size field for use with struct {size, path} */
+static int cmp_disk_info(const void *a, const void *b)
+{
+	const struct {
+		uint64_t size;
+		const char *path;
+	} *da = a, *db = b;
+	if (da->size < db->size) return -1;
+	if (da->size > db->size) return 1;
+	return 0;
+}
+
 static const char *raid_type_name(unsigned int t)
 {
 	switch (t) {
@@ -951,10 +963,11 @@ static int shr_create_raid(struct shr_layout *layout,
 			/* mdadm: build member list */
 			int pos = 0;
 
-			pos = snprintf(cmd, sizeof(cmd),
-				"mdadm --create /dev/md/shr_tier_%u "
-				"--level=%d --raid-devices=%u --bitmap=none",
-				i, raid_level, t->partition_count);
+		pos = snprintf(cmd, sizeof(cmd),
+			"mdadm --create /dev/md/shr_tier_%u "
+			"--level=%d --raid-devices=%u "
+			"--bitmap=none --assume-clean",
+			i, raid_level, t->partition_count);
 
 			for (j = 0; j < layout->partition_count; j++) {
 				char pdev[512];
@@ -1120,8 +1133,28 @@ int cmd_shr_create(int argc, char **argv)
 		sizes[i] = sz / 512;
 	}
 
-	/* Sort by size ascending for algorithm */
-	qsort(sizes, disk_count, sizeof(uint64_t), cmp_u64_asc);
+	/* Sort by size ascending — keep disk_paths in sync */
+	{
+		struct disk_info {
+			uint64_t size;
+			const char *path;
+		} *info = malloc(disk_count * sizeof(struct disk_info));
+		if (!info) {
+			fprintf(stderr, "Error: out of memory\n");
+			goto out;
+		}
+		for (i = 0; i < disk_count; i++) {
+			info[i].size = sizes[i];
+			info[i].path = disk_paths[i];
+		}
+		qsort(info, disk_count, sizeof(struct disk_info),
+		      cmp_disk_info);
+		for (i = 0; i < disk_count; i++) {
+			sizes[i] = info[i].size;
+			disk_paths[i] = info[i].path;
+		}
+		free(info);
+	}
 
 	/* Compute layout */
 	if (shr_plan_layout(sizes, disk_count, parity, 0, 0, &layout) < 0)
