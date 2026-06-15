@@ -130,5 +130,10 @@ int cmd_shr_create(int argc, char **argv);
  * Returns 0 on success, 1 on error.
  */
 int cmd_shr_status(int argc, char **argv);
+int cmd_shr_destroy(int argc, char **argv);
+int cmd_shr_scrub(int argc, char **argv);
+int cmd_shr_disk(int argc, char **argv);
+int cmd_shr_rebuild(int argc, char **argv);
+int cmd_shr_expand(int argc, char **argv);
 
 #endif /* LHSR_SHR_H */

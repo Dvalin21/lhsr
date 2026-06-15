@@ -94,6 +94,10 @@ static char *control_query(const char *cmd);
 int cmd_shr_plan(int argc, char **argv);
 int cmd_shr_create(int argc, char **argv);
 int cmd_shr_status(int argc, char **argv);
+int cmd_shr_destroy(int argc, char **argv);
+int cmd_shr_scrub(int argc, char **argv);
+int cmd_shr_disk(int argc, char **argv);
+int cmd_shr_rebuild(int argc, char **argv);
 
 /* Command options */
 enum {
@@ -140,6 +144,10 @@ static void usage(const char *prog)
 		"  shr plan [opts] <dev>...     Compute SHR layout for variable-size disks\n"
 		"  shr create [opts] <dev>...   Execute SHR layout (DESTRUCTIVE)\n"
 		"  shr status                   Show current SHR topology and health\n"
+		"  shr scrub [start|stop]       Start/stop scrubbing (health check)\n"
+		"  shr disk <fail|online|list> <n>  Fail/bring online/list member disk\n"
+		"  shr rebuild <start <n>|stop|status>  Rebuild a failed disk\n"
+		"  shr expand <tier> <dev>...    Add disks as new tier + extend LVM\n"
 		"  message <device> <msg> [args] Send message to kernel\n"
 		"\n"
 		"RAID Types:\n"
@@ -2027,8 +2035,20 @@ int main(int argc, char **argv)
 			ret = cmd_shr_create(argc - 2, argv + 2);
 		} else if (strcmp(argv[2], "status") == 0) {
 			ret = cmd_shr_status(argc - 2, argv + 2);
+		} else if (strcmp(argv[2], "destroy") == 0) {
+			ret = cmd_shr_destroy(argc - 2, argv + 2);
+		} else if (strcmp(argv[2], "scrub") == 0) {
+			ret = cmd_shr_scrub(argc - 3, argv + 3);
+		} else if (strcmp(argv[2], "disk") == 0) {
+			ret = cmd_shr_disk(argc - 3, argv + 3);
+		} else if (strcmp(argv[2], "rebuild") == 0) {
+			ret = cmd_shr_rebuild(argc - 3, argv + 3);
+		} else if (strcmp(argv[2], "expand") == 0) {
+			ret = cmd_shr_expand(argc - 3, argv + 3);
 		} else {
-			fprintf(stderr, "Unknown shr subcommand '%s'. Use: plan, create, status\n",
+			fprintf(stderr, "Unknown shr subcommand '%s'. "
+				"Use: plan, create, status, destroy, "
+				"disk, rebuild, scrub, expand\n",
 				argv[2]);
 			ret = 1;
 		}

@@ -28,6 +28,7 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <dirent.h>
+#include <lhsr.h>
 #include <linux/fs.h>
 #include <errno.h>
 
@@ -960,13 +961,25 @@ static int shr_create_raid(struct shr_layout *layout,
 			if (shr_run_cmd("%s", cmd) < 0)
 				return -1;
 		} else {
+			/* mdadm: zero stale superblocks on member partitions */
+			for (j = 0; j < layout->partition_count; j++) {
+				char pdev[512];
+				if (layout->partitions[j].tier != i)
+					continue;
+				unsigned int di = layout->partitions[j].disk_idx;
+				unsigned int pn = layout->partitions[j].tier + 1;
+				shr_get_part_dev(disk_paths[di], pn, pdev, sizeof(pdev));
+				shr_run_cmd("mdadm --zero-superblock '%.255s' "
+					    "2>/dev/null; true", pdev);
+			}
+
 			/* mdadm: build member list */
 			int pos = 0;
 
 		pos = snprintf(cmd, sizeof(cmd),
 			"mdadm --create /dev/md/shr_tier_%u "
 			"--level=%d --raid-devices=%u "
-			"--bitmap=none --assume-clean",
+			"--bitmap=none --assume-clean --force",
 			i, raid_level, t->partition_count);
 
 			for (j = 0; j < layout->partition_count; j++) {
@@ -999,13 +1012,22 @@ static int shr_create_raid(struct shr_layout *layout,
 static int shr_create_lvm(struct shr_layout *layout, int use_lhsr)
 {
 	unsigned int i;
+	/* LVM config filter for LHSR mode: only accept /dev/mapper/shr_tier_*
+	 * This prevents LVM from detecting the underlying RAID member partitions
+	 * as duplicate PVs (the PV metadata gets striped across members). */
+	const char *lvm_filter =
+		"devices { "
+		"preferred_names=[\"^/dev/mapper/\"] "
+		"filter = [ \"a|/dev/mapper/shr_tier_.*|\", \"r|.*|\" ] "
+		"}";
 
 	printf("\n--- Step 4: LVM setup ---\n");
 
 	for (i = 0; i < layout->tier_count; i++) {
 		if (use_lhsr) {
-			if (shr_run_cmd("pvcreate /dev/mapper/shr_tier_%u",
-					i) < 0)
+			if (shr_run_cmd("pvcreate --config '%s' "
+					"/dev/mapper/shr_tier_%u",
+					lvm_filter, i) < 0)
 				return -1;
 		} else {
 			if (shr_run_cmd("pvcreate /dev/md/shr_tier_%u",
@@ -1017,7 +1039,9 @@ static int shr_create_lvm(struct shr_layout *layout, int use_lhsr)
 	/* Create VG on first tier */
 	printf("\n# Creating volume group 'shr_vg' ...\n");
 	if (use_lhsr) {
-		if (shr_run_cmd("vgcreate shr_vg /dev/mapper/shr_tier_0") < 0)
+		if (shr_run_cmd("vgcreate --config '%s' "
+				"shr_vg /dev/mapper/shr_tier_0",
+				lvm_filter) < 0)
 			return -1;
 	} else {
 		if (shr_run_cmd("vgcreate shr_vg /dev/md/shr_tier_0") < 0)
@@ -1027,8 +1051,9 @@ static int shr_create_lvm(struct shr_layout *layout, int use_lhsr)
 	/* Extend VG with remaining tiers */
 	for (i = 1; i < layout->tier_count; i++) {
 		if (use_lhsr) {
-			if (shr_run_cmd("vgextend shr_vg /dev/mapper/shr_tier_%u",
-					i) < 0)
+			if (shr_run_cmd("vgextend --config '%s' "
+					"shr_vg /dev/mapper/shr_tier_%u",
+					lvm_filter, i) < 0)
 				return -1;
 		} else {
 			if (shr_run_cmd("vgextend shr_vg /dev/md/shr_tier_%u",
@@ -1039,8 +1064,16 @@ static int shr_create_lvm(struct shr_layout *layout, int use_lhsr)
 
 	/* Create LV spanning all available space */
 	printf("\n# Creating logical volume ...\n");
-	if (shr_run_cmd("lvcreate -l 100%%FREE -n shr_vol shr_vg") < 0)
-		return -1;
+	if (use_lhsr) {
+		if (shr_run_cmd("lvcreate --config '%s' "
+				"-l 100%%FREE -n shr_vol --yes shr_vg",
+				lvm_filter) < 0)
+			return -1;
+	} else {
+		if (shr_run_cmd("lvcreate -l 100%%FREE -n shr_vol "
+				"--yes shr_vg") < 0)
+			return -1;
+	}
 
 	return 0;
 }
@@ -1296,10 +1329,32 @@ static int shr_capture(const char *cmd, char *buf, size_t bufsz)
 	return pclose(fp);
 }
 
+/* Send a dmsetup message to a dm target and capture the result.
+ * Format: dmsetup message <device> <sector> <args...>
+ * Returns 0 on success, -1 on error.
+ * The result buffer receives the response (stripped of trailing newline).
+ */
+static int dm_msg(const char *dm_name, const char *msg,
+		  char *result, size_t result_sz)
+{
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd),
+		 "/usr/sbin/dmsetup message '%.63s' 0 %s 2>/dev/null || true",
+		 dm_name, msg);
+	return shr_capture(cmd, result, result_sz);
+}
+
 /* Entry from /dev/md/ directory scan. */
 struct md_entry {
 	char name[64];
 	int md_num;    /* kernel md device number, -1 if unknown */
+	char members[SHR_MAX_DISKS][512]; /* member partition paths */
+	int nmembers;  /* number of members */
+};
+
+/* Entry from dmsetup ls for LHSR dm targets. */
+struct dm_entry {
+	char name[64];  /* e.g. shr_tier_0 */
 };
 
 /* List /dev/md/<name> entries matching a prefix.  Returns count. */
@@ -1341,9 +1396,78 @@ static int scan_md_devices(const char *prefix,
 	return count;
 }
 
+/* Populate members[] for an md_entry from /sys/block/md<N>/slaves/
+ * Must be called while the md array is still active (before mdadm --stop).
+ */
+static void md_entry_read_members(struct md_entry *entry)
+{
+	char slave_dir[256];
+	DIR *dir;
+	struct dirent *de;
+
+	entry->nmembers = 0;
+	if (entry->md_num < 0)
+		return;
+
+	snprintf(slave_dir, sizeof(slave_dir),
+		 "/sys/block/md%d/slaves/", entry->md_num);
+	dir = opendir(slave_dir);
+	if (!dir)
+		return;
+
+	while ((de = readdir(dir)) != NULL &&
+	       entry->nmembers < SHR_MAX_DISKS) {
+		if (de->d_name[0] == '.')
+			continue;
+		/* Build /dev/ path from the slave device name */
+		snprintf(entry->members[entry->nmembers],
+			 sizeof(entry->members[entry->nmembers]),
+			 "/dev/%.255s", de->d_name);
+		entry->nmembers++;
+	}
+	closedir(dir);
+}
+
+/* Scan dmsetup for SHR tier devices (LHSR mode).
+ * Returns count of entries found (max 'max').
+ */
+static int scan_dm_tiers(const char *prefix,
+			 struct dm_entry *entries, int max)
+{
+	FILE *fp;
+	char line[256];
+	int count = 0;
+	int plen = strlen(prefix);
+
+	fp = popen("/usr/sbin/dmsetup ls 2>/dev/null || true", "r");
+	if (!fp)
+		return 0;
+
+	while (fgets(line, sizeof(line), fp) && count < max) {
+		/* dmsetup ls output: "name\t(major:minor)" or "name (major:minor)"
+		 * Find the first tab/space to separate name from (major:minor) */
+		char *sep = line;
+		while (*sep && *sep != ' ' && *sep != '\t')
+			sep++;
+		if (!*sep)
+			continue;
+		*sep = '\0';
+
+		if (strncmp(line, prefix, plen) != 0)
+			continue;
+
+		snprintf(entries[count].name, sizeof(entries[count].name),
+			 "%.63s", line);
+		count++;
+	}
+	pclose(fp);
+	return count;
+}
+
 int cmd_shr_status(int argc, char **argv)
 {
 	struct md_entry mdents[16];
+	struct dm_entry dments[16];
 	int ntiers;
 	unsigned int i;
 	int found_lvm = 0;
@@ -1354,12 +1478,16 @@ int cmd_shr_status(int argc, char **argv)
 	printf("LHSR SHR Status\n");
 	printf("===============\n\n");
 
-	/* ---- Scan SHR tiers ---- */
+	/* ---- Scan SHR tiers (mdadm + LHSR dm) ---- */
+	mdents[0].md_num = -1;  /* sentinel: uninitialized */
 	ntiers = scan_md_devices("shr_tier_", mdents, 16);
+	if (ntiers == 0)
+		ntiers = scan_dm_tiers("shr_tier_", dments, 16);
 
 	if (ntiers == 0) {
 		printf("No SHR tiers found.\n");
-		printf("  (Looked in /dev/md/ for shr_tier_* devices)\n\n");
+		printf("  (Looked in /dev/md/ for shr_tier_* devices "
+		       "and dmsetup)\n\n");
 		printf("No LVM VG created by SHR found.\n");
 		printf("Use 'lhsrctl shr create' to create an SHR layout.\n");
 		return 1;
@@ -1371,109 +1499,251 @@ int cmd_shr_status(int argc, char **argv)
 	for (i = 0; i < (unsigned int)ntiers; i++) {
 		char sysfs[256];
 		char buf[256];
-		char level[64] = "?";
-		int raid_disks = 0;
-		int degraded = 0;
-		uint64_t array_sectors = 0;
-		char sync_action[64] = "?";
-		char sync_progress[256] = "";
-		char metadata[64] = "?";
 		DIR *sdir;
 		struct dirent *de;
-		int member_count = 0;
 
-		printf("  Tier %d\n", (int)i);
-		printf("    Device: /dev/md/%s", mdents[i].name);
-		if (mdents[i].md_num >= 0)
-			printf(" (md%d)", mdents[i].md_num);
-		printf("\n");
+		if (i < (unsigned int)ntiers && mdents[0].md_num >= 0) {
+			/* mdadm tier: read sysfs attributes */
+			char level[64] = "?";
+			int raid_disks = 0;
+			int degraded = 0;
+			uint64_t array_sectors = 0;
+			char sync_action[64] = "?";
+			char sync_progress[256] = "";
+			char metadata[64] = "?";
+			int member_count = 0;
 
-		if (mdents[i].md_num < 0)
-			goto skip_sysfs;
+			printf("  Tier %d (mdadm)\n", (int)i);
+			printf("    Device: /dev/md/%s", mdents[i].name);
+			if (mdents[i].md_num >= 0)
+				printf(" (md%d)", mdents[i].md_num);
+			printf("\n");
 
-		/* Read sysfs attributes */
-		snprintf(sysfs, sizeof(sysfs), "/sys/block/md%d/md/level",
-			 mdents[i].md_num);
-		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
-			snprintf(level, sizeof(level), "%.63s", buf);
+			if (mdents[i].md_num < 0)
+				goto print_md_summary;
 
-		snprintf(sysfs, sizeof(sysfs), "/sys/block/md%d/md/raid_disks",
-			 mdents[i].md_num);
-		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
-			raid_disks = atoi(buf);
-
-		snprintf(sysfs, sizeof(sysfs), "/sys/block/md%d/md/degraded",
-			 mdents[i].md_num);
-		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
-			degraded = atoi(buf);
-
-		snprintf(sysfs, sizeof(sysfs), "/sys/block/md%d/md/array_size",
-			 mdents[i].md_num);
-		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0) {
-			array_sectors = strtoull(buf, NULL, 10);
-			/* "default" means full device — read size directly */
-			if (array_sectors == 0 && buf[0] == 'd')
-				array_sectors = 0; /* flag to fall through */
-		}
-		if (array_sectors == 0) {
-			/* Fallback: read block device size */
 			snprintf(sysfs, sizeof(sysfs),
-				 "/sys/block/md%d/size",
+				 "/sys/block/md%d/md/level",
 				 mdents[i].md_num);
 			if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+				snprintf(level, sizeof(level), "%.63s", buf);
+
+			snprintf(sysfs, sizeof(sysfs),
+				 "/sys/block/md%d/md/raid_disks",
+				 mdents[i].md_num);
+			if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+				raid_disks = atoi(buf);
+
+			snprintf(sysfs, sizeof(sysfs),
+				 "/sys/block/md%d/md/degraded",
+				 mdents[i].md_num);
+			if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+				degraded = atoi(buf);
+
+			snprintf(sysfs, sizeof(sysfs),
+				 "/sys/block/md%d/md/array_size",
+				 mdents[i].md_num);
+			if (read_sysfs(sysfs, buf, sizeof(buf)) == 0) {
 				array_sectors = strtoull(buf, NULL, 10);
-		}
-
-		snprintf(sysfs, sizeof(sysfs),
-			 "/sys/block/md%d/md/sync_action",
-			 mdents[i].md_num);
-		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
-			snprintf(sync_action, sizeof(sync_action),
-				 "%.63s", buf);
-
-		snprintf(sysfs, sizeof(sysfs),
-			 "/sys/block/md%d/md/sync_completed",
-			 mdents[i].md_num);
-		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0 && buf[0])
-			snprintf(sync_progress, sizeof(sync_progress),
-				 " (%.127s)", buf);
-
-		snprintf(sysfs, sizeof(sysfs),
-			 "/sys/block/md%d/md/metadata_version",
-			 mdents[i].md_num);
-		if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
-			snprintf(metadata, sizeof(metadata),
-				 "%.63s", buf);
-
-		printf("    RAID level: %s\n", level);
-		printf("    Disks: %d configured, %d failed\n",
-		       raid_disks, degraded);
-		printf("    Size: %lu sectors (%.1f GiB)\n",
-		       (unsigned long)array_sectors,
-		       (double)array_sectors * 512 / (1024*1024*1024));
-		printf("    Metadata: %s\n", metadata);
-		printf("    Sync: %s%s\n", sync_action, sync_progress);
-
-		/* List member partitions */
-		snprintf(sysfs, sizeof(sysfs),
-			 "/sys/block/md%d/slaves/",
-			 mdents[i].md_num);
-		sdir = opendir(sysfs);
-		if (sdir) {
-			printf("    Members:\n");
-			while ((de = readdir(sdir)) != NULL) {
-				if (de->d_name[0] == '.')
-					continue;
-				printf("      - %s\n", de->d_name);
-				member_count++;
+				if (array_sectors == 0 && buf[0] == 'd')
+					array_sectors = 0;
 			}
-			closedir(sdir);
-		}
-		if (member_count == 0)
-			printf("    Members: (none)\n");
-		printf("\n");
+			if (array_sectors == 0) {
+				snprintf(sysfs, sizeof(sysfs),
+					 "/sys/block/md%d/size",
+					 mdents[i].md_num);
+				if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+					array_sectors = strtoull(buf, NULL, 10);
+			}
 
-skip_sysfs: ;
+			snprintf(sysfs, sizeof(sysfs),
+				 "/sys/block/md%d/md/sync_action",
+				 mdents[i].md_num);
+			if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+				snprintf(sync_action, sizeof(sync_action),
+					 "%.63s", buf);
+
+			snprintf(sysfs, sizeof(sysfs),
+				 "/sys/block/md%d/md/sync_completed",
+				 mdents[i].md_num);
+			if (read_sysfs(sysfs, buf, sizeof(buf)) == 0 && buf[0])
+				snprintf(sync_progress, sizeof(sync_progress),
+					 " (%.127s)", buf);
+
+			snprintf(sysfs, sizeof(sysfs),
+				 "/sys/block/md%d/md/metadata_version",
+				 mdents[i].md_num);
+			if (read_sysfs(sysfs, buf, sizeof(buf)) == 0)
+				snprintf(metadata, sizeof(metadata),
+					 "%.63s", buf);
+
+print_md_summary:
+			printf("    RAID level: %s\n", level);
+			printf("    Disks: %d configured, %d failed\n",
+			       raid_disks, degraded);
+			printf("    Size: %lu sectors (%.1f GiB)\n",
+			       (unsigned long)array_sectors,
+			       (double)array_sectors * 512
+			       / (1024*1024*1024));
+			printf("    Metadata: %s\n", metadata);
+			printf("    Sync: %s%s\n", sync_action,
+			       sync_progress);
+
+			/* List member partitions */
+			snprintf(sysfs, sizeof(sysfs),
+				 "/sys/block/md%d/slaves/",
+				 mdents[i].md_num);
+			sdir = opendir(sysfs);
+			if (sdir) {
+				printf("    Members:\n");
+				while ((de = readdir(sdir)) != NULL) {
+					if (de->d_name[0] == '.')
+						continue;
+					printf("      - %s\n", de->d_name);
+					member_count++;
+				}
+				closedir(sdir);
+			}
+			if (member_count == 0)
+				printf("    Members: (none)\n");
+		} else {
+			/* LHSR dm tier: extended status via kernel messages */
+			char dm_path[256];
+			char cfg[512] = "";
+			uint64_t dm_sectors = 0;
+			unsigned int raid_type = 0;
+			unsigned int n_disks = 0;
+			int gen = 0;
+			unsigned int state = 0;
+			unsigned int j;
+
+			snprintf(dm_path, sizeof(dm_path),
+				 "/dev/mapper/%.63s", dments[i].name);
+			printf("  Tier %d (LHSR)\n", (int)i);
+			printf("    Device: %s\n", dm_path);
+
+			/* Query kernel config */
+			if (dm_msg(dments[i].name, "config",
+				   cfg, sizeof(cfg)) == 0 && cfg[0]) {
+				/* Parse key=value pairs */
+				char *kv = cfg;
+				while (kv && *kv) {
+					char *next = strchr(kv, ' ');
+					if (next) *next = '\0';
+					if (strncmp(kv, "raid=", 5) == 0)
+						raid_type = atoi(kv + 5);
+					else if (strncmp(kv, "disks=", 6) == 0)
+						n_disks = atoi(kv + 6);
+					else if (strncmp(kv, "state=", 6) == 0)
+						state = atoi(kv + 6);
+					else if (strncmp(kv, "gen=", 4) == 0)
+						gen = atoi(kv + 4);
+					if (next) {
+						*next = ' ';
+						kv = next + 1;
+					} else break;
+				}
+			}
+
+			/* dm device major:minor from dmsetup info */
+			{
+				char info_cmd[512];
+				char info[256] = "";
+				snprintf(info_cmd, sizeof(info_cmd),
+					 "/usr/sbin/dmsetup info -c "
+					 "--noheadings -o major,minor "
+					 "'%.63s' 2>/dev/null",
+					 dments[i].name);
+				shr_capture(info_cmd, info, sizeof(info));
+				if (info[0])
+					printf("    Kernel dev: %s\n", info);
+			}
+
+			/* RAID info from kernel config */
+			{
+				const char *raid_name = "?";
+				switch (raid_type) {
+				case LHSR_RAID5: raid_name = "RAID5"; break;
+				case LHSR_RAID6: raid_name = "RAID6"; break;
+				case LHSR_RAID_MIRROR: raid_name = "RAID1"; break;
+				case LHSR_RAID_SINGLE: raid_name = "SINGLE"; break;
+				}
+				const char *state_str = "?";
+				switch (state) {
+				case LHSR_STATE_HEALTHY:
+					state_str = "HEALTHY"; break;
+				case LHSR_STATE_DEGRADED:
+					state_str = "DEGRADED"; break;
+				case LHSR_STATE_ONLINE:
+					state_str = "ONLINE"; break;
+				case LHSR_STATE_OFFLINE:
+					state_str = "OFFLINE"; break;
+				}
+				printf("    RAID: %s  Disks: %u  "
+				       "State: %s  gen=%d\n",
+				       raid_name, n_disks, state_str, gen);
+			}
+
+			/* Read block device size via sysfs */
+			{
+				char sysfs_path[256];
+				snprintf(sysfs_path, sizeof(sysfs_path),
+					 "/sys/block/dm-%s/size",
+					 dments[i].name + 9);
+				if (read_sysfs(sysfs_path, buf,
+					       sizeof(buf)) == 0)
+					dm_sectors = strtoull(buf, NULL, 10);
+			}
+			/* Fallback: dmsetup table size */
+			if (dm_sectors == 0) {
+				char sz_cmd[512];
+				char sz[256] = "";
+				snprintf(sz_cmd, sizeof(sz_cmd),
+					 "/usr/sbin/dmsetup table "
+					 "'%.63s' 2>/dev/null | "
+					 "awk '{print $2}'",
+					 dments[i].name);
+				shr_capture(sz_cmd, sz, sizeof(sz));
+				if (sz[0])
+					dm_sectors = strtoull(sz, NULL, 10);
+			}
+			printf("    Size: %lu sectors (%.1f GiB)\n",
+			       (unsigned long)dm_sectors,
+			       (double)dm_sectors * 512
+			       / (1024*1024*1024));
+
+			/* Member disk health */
+			if (n_disks > 0 && n_disks <= 32) {
+				printf("    Members:\n");
+				for (j = 0; j < n_disks; j++) {
+					char mem[256] = "";
+					char msgbuf[128];
+					snprintf(msgbuf, sizeof(msgbuf),
+						 "member_status %u", j);
+					if (dm_msg(dments[i].name, msgbuf,
+						   mem, sizeof(mem)) == 0
+					    && mem[0]) {
+						printf("      disk%u: %s\n",
+						       j, mem);
+					} else {
+						printf("      disk%u: "
+						       "(no response)\n", j);
+					}
+				}
+			}
+
+			/* Scrub status */
+			{
+				char scrub[256] = "";
+				if (dm_msg(dments[i].name, "scrub",
+					   scrub, sizeof(scrub)) == 0
+				    && scrub[0]) {
+					/* Default scrub response: "scrub: state=X ..." */
+					printf("    Scrub: %s\n", scrub);
+				}
+			}
+		}
+		printf("\n");
 	}
 
 	/* ---- Discover LVM and mount topology ---- */
@@ -1628,4 +1898,1009 @@ skip_sysfs: ;
 
 	printf("\n");
 	return 0;
+}
+
+/* ===================================================================
+ * shr destroy — tear down an existing SHR layout
+ *
+ * Scans for SHR tiers (/dev/md/shr_tier_*), discovers LVM on them,
+ * and destroys everything in dependency order.
+ * =================================================================== */
+int cmd_shr_destroy(int argc, char **argv)
+{
+	struct md_entry mdents[16];
+	struct dm_entry dments[16];
+	int ntiers;
+	int is_dm = 0;
+	int force = 0;
+	unsigned int i;
+	int ret = 0;
+	char confirm[64];
+	char vg_names[16][64];
+	int nvgs = 0;
+
+	/* Parse --force */
+	for (i = 1; i < (unsigned int)argc; i++) {
+		if (strcmp(argv[i], "--force") == 0)
+			force = 1;
+		else {
+			fprintf(stderr,
+				"Usage: lhsrctl shr destroy [--force]\n");
+			return 1;
+		}
+	}
+
+	/* Scan SHR tiers: try mdadm first, then LHSR dm */
+	ntiers = scan_md_devices("shr_tier_", mdents, 16);
+	if (ntiers == 0) {
+		ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+		if (ntiers > 0)
+			is_dm = 1;
+	}
+	if (ntiers == 0) {
+		printf("No SHR tiers found.\n");
+		return 1;
+	}
+
+	printf("LHSR SHR Destroy\n");
+	printf("================\n");
+	printf("Tiers to destroy: %d\n\n", ntiers);
+
+	/* Read member partitions from each md array (arrays still active) */
+	if (!is_dm) {
+		for (i = 0; i < (unsigned int)ntiers; i++)
+			md_entry_read_members(&mdents[i]);
+	}
+
+	/* LVM config filter for LHSR mode: avoid duplicate PV detection */
+	const char *lvm_filter =
+		"devices { "
+		"preferred_names=[\"^/dev/mapper/\"] "
+		"filter = [ \"a|/dev/mapper/shr_tier_.*|\", \"r|.*|\" ] "
+		"}";
+
+	/* Discover LVM on each tier */
+	for (i = 0; i < (unsigned int)ntiers; i++) {
+		char tier_path[256];
+		char buf[512];
+		char result[256] = "";
+
+		if (is_dm) {
+			snprintf(tier_path, sizeof(tier_path),
+				 "/dev/mapper/%.63s", dments[i].name);
+			printf("  %s (%s) [LHSR]\n",
+			       dments[i].name, tier_path);
+		} else {
+			snprintf(tier_path, sizeof(tier_path),
+				 "/dev/md/%.63s", mdents[i].name);
+			printf("  %s (%s)\n", mdents[i].name, tier_path);
+		}
+
+		if (is_dm) {
+			snprintf(buf, sizeof(buf),
+				 "pvs --config '%s' --noheadings "
+				 "-o vg_name "
+				 "'%.255s' 2>/dev/null || true",
+				 lvm_filter, tier_path);
+		} else {
+			snprintf(buf, sizeof(buf),
+				 "pvs --noheadings -o vg_name "
+				 "'%.255s' 2>/dev/null || true",
+				 tier_path);
+		}
+		shr_capture(buf, result, sizeof(result));
+
+		/* Parse VG name from pvs output */
+		{
+			char *p = result;
+			char vg[64] = "";
+			while (*p == ' ' || *p == '\t') p++;
+			if (*p) {
+				snprintf(vg, sizeof(vg), "%.63s", p);
+				size_t len = strlen(vg);
+				while (len > 0 && (vg[len-1] == ' ' ||
+						   vg[len-1] == '\t' ||
+						   vg[len-1] == '\n'))
+					vg[--len] = '\0';
+			}
+
+			if (vg[0]) {
+				printf("    -> LVM VG: %s\n", vg);
+				int found = 0;
+				unsigned int j;
+				for (j = 0; j < (unsigned int)nvgs; j++) {
+					if (strcmp(vg_names[j], vg) == 0) {
+						found = 1;
+						break;
+					}
+				}
+				if (!found && nvgs < 16) {
+					snprintf(vg_names[nvgs], 64, "%.63s",
+						 vg);
+					nvgs++;
+				}
+			} else {
+				printf("    -> not in LVM\n");
+			}
+		}
+	}
+
+	/* Show LVs and mounts within each VG */
+	if (nvgs > 0) {
+		printf("\nLVM VGs to remove: %d\n", nvgs);
+		for (i = 0; i < (unsigned int)nvgs; i++) {
+			printf("  %s\n", vg_names[i]);
+			char cmd[1024];
+			char result[4096];
+			if (is_dm) {
+				snprintf(cmd, sizeof(cmd),
+					 "lvs --config '%s' --noheadings "
+					 "-o lv_path "
+					 "'%.63s' 2>/dev/null || true",
+					 lvm_filter, vg_names[i]);
+			} else {
+				snprintf(cmd, sizeof(cmd),
+					 "lvs --noheadings -o lv_path "
+					 "'%.63s' 2>/dev/null || true",
+					 vg_names[i]);
+			}
+			if (shr_capture(cmd, result, sizeof(result)) == 0
+			    && result[0]) {
+				char *line = result;
+				while (line && *line) {
+					char *nl = strchr(line, '\n');
+					if (nl) *nl = '\0';
+					char *p = line;
+					while (*p == ' ') p++;
+					if (*p) {
+						char mntbuf[256] = "";
+						char find_cmd[1024];
+						snprintf(find_cmd,
+							 sizeof(find_cmd),
+							 "findmnt -n -o TARGET "
+							 "'%.255s' "
+							 "2>/dev/null "
+							 "|| true", p);
+						shr_capture(find_cmd, mntbuf,
+							    sizeof(mntbuf));
+						if (mntbuf[0])
+							printf("    %s -> "
+							       "mounted %s\n",
+							       p, mntbuf);
+						else
+							printf("    %s\n", p);
+					}
+					if (nl) line = nl + 1;
+					else break;
+				}
+			}
+		}
+	}
+
+	/* Confirmation */
+	if (!force) {
+		printf("\n======================================"
+		       "==========================\n");
+		printf("  DESTRUCTIVE — DATA ON SHR TIERS "
+		       "WILL BE LOST\n");
+		printf("======================================"
+		       "==========================\n");
+		printf("Type 'YES' to proceed, anything else "
+		       "to abort: ");
+		fflush(stdout);
+		if (!fgets(confirm, sizeof(confirm), stdin)) {
+			printf("Aborted.\n");
+			return 1;
+		}
+		{
+			size_t clen = strlen(confirm);
+			if (clen > 0 && confirm[clen - 1] == '\n')
+				confirm[clen - 1] = '\0';
+		}
+		if (strcmp(confirm, "YES") != 0) {
+			printf("Aborted.\n");
+			return 1;
+		}
+	}
+
+	printf("\nExecuting SHR destroy (best-effort) ...\n");
+
+	/* ---- Teardown: reverse of create order ---- */
+
+	/* Step 1: Unmount all LVs and remove them */
+	for (i = 0; i < (unsigned int)nvgs; i++) {
+		char cmd[4096];
+		char result[8192];
+
+		if (is_dm) {
+			snprintf(cmd, sizeof(cmd),
+				 "lvs --config '%s' --noheadings "
+				 "-o lv_path "
+				 "'%.63s' 2>/dev/null || true",
+				 lvm_filter, vg_names[i]);
+		} else {
+			snprintf(cmd, sizeof(cmd),
+				 "lvs --noheadings -o lv_path "
+				 "'%.63s' 2>/dev/null || true",
+				 vg_names[i]);
+		}
+		if (shr_capture(cmd, result, sizeof(result)) == 0
+		    && result[0]) {
+			char *line = result;
+			while (line && *line) {
+				char *nl = strchr(line, '\n');
+				if (nl) *nl = '\0';
+				char *p = line;
+				while (*p == ' ') p++;
+				if (*p) {
+					/* Unmount */
+					char mntbuf[256] = "";
+					snprintf(cmd, sizeof(cmd),
+						 "findmnt -n -o TARGET "
+						 "'%.255s' "
+						 "2>/dev/null || true",
+						 p);
+					shr_capture(cmd, mntbuf,
+						    sizeof(mntbuf));
+					if (mntbuf[0]) {
+						printf("  umount %s ... ",
+						       mntbuf);
+						char umnt[1024];
+						snprintf(umnt, sizeof(umnt),
+							 "umount '%.255s' "
+							 ">/dev/null 2>&1",
+							 mntbuf);
+						if (system(umnt) == 0)
+							printf("OK\n");
+						else
+							printf("FAIL "
+							       "(ignored)\n");
+					}
+					/* Remove LV (suppress LVM stdout banner) */
+					printf("  lvremove %s ... ", p);
+					if (is_dm)
+						snprintf(cmd, sizeof(cmd),
+							 "lvremove --config '%s' "
+							 "-f '%.255s' "
+							 ">/dev/null 2>&1",
+							 lvm_filter, p);
+					else
+						snprintf(cmd, sizeof(cmd),
+							 "lvremove -f '%.255s' "
+							 ">/dev/null 2>&1", p);
+					if (system(cmd) == 0)
+						printf("OK\n");
+					else
+						printf("FAIL (ignored)\n");
+				}
+				if (nl) line = nl + 1;
+				else break;
+			}
+		}
+	}
+
+	/* Step 2: Remove VGs */
+	for (i = 0; i < (unsigned int)nvgs; i++) {
+		char cmd[1024];
+		printf("  vgremove %s ... ", vg_names[i]);
+		if (is_dm)
+			snprintf(cmd, sizeof(cmd),
+				 "vgremove --config '%s' -f '%.63s' "
+				 ">/dev/null 2>&1",
+				 lvm_filter, vg_names[i]);
+		else
+			snprintf(cmd, sizeof(cmd),
+				 "vgremove -f '%.63s' >/dev/null 2>&1",
+				 vg_names[i]);
+		if (system(cmd) == 0)
+			printf("OK\n");
+		else
+			printf("FAIL (ignored)\n");
+	}
+
+	if (is_dm) {
+		/* Step 3 (LHSR): Remove PVs and dm devices */
+		for (i = 0; i < (unsigned int)ntiers; i++) {
+			char dm_path[256];
+			char cmd[1024];
+			snprintf(dm_path, sizeof(dm_path),
+				 "/dev/mapper/%.63s", dments[i].name);
+
+			/* Wipe PV label */
+			printf("  pvremove %s ... ", dm_path);
+			snprintf(cmd, sizeof(cmd),
+				 "pvremove --config '%s' "
+				 "-ff '%.255s' >/dev/null 2>&1",
+				 lvm_filter, dm_path);
+			if (system(cmd) == 0)
+				printf("OK\n");
+			else
+				printf("FAIL (ignored)\n");
+
+			/* Remove dm device */
+			printf("  dmsetup remove %s ... ", dments[i].name);
+			snprintf(cmd, sizeof(cmd),
+				 "/usr/sbin/dmsetup remove '%.63s' "
+				 "2>/dev/null", dments[i].name);
+			if (system(cmd) == 0)
+				printf("OK\n");
+			else
+				printf("FAIL (ignored)\n");
+		}
+	} else {
+		/* Step 3 (mdadm): Remove PVs and stop md arrays */
+		for (i = 0; i < (unsigned int)ntiers; i++) {
+			char md_path[256];
+			char cmd[1024];
+			snprintf(md_path, sizeof(md_path),
+				 "/dev/md/%.63s", mdents[i].name);
+
+			/* Wipe PV label */
+			printf("  pvremove %s ... ", md_path);
+			snprintf(cmd, sizeof(cmd),
+				 "pvremove -ff '%.255s' >/dev/null 2>&1",
+				 md_path);
+			if (system(cmd) == 0)
+				printf("OK\n");
+			else
+				printf("FAIL (ignored)\n");
+
+			/* Stop md array (try readonly first) */
+			printf("  mdadm --stop %s ... ", mdents[i].name);
+			snprintf(cmd, sizeof(cmd),
+				 "mdadm --readonly '%.255s' >/dev/null 2>&1; "
+				 "mdadm --stop '%.255s' >/dev/null 2>&1",
+				 md_path, md_path);
+			if (system(cmd) == 0)
+				printf("OK\n");
+			else
+				printf("FAIL (ignored)\n");
+
+			/* Wipe md superblocks on member partitions */
+			unsigned int m;
+			for (m = 0; m < (unsigned int)mdents[i].nmembers;
+			     m++) {
+				printf("  mdadm --zero-superblock %s ... ",
+				       mdents[i].members[m]);
+				snprintf(cmd, sizeof(cmd),
+					 "mdadm --zero-superblock '%.255s' "
+					 ">/dev/null 2>&1",
+					 mdents[i].members[m]);
+				if (system(cmd) == 0)
+					printf("OK\n");
+				else
+					printf("FAIL (ignored)\n");
+			}
+		}
+	}
+
+	printf("\nSHR destroy complete.\n");
+	return ret;
+}
+int cmd_shr_disk(int argc, char **argv)
+{
+	struct dm_entry dments[16];
+	int ntiers;
+	const char *action;
+	unsigned int disk_idx;
+
+	if (argc < 2) {
+		fprintf(stderr, "Usage: lhsrctl shr disk <fail|online> <idx>\n");
+		return 1;
+	}
+	action = argv[0];
+
+	/* Validate and parse disk index */
+	{
+		char *end;
+		long val = strtol(argv[1], &end, 10);
+		if (*end || val < 0 || val >= 32) {
+			fprintf(stderr, "Invalid disk index '%s' (0-31)\n", argv[1]);
+			return 1;
+		}
+		disk_idx = (unsigned int)val;
+	}
+
+	ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	if (ntiers == 0) {
+		printf("No LHSR SHR tiers found.\n");
+		return 1;
+	}
+
+	{
+		int i;
+		for (i = 0; i < ntiers; i++) {
+			char resp[512] = "";
+			char msgbuf[256];
+
+			if (strcmp(action, "fail") == 0)
+				snprintf(msgbuf, sizeof(msgbuf),
+					 "disk_fail %u", disk_idx);
+			else if (strcmp(action, "online") == 0)
+				snprintf(msgbuf, sizeof(msgbuf),
+					 "disk_online %u", disk_idx);
+			else {
+				fprintf(stderr, "Unknown action '%s'. "
+					"Use 'fail' or 'online'.\n", action);
+				return 1;
+			}
+
+			printf("%s: %s disk%u ... ", dments[i].name,
+			       action, disk_idx);
+			fflush(stdout);
+
+			if (dm_msg(dments[i].name, msgbuf,
+				  resp, sizeof(resp)) == 0 && resp[0]) {
+				printf("%s\n", resp);
+			} else {
+				printf("FAILED\n");
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * SHR rebuild — control/resync disk rebuild.
+ *
+ * Usage: lhsrctl shr rebuild <start <idx>|stop|status>
+ */
+int cmd_shr_rebuild(int argc, char **argv)
+{
+	struct dm_entry dments[16];
+	int ntiers;
+	const char *action;
+
+	if (argc < 1) {
+		fprintf(stderr, "Usage: lhsrctl shr rebuild "
+			"<start <idx>|stop|status>\n");
+		return 1;
+	}
+	action = argv[0];
+
+	ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	if (ntiers == 0) {
+		printf("No LHSR SHR tiers found.\n");
+		return 1;
+	}
+
+	{
+		int i;
+		for (i = 0; i < ntiers; i++) {
+			char resp[512] = "";
+			char msgbuf[256];
+
+			if (strcmp(action, "start") == 0) {
+				if (argc < 2) {
+					fprintf(stderr, "Usage: lhsrctl shr "
+						"rebuild start <disk_idx>\n");
+					return 1;
+				}
+				snprintf(msgbuf, sizeof(msgbuf),
+					 "rebuild start %s", argv[1]);
+			} else if (strcmp(action, "stop") == 0) {
+				snprintf(msgbuf, sizeof(msgbuf),
+					 "rebuild stop");
+			} else {
+				snprintf(msgbuf, sizeof(msgbuf),
+					 "rebuild status");
+			}
+
+			printf("%s: %s", dments[i].name, action);
+			if (strcmp(action, "start") == 0)
+				printf(" disk%s", argv[1]);
+			printf(" ... ");
+			fflush(stdout);
+
+			if (dm_msg(dments[i].name, msgbuf,
+				  resp, sizeof(resp)) == 0 && resp[0]) {
+				printf("%s\n", resp);
+			} else {
+				printf("FAILED\n");
+				return 1;
+			}
+		}
+	}
+	return 0;
+}
+/*
+ * SHR scrub — control/resync health check via kernel dm messages.
+ *
+ * Usage: lhsrctl shr scrub [start|stop|status]
+ *
+ * Without arguments, reports current scrub state for all discovered tiers.
+ */
+int cmd_shr_scrub(int argc, char **argv)
+{
+	struct dm_entry dments[16];
+	int ntiers;
+	int i;
+
+	ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	if (ntiers == 0) {
+		printf("No LHSR SHR tiers found.\n");
+		return 1;
+	}
+
+	/* Determine action */
+	const char *action = "status";
+	if (argc > 0)
+		action = argv[0];
+
+	for (i = 0; i < ntiers; i++) {
+		char resp[512] = "";
+		char msgbuf[256];
+
+		if (strcmp(action, "start") == 0) {
+			snprintf(msgbuf, sizeof(msgbuf), "scrub start");
+		} else if (strcmp(action, "stop") == 0) {
+			snprintf(msgbuf, sizeof(msgbuf), "scrub stop");
+		} else {
+			snprintf(msgbuf, sizeof(msgbuf), "scrub status");
+		}
+
+		printf("%s: %s ... ", dments[i].name, action);
+		fflush(stdout);
+
+		if (dm_msg(dments[i].name, msgbuf, resp, sizeof(resp)) == 0
+		    && resp[0]) {
+			printf("%s\n", resp);
+		} else {
+			printf("(no response)\n");
+		}
+	}
+	return 0;
+}
+
+/* ===================================================================
+ * shr expand — add new disk(s) to an existing SHR array
+ *
+ * Scans for existing LHSR SHR tiers and their LVM VG, creates a new
+ * LHSR tier from the new disk(s), and extends the VG/LV.
+ *
+ * RAID type determined by disk count:
+ *   1 disk  → SINGLE   (no redundancy, just adds capacity)
+ *   2 disks → RAID1    (mirror)
+ *   3+ disks → RAID5   (single parity)
+ *
+ * Usage:  lhsrctl shr expand [--lhsr|--mdadm] [--force] <device>...
+ *
+ * For LHSR mode (default): raw block devices are used directly as
+ * RAID members — no partition table needed.
+ * =================================================================== */
+int cmd_shr_expand(int argc, char **argv)
+{
+	uint64_t *disk_sizes = NULL;
+	unsigned int new_count = 0;
+	int use_lhsr = 1;
+	int force = 0;
+	int ret = 1;
+	int opt_consumed = 0;
+	unsigned int i;
+	char confirm[64];
+
+	/* LVM config filter for LHSR mode: only accept /dev/mapper/shr_tier_* */
+	const char *lvm_filter =
+		"devices { "
+		"preferred_names=[\"^/dev/mapper/\"] "
+		"filter = [ \"a|/dev/mapper/shr_tier_.*|\", \"r|.*|\" ] "
+		"}";
+
+	/* ---- Parse options ---- */
+	for (i = 0; i < (unsigned int)argc; i++) {
+		if (strcmp(argv[i], "--lhsr") == 0) {
+			use_lhsr = 1;
+			opt_consumed++;
+		} else if (strcmp(argv[i], "--mdadm") == 0) {
+			use_lhsr = 0;
+			opt_consumed++;
+		} else if (strcmp(argv[i], "--force") == 0) {
+			force = 1;
+			opt_consumed++;
+		} else if (argv[i][0] == '-') {
+			fprintf(stderr, "Error: unknown option '%s'\n",
+				argv[i]);
+			fprintf(stderr, "Usage: lhsrctl shr expand "
+				"[--lhsr|--mdadm] [--force] <device>...\n");
+			return 1;
+		}
+	}
+
+	new_count = argc - opt_consumed;
+	if (new_count == 0) {
+		fprintf(stderr, "Error: no new disk devices specified\n");
+		fprintf(stderr, "Usage: lhsrctl shr expand "
+			"[--lhsr|--mdadm] [--force] <device>...\n");
+		return 1;
+	}
+
+	/* Point directly into argv — no allocation needed */
+	const char **new_disks = (const char **)(argv + opt_consumed);
+
+	disk_sizes = calloc(new_count, sizeof(uint64_t));
+	if (!disk_sizes) {
+		fprintf(stderr, "Error: out of memory\n");
+		return 1;
+	}
+
+	/* ---- Validate new disks and read sizes ---- */
+	printf("Scanning new devices ...\n");
+	for (i = 0; i < new_count; i++) {
+		int fd;
+		uint64_t sz;
+
+		if (shr_validate_device(new_disks[i]) < 0)
+			goto out;
+
+		fd = open(new_disks[i], O_RDONLY);
+		if (fd < 0) {
+			fprintf(stderr, "Error: cannot open %s: %s\n",
+				new_disks[i], strerror(errno));
+			goto out;
+		}
+		if (ioctl(fd, BLKGETSIZE64, &sz) < 0) {
+			fprintf(stderr, "Error: cannot get size of %s: %s\n",
+				new_disks[i], strerror(errno));
+			close(fd);
+			goto out;
+		}
+		close(fd);
+		disk_sizes[i] = sz / 512;  /* convert bytes to sectors */
+		printf("  %s: %llu sectors (%.1f GiB)\n",
+		       new_disks[i],
+		       (unsigned long long)disk_sizes[i],
+		       (double)disk_sizes[i] * 512 / (1024*1024*1024));
+	}
+
+	/* ---- Scan existing LHSR tiers ---- */
+	struct dm_entry dments[16];
+	int ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	if (ntiers == 0) {
+		fprintf(stderr, "Error: no existing SHR tiers found.\n");
+		fprintf(stderr, "Use 'lhsrctl shr create' to create "
+			"a new SHR layout.\n");
+		goto out;
+	}
+
+	printf("\nExisting LHSR tiers: %d\n", ntiers);
+	for (i = 0; i < (unsigned int)ntiers; i++)
+		printf("  %s\n", dments[i].name);
+
+	/* ---- Find the LVM VG on existing tiers ---- */
+	char vg_name[64] = "";
+	{
+		char buf[4096];
+		int rv;
+		rv = shr_capture(
+			"lvm pvs --noheadings -o pv_name,vg_name "
+			"2>/dev/null | "
+			"grep '^[[:space:]]*/dev/mapper/shr_tier_' "
+			"|| true",
+			buf, sizeof(buf));
+		(void)rv;
+		if (buf[0]) {
+			char pv[256], vg[64];
+			char *nl = strchr(buf, '\n');
+			if (nl)
+				*nl = '\0';
+			if (sscanf(buf, "%255s %63s", pv, vg) >= 2)
+				snprintf(vg_name, sizeof(vg_name),
+					 "%s", vg);
+		}
+	}
+	if (!vg_name[0]) {
+		fprintf(stderr, "Error: no LVM VG found on existing "
+			"SHR tiers.\n");
+		fprintf(stderr, "The tiers must be part of an LVM VG "
+			"before expansion.\n");
+		goto out;
+	}
+	printf("LVM volume group: %s\n", vg_name);
+
+	/* ---- Determine next tier index ---- */
+	unsigned int next_tier = 0;
+	for (i = 0; i < (unsigned int)ntiers; i++) {
+		unsigned int idx;
+		if (sscanf(dments[i].name, "shr_tier_%u", &idx) == 1) {
+			if (idx >= next_tier)
+				next_tier = idx + 1;
+		}
+	}
+
+	/* ---- Determine RAID type from disk count ---- */
+	unsigned int raid_type;
+	const char *raid_name;
+	unsigned int parity_per_tier;
+	if (new_count >= 3) {
+		raid_type = LHSR_RAID5;
+		raid_name = "RAID5";
+		parity_per_tier = 1;
+	} else if (new_count == 2) {
+		raid_type = LHSR_RAID_MIRROR;
+		raid_name = "RAID1";
+		parity_per_tier = 1;  /* N-1 = 1 for 2-disk mirror */
+	} else {
+		raid_type = LHSR_RAID_SINGLE;
+		raid_name = "SINGLE";
+		parity_per_tier = 0;
+	}
+
+	/* ---- Calculate tier size ---- */
+	uint64_t tier_sectors = disk_sizes[0];
+	for (i = 1; i < new_count; i++) {
+		if (disk_sizes[i] < tier_sectors)
+			tier_sectors = disk_sizes[i];
+	}
+	/* Align down to SHR alignment */
+	tier_sectors = (tier_sectors / SHR_ALIGNMENT) * SHR_ALIGNMENT;
+
+	/* Usable = size * (members - parity) */
+	uint64_t usable_sectors;
+	if (parity_per_tier > 0 && new_count > parity_per_tier)
+		usable_sectors = tier_sectors * (new_count - parity_per_tier);
+	else
+		usable_sectors = tier_sectors;
+
+	/* ---- Print plan ---- */
+	printf("\nSHR Expansion Plan\n");
+	printf("==================\n");
+	printf("Mode:               LHSR\n");
+	printf("New disks:          %u\n", new_count);
+	printf("New tier:           %s (%s)\n", raid_name,
+	       new_count == 1 ? "no redundancy" :
+	       new_count == 2 ? "mirrored" : "single parity");
+	printf("Tier index:         %u\n", next_tier);
+	printf("Tier device:        /dev/mapper/shr_tier_%u\n", next_tier);
+	printf("Tier size:          %llu sectors (%.1f GiB)\n",
+	       (unsigned long long)tier_sectors,
+	       (double)tier_sectors * 512 / (1024*1024*1024));
+	printf("Usable capacity:    %llu sectors (%.1f GiB)\n",
+	       (unsigned long long)usable_sectors,
+	       (double)usable_sectors * 512 / (1024*1024*1024));
+	printf("\nLVM actions:\n");
+	printf("  pvcreate /dev/mapper/shr_tier_%u\n", next_tier);
+	printf("  vgextend %s /dev/mapper/shr_tier_%u\n",
+	       vg_name, next_tier);
+	printf("  lvextend -l +100%%FREE %s/shr_vol\n", vg_name);
+
+	/* ---- Confirmation ---- */
+	printf("\nThis operation will modify LVM state.\n");
+	printf("Type 'YES' to proceed, anything else to abort: ");
+	fflush(stdout);
+	if (!fgets(confirm, sizeof(confirm), stdin)) {
+		printf("Aborted.\n");
+		goto out;
+	}
+	{
+		size_t clen = strlen(confirm);
+		if (clen > 0 && confirm[clen - 1] == '\n')
+			confirm[clen - 1] = '\0';
+	}
+	if (strcmp(confirm, "YES") != 0) {
+		printf("Aborted.\n");
+		goto out;
+	}
+
+	/* ---- Execute ---- */
+	printf("\nExecuting SHR expansion ...\n");
+
+	/* Step 1: Check for stale /dev/mapper/shr_tier_N */
+	{
+		char stale_path[64];
+		struct stat st;
+		snprintf(stale_path, sizeof(stale_path),
+			 "/dev/mapper/shr_tier_%u", next_tier);
+		if (stat(stale_path, &st) == 0 && S_ISBLK(st.st_mode)) {
+			fprintf(stderr, "Error: %s already exists.\n",
+				stale_path);
+			fprintf(stderr, "Remove it first with "
+				"'dmsetup remove shr_tier_%u' "
+				"or use --force.\n", next_tier);
+			if (!force)
+				goto out;
+			fprintf(stderr, "  (--force override: "
+				"removing existing device)\n");
+			shr_run_cmd(
+				"/usr/sbin/dmsetup remove "
+				"shr_tier_%u 2>/dev/null; true",
+				next_tier);
+		}
+	}
+
+	/* Step 2: Pre-flight checks */
+	printf("\n--- Pre-flight checks ---\n");
+	for (i = 0; i < new_count; i++) {
+		if (shr_warn_used_device(new_disks[i]) < 0) {
+			if (!force) {
+				fprintf(stderr,
+					"Use --force to override.\n");
+				goto out;
+			}
+			fprintf(stderr, "  (--force override)\n");
+		}
+	}
+
+	/* Step 3: Create RAID tier */
+	printf("\n--- Step 3: Create RAID tier ---\n");
+
+	if (use_lhsr) {
+		char cmd[16384];
+		int pos;
+
+		if (raid_type == LHSR_RAID_SINGLE) {
+			/* SINGLE: type + device + offset (kernel requires >=3 args) */
+			pos = snprintf(cmd, sizeof(cmd),
+				"dmsetup create shr_tier_%u --table "
+				"\"0 %llu lhsr single %s 0\"",
+				next_tier,
+				(unsigned long long)tier_sectors,
+				new_disks[0]);
+			if (shr_run_cmd("%s", cmd) < 0)
+				goto out;
+		} else if (raid_type == LHSR_RAID_MIRROR) {
+			/* MIRROR: type + dev/offset pairs */
+			pos = snprintf(cmd, sizeof(cmd),
+				"dmsetup create shr_tier_%u --table "
+				"\"0 %llu lhsr mirror",
+				next_tier,
+				(unsigned long long)tier_sectors);
+			for (i = 0; i < new_count; i++) {
+				pos += snprintf(cmd + pos,
+					sizeof(cmd) - pos,
+					" %s 0", new_disks[i]);
+				if ((size_t)pos >= sizeof(cmd) - 64) {
+					fprintf(stderr, "Error: "
+						"dmsetup table too long\n");
+					goto out;
+				}
+			}
+			snprintf(cmd + pos, sizeof(cmd) - pos, "\"");
+			if (shr_run_cmd("%s", cmd) < 0)
+				goto out;
+		} else {
+			/* RAID5/6: type + params + dev/offset pairs */
+			int raid_char = (raid_type == LHSR_RAID5) ? '5' : '6';
+			pos = snprintf(cmd, sizeof(cmd),
+				"dmsetup create shr_tier_%u --table "
+				"\"0 %llu lhsr raid%c 8 %u %u",
+				next_tier,
+				(unsigned long long)tier_sectors,
+				raid_char,
+				new_count, parity_per_tier);
+			for (i = 0; i < new_count; i++) {
+				pos += snprintf(cmd + pos,
+					sizeof(cmd) - pos,
+					" %s 0", new_disks[i]);
+				if ((size_t)pos >= sizeof(cmd) - 64) {
+					fprintf(stderr, "Error: "
+						"dmsetup table too long\n");
+					goto out;
+				}
+			}
+			snprintf(cmd + pos, sizeof(cmd) - pos, "\"");
+			if (shr_run_cmd("%s", cmd) < 0)
+				goto out;
+		}
+	} else {
+		/* mdadm mode */
+		char cmd[16384];
+		int raid_level;
+		int pos;
+
+		raid_level = (raid_type == LHSR_RAID5) ? 5 :
+			     (raid_type == LHSR_RAID_MIRROR) ? 1 : 0;
+
+		pos = snprintf(cmd, sizeof(cmd),
+			"mdadm --create /dev/md/shr_tier_%u "
+			"--level=%d --raid-devices=%u "
+			"--bitmap=none --assume-clean --force",
+			next_tier, raid_level, new_count);
+
+		for (i = 0; i < new_count; i++) {
+			pos += snprintf(cmd + pos, sizeof(cmd) - pos,
+					" %s", new_disks[i]);
+			if ((size_t)pos >= sizeof(cmd) - 64) {
+				fprintf(stderr, "Error: "
+					"mdadm command too long\n");
+				goto out;
+			}
+		}
+		if (shr_run_cmd("%s", cmd) < 0)
+			goto out;
+
+		{
+			char mddev[64];
+			snprintf(mddev, sizeof(mddev),
+				 "/dev/md/shr_tier_%u", next_tier);
+			shr_wait_for_part(mddev, 0, 5000);
+		}
+	}
+
+	/* Step 4: Wait for tier device */
+	{
+		char tier_path[64];
+		snprintf(tier_path, sizeof(tier_path),
+			 use_lhsr ? "/dev/mapper/shr_tier_%u"
+				  : "/dev/md/shr_tier_%u",
+			 next_tier);
+		if (shr_wait_for_part(tier_path, 0, 5000) < 0)
+			goto out;
+	}
+
+	/* Step 5: PV and VG extend */
+	printf("\n--- Step 5: LVM — extend VG ---\n");
+	{
+		char tier_dev[64];
+		snprintf(tier_dev, sizeof(tier_dev),
+			 use_lhsr ? "/dev/mapper/shr_tier_%u"
+				  : "/dev/md/shr_tier_%u",
+			 next_tier);
+
+		if (use_lhsr) {
+			if (shr_run_cmd("pvcreate --config '%s' '%s'",
+					lvm_filter, tier_dev) < 0)
+				goto out;
+			if (shr_run_cmd("vgextend --config '%s' "
+					"'%s' '%s'",
+					lvm_filter,
+					vg_name, tier_dev) < 0)
+				goto out;
+		} else {
+			if (shr_run_cmd("pvcreate '%s'", tier_dev) < 0)
+				goto out;
+			if (shr_run_cmd("vgextend '%s' '%s'",
+					vg_name, tier_dev) < 0)
+				goto out;
+		}
+	}
+
+	/* Step 6: Extend LV */
+	printf("\n--- Step 6: LVM — extend LV ---\n");
+	{
+		char lv_path[128];
+		snprintf(lv_path, sizeof(lv_path), "%s/shr_vol", vg_name);
+		/* allow_changes_with_duplicate_pvs=1 needed because LVM
+		 * detects PV UUID fragments in RAID5-striped data on the
+		 * underlying member devices.  The LHSR filter prevents LVM
+		 * from USING those devices, but LVM still blocks metadata
+		 * commits when it sees duplicates. */
+		if (shr_run_cmd("lvextend --config "
+				"'devices { allow_changes_with_duplicate_pvs=1 "
+				"preferred_names=[\"^/dev/mapper/\"] "
+				"filter = [ \"a|/dev/mapper/shr_tier_.*|\", "
+				"\"r|.*|\" ] }' "
+				"-l +100%%FREE '%s' --yes",
+				lv_path) < 0) {
+			fprintf(stderr, "Warning: lvextend failed. "
+				"You can run it manually:\n");
+			fprintf(stderr, "  lvextend -l +100%%FREE %s --yes\n",
+				lv_path);
+		}
+	}
+
+	/* ---- Success ---- */
+	printf("\n===========================================================\n");
+	printf("  SHR EXPANSION SUCCESSFUL\n");
+	printf("===========================================================\n");
+	printf("\nAdded %u new disk(s)", new_count);
+	printf(" as %s tier /dev/mapper/shr_tier_%u\n",
+	       raid_name, next_tier);
+	printf("Volume group: %s\n", vg_name);
+	printf("Tier size: %llu sectors (%.1f GiB)\n",
+	       (unsigned long long)tier_sectors,
+	       (double)tier_sectors * 512 / (1024*1024*1024));
+	printf("New usable capacity: %llu sectors (%.1f GiB)\n",
+	       (unsigned long long)usable_sectors,
+	       (double)usable_sectors * 512 / (1024*1024*1024));
+	printf("\nIf the filesystem supports online resize:\n");
+	printf("  ext4:  resize2fs /dev/%s/shr_vol\n", vg_name);
+	printf("  xfs:   xfs_growfs /mount/point\n");
+	printf("\n");
+
+	ret = 0;
+
+out:
+	free(disk_sizes);
+	return ret;
 }

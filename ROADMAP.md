@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-14 (Phase 6.4 COMPLETE)
+**Last Updated:** 2026-06-15 (Phase 7 ALL COMPLETE)
 
 ---
 
@@ -514,10 +514,111 @@ LHSR), and merges them with LVM. It does NOT belong in the kernel module.
         - `shr status` shows correct hierarchy, PVs annotated [SHR tier]
         - mkfs.ext4, mount, 100MB write/read: SHA256 verified PASS
         - Bugs fixed: paired sort (sizes[]/disk_paths[] sync), --assume-clean
+- ✅ Phase 6.5: `lhsrctl shr destroy` — clean teardown of SHR tiers
+        - `destroy` scans DM tables for SHR tiers (lhsr + mdadm)
+        - LVM: lvremove, vgremove, pvremove (with --yes for automation)
+        - DM: dmsetup remove on each tier
+        - mdadm: stop arrays, zero superblocks on member partitions
+        - `--force` flag skips individual failures to clean as much as possible
+        - Tested: 4-loopback RAID5 array, full teardown from SHR to clean state
+- ✅ Phase 6.6: `lhsrctl shr disk fail/online` — per-disk health management
+        - `shr disk fail <tier> <device>`: sends `disk_fail <idx>` message via dmsetup
+        - `shr disk online <tier> <device>`: sends `member_status <idx> 0` to re-enable
+        - `shr disk list <tier>`: shows per-disk state from dmsetup status
+        - Integration with `lhsrctl status`: displays disk states per tier
+- ✅ Phase 6.7: `lhsrctl shr rebuild start/stop/status` — incremental rebuild
+        - `shr rebuild start <tier>`: sends `rebuild` message, accepts optional target disk index
+        - `shr rebuild stop <tier>`: sends `rebuild_stop` message
+        - `shr rebuild status <tier>`: polls dmsetup status for rebuild progress
+        - Tested: 3-loop RAID5, disk fail → rebuild start → progress tracking → completion
+        - WIB-aware: RAID1 skips clean chunks, RAID5 does full parity reconstruction
+- ✅ Phase 6.8: `lhsrctl shr scrub start/stop/status` — background data integrity scrub
+        - `shr scrub start <tier>`: sends `scrub` message
+        - `shr scrub stop <tier>`: sends `scrub_stop` message
+        - `shr scrub status <tier>`: polls dmsetup status for scrub progress
+        - Tested: 3-loop RAID5, write data → scrub → checksum verified PASS
+- ✅ Phase 6.9: `lhsrctl shr expand` — add new tier + extend LVM
+        - `shr expand <tier> <device> [device...]`: adds disks as new tier
+        - RAID type by disk count: 1=SINGLE, 2=MIRROR, 3+=RAID5
+        - Uses raw block devices (not partitions) — matches `shr create --lhsr` behavior
+        - LVM: vgextend shr_vg + lvextend -l +100%FREE to grow filesystem online
+        - Tested: 4-disk RAID5 → +1 disk SINGLE tier → LV grows 6G → 8G
+        - **Bugs fixed during implementation:**
+          - Kernel table format: SINGLE needs `"single /dev/loop4 0"` (3 args minimum)
+          - `lvextend` syntax: `-l +100%FREE` not `-l 100%FREE` (latter sets absolute)
+          - LVM duplicate PV workaround: `allow_changes_with_duplicate_pvs=1` in lvm.conf
+        - LVM filter hardening: `--config` passed for all pvcreate/vgcreate/vgextend/lvextend
 
 ---
 
-## Phase 7: Live Migration (NOT YET SCOPED)
+## Phase 7: SHR Userspace Operational Commands — ✅ COMPLETE (2026-06-15)
+
+**What changed:** The SHR userspace tool (`lhsrctl shr`) was extended from a setup/status tool into a full operational management suite. All commands that a storage admin needs for day-to-day operation of a Synology-Hybrid-RAID-like pool are now implemented: destroy, disk health, rebuild, scrub, and expand.
+
+**Key design decisions:**
+- **Zero kernel changes**: All commands operate entirely in userspace via `dmsetup message` and `dmsetup table`/`status` parsing. The kernel module already supports disk_fail, rebuild, and scrub messages — no new kernel code was needed.
+- **LHSR and mdadm mode**: All commands work with both `--lhsr` mode (dm-lhsr kernel module) and default mdadm mode, with appropriate code paths for each.
+- **Raw block devices for LHSR tiers**: LHSR mode uses raw block devices directly as tier members (no partition table), matching `shr create --lhsr` behavior. mdadm mode uses partitions on member disks.
+- **LVM filter for duplicate PV protection**: When LHSR tiers are built on loop devices that are also visible to LVM as potential PVs, the duplicate UUID detection blocks operations. Hardened with `--config` flags passing strict LVM filter rules.
+
+### Deliverables
+- ✅ Phase 6.5: `shr destroy` — clean teardown (LVM + DM + mdadm + superblock wipe)
+- ✅ Phase 6.6: `shr disk fail/online/list` — per-disk health management
+- ✅ Phase 6.7: `shr rebuild start/stop/status` — incremental rebuild with progress
+- ✅ Phase 6.8: `shr scrub start/stop/status` — background integrity verification
+- ✅ Phase 6.9: `shr expand` — dynamic tier addition + online LV extension
+- ✅ All tested end-to-end on VM with 3-4 loopback devices in RAID5 configuration
+- ✅ Zero new compiler warnings on any target
+- ✅ LHSR-specific bug fixes: SINGLE kernel table format, lvextend syntax, LVM duplicate PV
+
+---
+
+## Phase 8: shr disk replace (PLANNED)
+
+**Status:** Design phase — implementation pending
+
+**What:** `lhsrctl shr disk replace <tier> <old_device> <new_device>` — atomically swap a failed or
+failing disk in an LHSR tier with a new device, then trigger rebuild to populate it.
+
+### Why
+The current workflow for replacing a failed disk requires 3 separate steps:
+1. `shr disk fail <tier> <device>` (if not auto-detected)
+2. Manually compute and load a new dm table with the replacement device
+3. `shr rebuild start <tier>`
+
+A single `shr disk replace` command makes this a one-step operation for the admin.
+
+### Approach (userspace-only, no kernel changes)
+1. Scan existing tiers via `dmsetup table` — find the tier and the specific disk slot
+2. Validate new device (exists, readable, writable, sane size)
+3. Optionally fail the old disk if not already failed
+4. Build new dm table line with old_dev replaced by new_dev in the same slot
+5. `dmsetup load <tier_name> <new_table>` + `dmsetup resume <tier_name>`
+6. The kernel module reloads with the new table (state reinitialized, WIB loaded from disk)
+7. Start rebuild on the replaced disk via `dmsetup message`
+8. Report progress
+
+### Constraints
+- **State loss on table reload**: The kernel module's stripe cache and in-memory state is lost
+  on `dmsetup resume`. The WIB (write-intent bitmap) is reloaded from disk, which is safe
+  (conservative). This is acceptable for a maintenance operation — the array should be idle
+  (no active I/O) during disk replacement.
+- **RAID5/6 requires full rebuild**: Unlike WIB-optimized RAID1 rebuild, replaced disks in
+  parity layouts always require full reconstruction. The rebuild command handles this.
+- **mdadm mode**: mdadm has its own `mdadm --replace` / `mdadm --add` workflow. v1 only
+  supports LHSR mode. mdadm mode can be added later.
+
+### Deliverables
+- `shr disk replace` command in `shr.c`
+- Table parse/rebuild logic (parse dmsetup table, swap device in slot)
+- `dmsetup load` + `dmsetup resume` using libdevmapper or /usr/sbin/dmsetup
+- Rebuild trigger after successful table reload
+- Error handling: validate device sizes match, rollback on failure
+- Tested end-to-end on VM: RAID5 with failed disk → replace → rebuild → scrub verify
+
+---
+
+## Phase 9: Live Migration (NOT YET SCOPED)
 
 Online RAID reshape (adding/removing disks, changing RAID levels) is an
 architecture-level feature for the DM target. It is NOT trivial.
@@ -544,9 +645,10 @@ architecture-level feature for the DM target. It is NOT trivial.
 | 3 | Daemon refactor | **1 day** (est. 2-3 weeks) | Phase 0 |
 | 4 | Predictive failure | **1 session** (est. 2 weeks) | Phase 3 |
 | 5 | Recovery tools + kernel degraded mode | 2 weeks | Phase 0 |
-| 6 | SHR userspace (plan-only v1) | ~1 week (mdadm), ~2-3 weeks (LHSR) | Phase 0 |
+| 6 | SHR userspace (core: plan/create/status) | ~1 week | Phase 0 |
+| 7 | SHR operational commands (destroy/disk/rebuild/scrub/expand) | **1 session** | Phase 6 |
 
-**Estimated total for Phases 0-5:** 7-10 weeks (~2 months) with one developer.
+**Estimated total for Phases 0-6:** ~8 weeks with one developer. Phase 7 added in 1 session.
 
 ---
 
