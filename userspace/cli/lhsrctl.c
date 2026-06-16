@@ -146,6 +146,7 @@ static void usage(const char *prog)
 		"  shr status                   Show current SHR topology and health\n"
 		"  shr scrub [start|stop]       Start/stop scrubbing (health check)\n"
 		"  shr disk <fail|online|list> <n>  Fail/bring online/list member disk\n"
+		"  shr disk replace <tier> <old> <new>  Replace disk, start rebuild\n"
 		"  shr rebuild <start <n>|stop|status>  Rebuild a failed disk\n"
 		"  shr expand <tier> <dev>...    Add disks as new tier + extend LVM\n"
 		"  message <device> <msg> [args] Send message to kernel\n"

@@ -34,6 +34,10 @@
 
 #include "shr.h"
 
+/* Forward declarations */
+static int shr_disk_replace(const char *tier_name,
+			    unsigned int disk_idx, const char *new_dev);
+
 /* ===================================================================
  * Internal helpers
  * =================================================================== */
@@ -2284,11 +2288,37 @@ int cmd_shr_disk(int argc, char **argv)
 	const char *action;
 	unsigned int disk_idx;
 
+	if (argc < 1) {
+		fprintf(stderr, "Usage: lhsrctl shr disk <fail|online|list|replace>\n");
+		return 1;
+	}
+	action = argv[0];
+
+	/* "replace <tier> <disk_idx> <new_dev>" uses disk index directly */
+	if (strcmp(action, "replace") == 0) {
+		if (argc < 4) {
+			fprintf(stderr, "Usage: lhsrctl shr disk "
+				"replace <tier> <disk_idx> <new_dev>\n");
+			return 1;
+		}
+		/* Parse disk index */
+		{
+			char *end;
+			long val = strtol(argv[2], &end, 10);
+			if (*end || val < 0 || val >= 32) {
+				fprintf(stderr, "Invalid disk index '%s' (0-31)\n",
+					argv[2]);
+				return 1;
+			}
+			disk_idx = (unsigned int)val;
+		}
+		return shr_disk_replace(argv[1], disk_idx, argv[3]);
+	}
+
 	if (argc < 2) {
 		fprintf(stderr, "Usage: lhsrctl shr disk <fail|online> <idx>\n");
 		return 1;
 	}
-	action = argv[0];
 
 	/* Validate and parse disk index */
 	{
@@ -2321,7 +2351,8 @@ int cmd_shr_disk(int argc, char **argv)
 					 "disk_online %u", disk_idx);
 			else {
 				fprintf(stderr, "Unknown action '%s'. "
-					"Use 'fail' or 'online'.\n", action);
+					"Use 'fail', 'online', or 'replace'.\n",
+					action);
 				return 1;
 			}
 
@@ -2903,4 +2934,263 @@ int cmd_shr_expand(int argc, char **argv)
 out:
 	free(disk_sizes);
 	return ret;
+}
+
+/*
+ * Replace a disk in an LHSR SHR tier.
+ *
+ * Usage (via cmd_shr_disk):
+ *   shr disk replace <tier_name> <disk_idx> <new_dev>
+ *
+ * Uses the kernel module's device_path message to get the current device
+ * for each disk index, builds a new dm table, loads/resumes, then starts
+ * rebuild.
+ */
+static int shr_disk_replace(const char *tier_name,
+			    unsigned int disk_idx, const char *new_dev)
+{
+	char cmd[4096];
+	char resp[2048];
+	char table_line[4096];
+	unsigned long long size = 0;
+	int raid_type = -1;
+	int disks = 0;
+		/* Kernel disk name is at most 32 bytes (DISK_NAME_LEN) */
+		char dev_paths[32][64];
+	int i;
+
+	printf("Replacing disk %u in '%s' with %s\n",
+	       disk_idx, tier_name, new_dev);
+
+	/* 1. Verify new device exists and is a block device */
+	{
+		struct stat st;
+		if (stat(new_dev, &st) < 0) {
+			fprintf(stderr, "Error: '%s' does not exist\n", new_dev);
+			return 1;
+		}
+		if (!S_ISBLK(st.st_mode)) {
+			fprintf(stderr, "Error: '%s' is not a block device\n",
+				new_dev);
+			return 1;
+		}
+	}
+
+	/* 2. Get config: raid=N disks=N */
+	if (dm_msg(tier_name, "config", resp, sizeof(resp)) < 0 || !resp[0]) {
+		fprintf(stderr, "Error: cannot get config from '%s'\n",
+			tier_name);
+		return 1;
+	}
+	{
+		char work[1024];
+		snprintf(work, sizeof(work), "%.1000s", resp);
+		char *tok = strtok(work, " \t");
+		while (tok) {
+			int val;
+			if (sscanf(tok, "raid=%d", &val) == 1)
+				raid_type = val;
+			else if (sscanf(tok, "disks=%d", &val) == 1)
+				disks = val;
+			tok = strtok(NULL, " \t");
+		}
+	}
+	if (raid_type < 0 || disks <= 0) {
+		fprintf(stderr, "Error: cannot parse config: '%s'\n", resp);
+		return 1;
+	}
+	if (disk_idx >= (unsigned int)disks) {
+		fprintf(stderr, "Error: disk index %u out of range (0-%d)\n",
+			disk_idx, disks - 1);
+		return 1;
+	}
+	printf("  RAID type=%d, disks=%d\n", raid_type, disks);
+
+	/* 3. Get array size from dmsetup table (first 2 tokens: "0 <size> ...") */
+	snprintf(cmd, sizeof(cmd),
+		 "/usr/sbin/dmsetup table '%.63s' 2>/dev/null", tier_name);
+	if (shr_capture(cmd, table_line, sizeof(table_line)) < 0 ||
+	    !table_line[0]) {
+		fprintf(stderr, "Error: cannot get table for '%s'\n", tier_name);
+		return 1;
+	}
+	{
+		char twork[4096];
+		snprintf(twork, sizeof(twork), "%.3000s", table_line);
+		/* Strip "name: " prefix if present */
+		char *p = twork;
+		char *colon = strchr(p, ':');
+		if (colon) {
+			p = colon + 1;
+			while (*p == ' ') p++;
+		}
+		char *tok = strtok(p, " \t");
+		if (tok) tok = strtok(NULL, " \t"); /* skip start=0 */
+		if (tok)
+			size = strtoull(tok, NULL, 10);
+	}
+	if (size == 0) {
+		fprintf(stderr, "Error: cannot parse size from: '%s'\n",
+			table_line);
+		return 1;
+	}
+	printf("  Array size: %llu sectors\n", size);
+
+	/* 4. Get device path for each disk index */
+	for (i = 0; i < disks; i++) {
+		char msgbuf[64];
+		char dp_resp[256];
+		snprintf(msgbuf, sizeof(msgbuf), "device_path %d", i);
+		if (dm_msg(tier_name, msgbuf, dp_resp, sizeof(dp_resp)) < 0 ||
+		    !dp_resp[0]) {
+			fprintf(stderr, "Error: cannot get device path "
+				"for disk %d\n", i);
+			return 1;
+		}
+		/* Strip trailing whitespace/newline */
+		{
+			char *nl = dp_resp;
+			while (*nl) nl++;
+			while (nl > dp_resp &&
+			       (nl[-1] == '\n' || nl[-1] == '\r' ||
+				nl[-1] == ' '))
+				*--nl = '\0';
+		}
+		snprintf(dev_paths[i], sizeof(dev_paths[i]),
+			 "/dev/%.31s", dp_resp);
+		printf("  Disk %d: %s\n", i, dev_paths[i]);
+	}
+
+	/* 5. Build new table line */
+	{
+		char new_table[8192];
+		int pos = 0;
+
+		if (raid_type == LHSR_RAID_SINGLE ||
+		    raid_type == LHSR_RAID_MIRROR) {
+			const char *type_str =
+				(raid_type == LHSR_RAID_SINGLE)
+				? "single" : "mirror";
+			pos = snprintf(new_table, sizeof(new_table),
+				      "0 %llu lhsr %s", size, type_str);
+			for (i = 0; i < disks; i++) {
+				const char *dev = (i == (int)disk_idx)
+					? new_dev : dev_paths[i];
+				pos += snprintf(new_table + pos,
+						sizeof(new_table) - pos,
+						" %s 0", dev);
+				if (pos >= (int)sizeof(new_table) - 64) {
+					fprintf(stderr,
+						"Error: table too long\n");
+					return 1;
+				}
+			}
+		} else if (raid_type >= LHSR_RAID5) {
+			const char *type_str =
+				(raid_type == LHSR_RAID5)
+				? "raid5" : "raid6";
+			int parity = (raid_type == LHSR_RAID6) ? 2 : 1;
+			pos = snprintf(new_table, sizeof(new_table),
+				      "0 %llu lhsr %s 8 %d %d",
+				      size, type_str, disks, parity);
+			for (i = 0; i < disks; i++) {
+				const char *dev = (i == (int)disk_idx)
+					? new_dev : dev_paths[i];
+				pos += snprintf(new_table + pos,
+						sizeof(new_table) - pos,
+						" %s 0", dev);
+				if (pos >= (int)sizeof(new_table) - 64) {
+					fprintf(stderr,
+						"Error: table too long\n");
+					return 1;
+				}
+			}
+		} else {
+			fprintf(stderr, "Error: unsupported RAID type %d\n",
+				raid_type);
+			return 1;
+		}
+
+		printf("  New table: %s\n", new_table);
+
+		/* 6. Load new table */
+		printf("  Loading new table ... ");
+		fflush(stdout);
+		{
+			char tmpfile[] = "/tmp/shr_dm_table_XXXXXX";
+			int fd = mkstemp(tmpfile);
+			if (fd < 0) {
+				perror("  Failed to create temp file");
+				return 1;
+			}
+			FILE *f = fdopen(fd, "w");
+			if (!f) {
+				close(fd);
+				unlink(tmpfile);
+				perror("  Failed to open temp file");
+				return 1;
+			}
+			fprintf(f, "%s\n", new_table);
+			fclose(f);
+
+			snprintf(cmd, sizeof(cmd),
+				 "/usr/sbin/dmsetup load '%.63s' < '%s' 2>&1",
+				 tier_name, tmpfile);
+			int rc = system(cmd);
+			unlink(tmpfile);
+
+			if (rc != 0) {
+				fprintf(stderr,
+					"FAILED (dmsetup load returned %d)\n",
+					rc);
+				return 1;
+			}
+		}
+		printf("OK\n");
+
+		/* 7. Resume */
+		printf("  Resuming %s ... ", tier_name);
+		fflush(stdout);
+		snprintf(cmd, sizeof(cmd),
+			 "/usr/sbin/dmsetup resume '%.63s' 2>&1",
+			 tier_name);
+		if (system(cmd) != 0) {
+			fprintf(stderr, "FAILED\n");
+			return 1;
+		}
+		printf("OK\n");
+
+		/* 8. Mark replaced disk for rebuild */
+		printf("  Marking disk %u for rebuild ... ", disk_idx);
+		fflush(stdout);
+		snprintf(cmd, sizeof(cmd),
+			 "/usr/sbin/dmsetup message '%.63s' 0 "
+			 "disk_fail %u 2>&1", tier_name, disk_idx);
+		if (system(cmd) != 0) {
+			fprintf(stderr, "FAILED\n");
+			return 1;
+		}
+		printf("OK\n");
+
+		/* 9. Start rebuild */
+		printf("  Starting rebuild of disk %u ... ", disk_idx);
+		fflush(stdout);
+		snprintf(cmd, sizeof(cmd),
+			 "/usr/sbin/dmsetup message '%.63s' 0 "
+			 "rebuild start %u 2>&1", tier_name, disk_idx);
+		if (system(cmd) != 0) {
+			fprintf(stderr, "FAILED\n");
+			return 1;
+		}
+
+		/* 10. Show initial rebuild status */
+		if (dm_msg(tier_name, "rebuild status",
+			   resp, sizeof(resp)) == 0 && resp[0]) {
+			printf("OK\n  Rebuild: %s\n", resp);
+		} else {
+			printf("OK\n");
+		}
+	}
+
+	return 0;
 }

@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-15 (Phase 7 ALL COMPLETE)
+**Last Updated:** 2026-06-16 (Phase 8 ALL COMPLETE)
 
 ---
 
@@ -573,48 +573,51 @@ LHSR), and merges them with LVM. It does NOT belong in the kernel module.
 
 ---
 
-## Phase 8: shr disk replace (PLANNED)
+## Phase 8: shr disk replace (✅ COMPLETE 2026-06-16)
 
-**Status:** Design phase — implementation pending
+**Status:** IMPLEMENTED AND TESTED END-TO-END ON VM
 
-**What:** `lhsrctl shr disk replace <tier> <old_device> <new_device>` — atomically swap a failed or
-failing disk in an LHSR tier with a new device, then trigger rebuild to populate it.
+**What:** `lhsrctl shr disk replace <tier> <disk_idx> <new_dev>` — atomically swap a disk in an
+LHSR tier by index, then trigger rebuild to populate it.
 
-### Why
-The current workflow for replacing a failed disk requires 3 separate steps:
-1. `shr disk fail <tier> <device>` (if not auto-detected)
-2. Manually compute and load a new dm table with the replacement device
-3. `shr rebuild start <tier>`
+### API
+```
+lhsrctl shr disk replace <tier_name> <disk_idx> <new_dev>
+```
+- `<disk_idx>`: 0-based disk index in the array (use `shr status` to see indices)
+- `<new_dev>`: path to replacement block device
 
-A single `shr disk replace` command makes this a one-step operation for the admin.
+### Implementation
+1. Queries array config via kernel `device_path` message (returns kernel disk name for each index)
+2. Reads array geometry from `config` message (raid=N, disks=N)
+3. Gets device sector count from `dmsetup table`
+4. Builds new dm table line with the replacement device at the specified index
+5. `dmsetup load` + `dmsetup resume` — atomic table swap
+6. `disk_fail` message marks the replaced disk for rebuild
+7. `rebuild start` triggers reconstruction
 
-### Approach (userspace-only, no kernel changes)
-1. Scan existing tiers via `dmsetup table` — find the tier and the specific disk slot
-2. Validate new device (exists, readable, writable, sane size)
-3. Optionally fail the old disk if not already failed
-4. Build new dm table line with old_dev replaced by new_dev in the same slot
-5. `dmsetup load <tier_name> <new_table>` + `dmsetup resume <tier_name>`
-6. The kernel module reloads with the new table (state reinitialized, WIB loaded from disk)
-7. Start rebuild on the replaced disk via `dmsetup message`
-8. Report progress
+### Key design decisions
+- **Uses disk index, not device path**: The user specifies which disk slot (by index) to replace.
+  This avoids ambiguity with device path matching and works correctly even though `dmsetup deps`
+  returns devices in DM-core order (which differs from LHSR disk index order).
+- **Kernel `device_path <idx>` message**: Added to the kernel module to return the kernel disk
+  name (`bd_disk->disk_name`) for a given disk index. This is how userspace learns which device
+  is at each slot.
+- **Config message parsing**: Reads `raid=N` and `disks=N` from the `config` message response
+  to determine RAID type and disk count for table reconstruction.
+- **Table format reconstruction**: For RAID5, default params: chunk=8, stripes=disks, cont=parity.
+  This matches the `shr create` defaults.
 
-### Constraints
-- **State loss on table reload**: The kernel module's stripe cache and in-memory state is lost
-  on `dmsetup resume`. The WIB (write-intent bitmap) is reloaded from disk, which is safe
-  (conservative). This is acceptable for a maintenance operation — the array should be idle
-  (no active I/O) during disk replacement.
-- **RAID5/6 requires full rebuild**: Unlike WIB-optimized RAID1 rebuild, replaced disks in
-  parity layouts always require full reconstruction. The rebuild command handles this.
-- **mdadm mode**: mdadm has its own `mdadm --replace` / `mdadm --add` workflow. v1 only
-  supports LHSR mode. mdadm mode can be added later.
+### Kernel change
+- Added `device_path <idx>` handler in `lhsr_message()` that returns `bd_disk->disk_name`
+  (kernel short name like `loop0`, `sda`). Userspace prepends `/dev/` prefix.
 
-### Deliverables
-- `shr disk replace` command in `shr.c`
-- Table parse/rebuild logic (parse dmsetup table, swap device in slot)
-- `dmsetup load` + `dmsetup resume` using libdevmapper or /usr/sbin/dmsetup
-- Rebuild trigger after successful table reload
-- Error handling: validate device sizes match, rollback on failure
-- Tested end-to-end on VM: RAID5 with failed disk → replace → rebuild → scrub verify
+### Verification
+- Tested on VM with 3-disk RAID5 (32MB loop devices) + spare
+- Replaced disk 2 with spare while array was mounted and active
+- Rebuild completed 100% (reconstructed 65256 sectors)
+- Data integrity verified: SHA256 matched pre-replace checksum
+- Cleanup: DM device removed, loop devices detached, images deleted
 
 ---
 
@@ -647,8 +650,7 @@ architecture-level feature for the DM target. It is NOT trivial.
 | 5 | Recovery tools + kernel degraded mode | 2 weeks | Phase 0 |
 | 6 | SHR userspace (core: plan/create/status) | ~1 week | Phase 0 |
 | 7 | SHR operational commands (destroy/disk/rebuild/scrub/expand) | **1 session** | Phase 6 |
-
-**Estimated total for Phases 0-6:** ~8 weeks with one developer. Phase 7 added in 1 session.
+| 8 | shr disk replace | **1 session** | Phase 7 (kernel device_path handler)
 
 ---
 

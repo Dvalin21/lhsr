@@ -4573,6 +4573,20 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return 1;
 	}
 
+	if (strncmp(argv[0], "device_path", 11) == 0) {
+		if (argc < 2)
+			return -EINVAL;
+		err = kstrtouint(argv[1], 10, &disk_idx);
+		if (err || disk_idx >= arr->disks)
+			return -EINVAL;
+		if (!arr->disk[disk_idx] || !arr->disk[disk_idx]->bd_disk)
+			return -ENXIO;
+
+		scnprintf(result, maxlen, "%s",
+			  arr->disk[disk_idx]->bd_disk->disk_name);
+		return 1;
+	}
+
 	if (strncmp(argv[0], "scrub", 4) == 0) {
 		/*
 		 * dmsetup message format: dmsetup message <device> <sector> <message>
