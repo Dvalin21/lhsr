@@ -301,6 +301,17 @@ static void parse_smart_attributes(const uint8_t *data, struct disk_health *dh)
 		case SMART_ATTR_TEMPERATURE:
 			dh->temperature = attr[5];	/* Current temp in Celsius */
 			break;
+		case SMART_ATTR_POWER_ON_HOURS: {
+			/* 4-byte little-endian raw value starting at byte 5 */
+			uint64_t raw = (uint64_t)attr[5] | ((uint64_t)attr[6] << 8) |
+				       ((uint64_t)attr[7] << 16) | ((uint64_t)attr[8] << 24);
+			dh->power_on_hours = (int)raw;
+			break;
+		}
+		case SMART_ATTR_WEAR_LEVEL:
+			/* Normalized value is byte 3 (0-100), raw is bytes 5-6 */
+			dh->wear_level = attr[3];	/* normalized 0-100 */
+			break;
 		}
 	}
 }

@@ -114,6 +114,7 @@ enum {
 	CMD_BITROT_LOG,
 	CMD_RECOVER,
 	CMD_RECONSTRUCT,
+	CMD_HEALTH,
 	CMD_SHR,
 };
 
@@ -141,6 +142,7 @@ static void usage(const char *prog)
 		"  disk-health <device> <index>  Query disk health\n"
 		"  recover <device>...          Scan and assemble LHSR arrays\n"
 		"  reconstruct [opts] <dev>...   Reconstruct missing RAID5/6 disk from N-1\n"
+		"  health [--json]               Show daemon health summary\n"
 		"  shr plan [opts] <dev>...     Compute SHR layout for variable-size disks\n"
 		"  shr create [opts] <dev>...   Execute SHR layout (DESTRUCTIVE)\n"
 		"  shr status                   Show current SHR topology and health\n"
@@ -599,6 +601,117 @@ static int cmd_bitrot_log(int argc, char **argv)
 	printf("Run scrub to verify data integrity\n");
 
 	return 0;
+}
+
+/* Command health — quick daemon health summary */
+static int cmd_health(int argc, char **argv)
+{
+	int json_output = 0;
+
+	for (int i = 2; i < argc; i++) {
+		if (strcmp(argv[i], "--json") == 0)
+			json_output = 1;
+	}
+
+	char *json = read_file(LHSRD_STATUS_FILE);
+	if (!json) {
+		if (json_output) {
+			printf("{\"status\":\"error\",\"message\":\"Daemon not running\"}\n");
+		} else {
+			printf("LHSR Health\n");
+			printf("===========\n\n");
+			printf("Daemon: NOT RUNNING\n");
+			printf("Start daemon: lhsrd -d\n");
+		}
+		return 1;
+	}
+
+	/* Parse top-level fields */
+	char version[32] = "?";
+	int uptime = 0, running = 0, num_arrays = 0, num_disks = 0;
+	json_string(json, "version", version, sizeof(version));
+	json_int(json, "uptime", &uptime);
+	json_int(json, "running", &running);
+	json_int(json, "num_arrays", &num_arrays);
+	json_int(json, "num_disks", &num_disks);
+
+	if (json_output) {
+		/* Just pass through the status file JSON */
+		printf("%s\n", json);
+		free(json);
+		return 0;
+	}
+
+	char uptime_str[64] = "0s";
+	format_duration(uptime, uptime_str, sizeof(uptime_str));
+
+	printf("LHSR Health Summary\n");
+	printf("===================\n");
+	printf("Daemon:     %s (v%s, uptime %s)\n",
+	       running ? "RUNNING" : "STOPPED",
+	       version, uptime_str);
+	printf("Arrays:     %d\n", num_arrays);
+	printf("Disks:      %d\n\n", num_disks);
+
+	/* Scan each disk for health label and warning */
+	const char *disks_section = strstr(json, "\"disks\":");
+	int healthy = 0, warning = 0, critical = 0, failed = 0;
+
+	if (disks_section) {
+		const char *disk_start = strchr(disks_section, '[');
+		if (disk_start) {
+			const char *obj_end = disk_start;
+			for (int i = 0; i < num_disks; i++) {
+				const char *obj = next_object(obj_end, &obj_end);
+				if (!obj)
+					break;
+				int hs = 0, f = 0;
+				char warn[256] = "";
+				json_int_in(obj, obj_end, "health_score", &hs);
+				json_int_in(obj, obj_end, "failed", &f);
+				json_string_in(obj, obj_end, "trend_warning",
+					       warn, sizeof(warn));
+
+				if (f)
+					failed++;
+				else if (hs < 40)
+					critical++;
+				else if (hs < 70)
+					warning++;
+				else
+					healthy++;
+
+				if (f || hs < 70) {
+					char device[256] = "?";
+					json_string_in(obj, obj_end, "device",
+						       device, sizeof(device));
+					printf("  %s: health=%d%s",
+					       device, hs, f ? " FAILED" : "");
+					if (warn[0])
+						printf(" [%s]", warn);
+					printf("\n");
+				}
+			}
+		}
+	}
+
+	printf("\nDisk Status: %d healthy, %d warning, %d critical, %d failed\n",
+	       healthy, warning, critical, failed);
+
+	/* Overall status */
+	if (failed > 0)
+		printf("Overall: DEGRADED — %d disk(s) failed\n", failed);
+	else if (critical > 0)
+		printf("Overall: CRITICAL — %d disk(s) below 40%% health\n", critical);
+	else if (warning > 0)
+		printf("Overall: WARNING — %d disk(s) showing degradation signs\n", warning);
+	else if (num_disks > 0)
+		printf("Overall: HEALTHY — all disks OK\n");
+	else
+		printf("Overall: No disks tracked\n");
+
+	free(json);
+	return (failed > 0) ? 2 : (critical > 0) ? 1 : 0;
 }
 
 /* Message command - send message to kernel via dmsetup */
@@ -1943,6 +2056,8 @@ int main(int argc, char **argv)
 		cmd = CMD_RECOVER;
 	} else if (strcmp(argv[1], "reconstruct") == 0) {
 		cmd = CMD_RECONSTRUCT;
+	} else if (strcmp(argv[1], "health") == 0) {
+		cmd = CMD_HEALTH;
 	} else if (strcmp(argv[1], "shr") == 0) {
 		cmd = CMD_SHR;
 	} else if (strcmp(argv[1], "message") == 0) {
@@ -2025,6 +2140,9 @@ int main(int argc, char **argv)
 	case CMD_RECONSTRUCT:
 		ret = cmd_reconstruct(argc, argv);
 		break;
+	case CMD_HEALTH:
+		ret = cmd_health(argc, argv);
+		break;
 	case CMD_SHR:
 		/* Parse shr subcommands: "lhsrctl shr plan|create|status" */
 		if (argc < 3) {
@@ -2046,10 +2164,12 @@ int main(int argc, char **argv)
 			ret = cmd_shr_rebuild(argc - 3, argv + 3);
 		} else if (strcmp(argv[2], "expand") == 0) {
 			ret = cmd_shr_expand(argc - 3, argv + 3);
+		} else if (strcmp(argv[2], "grow") == 0) {
+			ret = cmd_shr_grow(argc - 3, argv + 3);
 		} else {
 			fprintf(stderr, "Unknown shr subcommand '%s'. "
 				"Use: plan, create, status, destroy, "
-				"disk, rebuild, scrub, expand\n",
+				"disk, rebuild, scrub, expand, grow\n",
 				argv[2]);
 			ret = 1;
 		}

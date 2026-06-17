@@ -135,5 +135,6 @@ int cmd_shr_scrub(int argc, char **argv);
 int cmd_shr_disk(int argc, char **argv);
 int cmd_shr_rebuild(int argc, char **argv);
 int cmd_shr_expand(int argc, char **argv);
+int cmd_shr_grow(int argc, char **argv);
 
 #endif /* LHSR_SHR_H */

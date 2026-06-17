@@ -43,6 +43,8 @@ struct disk_health {
 	int    smart_pending;
 	int    smart_uncorrectable;
 	int    temperature;
+	int    power_on_hours;		/* SMART attribute 0x09 */
+	int    wear_level;		/* SMART/NVMe wear level */
 	int    health;			/* 0-100 raw SMART health */
 	int    health_score;		/* 0-100 composite (computed) */
 	time_t last_check;
@@ -71,6 +73,9 @@ struct daemon_config {
 	int    trend_enabled;
 	char   trend_db_path[256];
 	int    trend_snapshot_interval;	/* seconds between snapshots */
+	char   notify_sendmail[256];	/* path to sendmail binary */
+	char   notify_email_to[256];	/* recipient email address */
+	char   notify_webhook_url[512];	/* HTTP URL for webhook POST */
 };
 
 /* Global daemon state */
@@ -173,5 +178,17 @@ int lhsr_config_load(struct daemon_config *cfg, const char *path);
  * Returns 0 on success, -1 on error.
  */
 int lhsr_config_save(const struct daemon_config *cfg, const char *path);
+
+/* ---------- Notification delivery (lhsr-notify.c) ---------- */
+
+/*
+ * Send an alert notification (email + webhook).
+ * st: daemon state with config (notify_sendmail, notify_webhook_url)
+ * subject: alert subject line
+ * message: alert body (may contain newlines)
+ * This is best-effort — failures are logged but not returned.
+ */
+void lhsr_notify_alert(struct daemon_state *st,
+		       const char *subject, const char *message);
 
 #endif /* LHSRD_H */

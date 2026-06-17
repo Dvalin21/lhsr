@@ -41,6 +41,9 @@ void lhsr_config_defaults(struct daemon_config *cfg)
 	strncpy(cfg->trend_db_path, LHSRD_TREND_DB,
 		sizeof(cfg->trend_db_path) - 1);
 	cfg->trend_snapshot_interval = LHSRD_TREND_SNAPSHOT_INT;
+	cfg->notify_sendmail[0]  = '\0';	/* disabled by default */
+	cfg->notify_email_to[0]  = '\0';
+	cfg->notify_webhook_url[0] = '\0';
 }
 
 /*
@@ -122,6 +125,15 @@ int lhsr_config_load(struct daemon_config *cfg, const char *path)
 				sizeof(cfg->trend_db_path) - 1);
 		} else if (strcasecmp(key, "trend_snapshot_interval") == 0) {
 			cfg->trend_snapshot_interval = atoi(val);
+		} else if (strcasecmp(key, "notify_sendmail") == 0) {
+			strncpy(cfg->notify_sendmail, val,
+				sizeof(cfg->notify_sendmail) - 1);
+		} else if (strcasecmp(key, "notify_email_to") == 0) {
+			strncpy(cfg->notify_email_to, val,
+				sizeof(cfg->notify_email_to) - 1);
+		} else if (strcasecmp(key, "notify_webhook_url") == 0) {
+			strncpy(cfg->notify_webhook_url, val,
+				 sizeof(cfg->notify_webhook_url) - 1);
 		} else {
 			syslog(LOG_WARNING, "%s:%d: unknown key '%s'", path, lineno, key);
 		}
@@ -152,6 +164,9 @@ int lhsr_config_save(const struct daemon_config *cfg, const char *path)
 	fprintf(f, "trend_enabled       = %d\n", cfg->trend_enabled);
 	fprintf(f, "trend_db_path       = %s\n", cfg->trend_db_path);
 	fprintf(f, "trend_snapshot_interval = %d\n", cfg->trend_snapshot_interval);
+	fprintf(f, "notify_sendmail     = %s\n", cfg->notify_sendmail);
+	fprintf(f, "notify_email_to     = %s\n", cfg->notify_email_to);
+	fprintf(f, "notify_webhook_url  = %s\n", cfg->notify_webhook_url);
 
 	fclose(f);
 	return 0;

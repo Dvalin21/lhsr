@@ -51,17 +51,18 @@ static int cmp_u64_asc(const void *a, const void *b)
 	return 0;
 }
 
-/* Paired sort: compare by size field for use with struct {size, path} */
 static int cmp_disk_info(const void *a, const void *b)
 {
 	const struct {
 		uint64_t size;
 		const char *path;
-	} *da = a, *db = b;
+	} *const da = a, *const db = b;
 	if (da->size < db->size) return -1;
 	if (da->size > db->size) return 1;
 	return 0;
 }
+
+
 
 static const char *raid_type_name(unsigned int t)
 {
@@ -3242,4 +3243,526 @@ static int shr_disk_replace(const char *tier_name,
 	}
 
 	return 0;
+}
+
+
+/*
+ * Grow an SHR tier by adding one or more disks to an existing mdadm RAID
+ * array, then resizing LVM PV/LV and filesystem.
+ *
+ * Usage: lhsrctl shr grow [--mdadm|--lhsr] [--yes] [--no-growfs]
+ *                        <tier_name> <device> [device...]
+ *
+ * For mdadm-mode tiers only in v1.  LHSR-mode tier growth requires kernel
+ * changes (reshape infrastructure) and is deferred — use 'shr expand' to
+ * add capacity via a new tier instead.
+ *
+ * Algorithm:
+ *   1. Validate new device(s), read sizes
+ *   2. Discover existing tier (scan /dev/md/ for shr_tier_* names)
+ *   3. For LHSR-mode tiers: print error + redirect to shr expand
+ *   4. Read current mdadm geometry from sysfs
+ *   5. Execute: mdadm --grow --raid-devices=N+count --add <dev>...
+ *   6. Monitor reshape progress via sysfs sync_action + sync_completed
+ *   7. pvresize the md device
+ *   8. lvextend -l +100%FREE to use new space
+ *   9. Optionally grow filesystem (ext4 resize2fs / xfs xfs_growfs)
+ */
+int cmd_shr_grow(int argc, char **argv)
+{
+	uint64_t *disk_sizes = NULL;
+	int use_lhsr = -1;	/* -1 = auto, 0 = mdadm, 1 = lhsr */
+	int yes = 0;
+	int no_growfs = 0;
+	int ret = 1;
+	int opt_consumed = 0;
+	unsigned int i;
+	char confirm[64];
+	const char *tier_name;
+	unsigned int new_count;
+	const char **new_disks;
+
+	/* ---- Parse options ---- */
+	for (i = 0; i < (unsigned int)argc; i++) {
+		if (strcmp(argv[i], "--mdadm") == 0) {
+			use_lhsr = 0;
+			opt_consumed++;
+		} else if (strcmp(argv[i], "--lhsr") == 0) {
+			use_lhsr = 1;
+			opt_consumed++;
+		} else if (strcmp(argv[i], "--yes") == 0) {
+			yes = 1;
+			opt_consumed++;
+		} else if (strcmp(argv[i], "--no-growfs") == 0) {
+			no_growfs = 1;
+			opt_consumed++;
+		} else if (argv[i][0] == '-') {
+			fprintf(stderr, "Error: unknown option '%s'\n",
+				argv[i]);
+			goto usage;
+		} else {
+			break;	/* first non-option = tier name */
+		}
+	}
+
+	if (argc - opt_consumed < 2) {
+usage:
+		fprintf(stderr, "Usage: lhsrctl shr grow "
+			"[--mdadm|--lhsr] [--yes] [--no-growfs] "
+			"<tier_name> <device> [device...]\n");
+		return 1;
+	}
+
+	tier_name = argv[opt_consumed];
+	new_count = argc - opt_consumed - 1;
+	new_disks = (const char **)(argv + opt_consumed + 1);
+
+	/* ---- Validate new devices and get sizes ---- */
+	printf("Scanning new device(s) ...\n");
+	disk_sizes = calloc(new_count, sizeof(uint64_t));
+	if (!disk_sizes) {
+		fprintf(stderr, "Error: out of memory\n");
+		return 1;
+	}
+
+	for (i = 0; i < new_count; i++) {
+		int fd;
+		uint64_t sz;
+
+		if (shr_validate_device(new_disks[i]) < 0)
+			goto out;
+
+		fd = open(new_disks[i], O_RDONLY);
+		if (fd < 0) {
+			fprintf(stderr, "Error: cannot open %s: %s\n",
+				new_disks[i], strerror(errno));
+			goto out;
+		}
+		if (ioctl(fd, BLKGETSIZE64, &sz) < 0) {
+			fprintf(stderr, "Error: cannot get size of %s: %s\n",
+				new_disks[i], strerror(errno));
+			close(fd);
+			goto out;
+		}
+		close(fd);
+		disk_sizes[i] = sz / 512;
+		printf("  %s: %llu sectors (%.1f GiB)\n",
+		       new_disks[i],
+		       (unsigned long long)disk_sizes[i],
+		       (double)disk_sizes[i] * 512 / (1024 * 1024 * 1024));
+	}
+
+	/* ---- Discover existing tier ---- */
+	struct md_entry mdents[16];
+	int nmd = scan_md_devices("shr_tier_", mdents, 16);
+	int found_md = -1;
+	int found_dm = -1;
+
+	for (i = 0; i < (unsigned int)nmd; i++) {
+		if (strcmp(mdents[i].name, tier_name) == 0) {
+			found_md = (int)i;
+			break;
+		}
+	}
+
+	/* Try LHSR dm if not found in mdadm */
+	if (found_md < 0) {
+		struct dm_entry dments[16];
+		int ndm = scan_dm_tiers("shr_tier_", dments, 16);
+		for (i = 0; i < (unsigned int)ndm; i++) {
+			if (strcmp(dments[i].name, tier_name) == 0) {
+				found_dm = (int)i;
+				break;
+			}
+		}
+	}
+
+	if (found_md < 0 && found_dm < 0) {
+		fprintf(stderr,
+			"Error: tier '%s' not found.\n"
+			"Scanned /dev/md/ (mdadm) and dmsetup "
+			"for shr_tier_* devices.\n",
+			tier_name);
+		goto out;
+	}
+
+	if (found_dm >= 0 && (use_lhsr != 0 || found_md < 0)) {
+		fprintf(stderr,
+			"Error: '%s' is an LHSR-mode tier.\n"
+			"Growing an LHSR tier requires kernel changes "
+			"and is not yet implemented.\n"
+			"Use 'lhsrctl shr expand' to add capacity "
+			"via a new tier.\n",
+			tier_name);
+		goto out;
+	}
+
+	/* We're growing an mdadm-mode tier */
+	int md_num = mdents[found_md].md_num;
+	if (md_num < 0) {
+		fprintf(stderr,
+			"Error: cannot determine md device number "
+			"for '%s'.\n", tier_name);
+		goto out;
+	}
+
+	/* ---- Read current geometry from sysfs ---- */
+	char sysfs_path[256];
+	char buf_ge[256];
+	int raid_disks = 0;
+	int degraded = 0;
+	uint64_t array_size_1k = 0;
+	uint64_t dev_size_512 = 0;
+	char raid_level[64] = "?";
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/block/md%d/md/raid_disks", md_num);
+	if (read_sysfs(sysfs_path, buf_ge, sizeof(buf_ge)) == 0)
+		raid_disks = atoi(buf_ge);
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/block/md%d/md/degraded", md_num);
+	if (read_sysfs(sysfs_path, buf_ge, sizeof(buf_ge)) == 0)
+		degraded = atoi(buf_ge);
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/block/md%d/md/level", md_num);
+	if (read_sysfs(sysfs_path, buf_ge, sizeof(buf_ge)) == 0)
+		snprintf(raid_level, sizeof(raid_level), "%.63s", buf_ge);
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/block/md%d/md/array_size", md_num);
+	if (read_sysfs(sysfs_path, buf_ge, sizeof(buf_ge)) == 0)
+		array_size_1k = strtoull(buf_ge, NULL, 10);
+
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/block/md%d/size", md_num);
+	if (read_sysfs(sysfs_path, buf_ge, sizeof(buf_ge)) == 0)
+		dev_size_512 = strtoull(buf_ge, NULL, 10);
+
+	/* Read member partition sizes */
+	md_entry_read_members(&mdents[found_md]);
+	uint64_t member_size = 0;
+	for (i = 0; i < (unsigned int)mdents[found_md].nmembers; i++) {
+		int fd = open(mdents[found_md].members[i], O_RDONLY);
+		if (fd >= 0) {
+			uint64_t sz;
+			if (ioctl(fd, BLKGETSIZE64, &sz) == 0) {
+				uint64_t sz_sect = sz / 512;
+				if (member_size == 0 || sz_sect < member_size)
+					member_size = sz_sect;
+			}
+			close(fd);
+		}
+	}
+
+	/* Validate new disks are large enough */
+	for (i = 0; i < new_count; i++) {
+		if (member_size > 0 && disk_sizes[i] < member_size) {
+			fprintf(stderr,
+				"Error: %s is too small "
+				"(%llu < %llu sectors).\n",
+				new_disks[i],
+				(unsigned long long)disk_sizes[i],
+				(unsigned long long)member_size);
+			goto out;
+		}
+	}
+
+	/* Check array is not already reshaping */
+	snprintf(sysfs_path, sizeof(sysfs_path),
+		 "/sys/block/md%d/md/sync_action", md_num);
+	if (read_sysfs(sysfs_path, buf_ge, sizeof(buf_ge)) == 0 &&
+	    strcmp(buf_ge, "idle") != 0) {
+		fprintf(stderr,
+			"Error: array '%s' is busy (%s).\n"
+			"Wait for current operation to complete.\n",
+			tier_name, buf_ge);
+		goto out;
+	}
+
+	/* Check resulting disk count */
+	int new_raid_disks = raid_disks + (int)new_count;
+	if (new_raid_disks > SHR_MAX_DISKS) {
+		fprintf(stderr,
+			"Error: resulting tier would have %d disks "
+			"(max is %d).\n", new_raid_disks, SHR_MAX_DISKS);
+		goto out;
+	}
+
+	uint64_t current_usable;
+	if (array_size_1k > 0)
+		current_usable = array_size_1k * 2;	/* 1K → 512 sectors */
+	else
+		current_usable = dev_size_512;
+
+	/* ---- Print plan ---- */
+	printf("\nSHR Grow Plan\n");
+	printf("=============\n");
+	printf("Tier:            %s (md%d)\n", tier_name, md_num);
+	printf("RAID level:      %s\n", raid_level);
+	printf("Status:          %d disks, %d degraded\n",
+	       raid_disks, degraded);
+	printf("New disk(s):     %u\n", new_count);
+	printf("Result disks:    %d\n", new_raid_disks);
+	if (member_size > 0)
+		printf("Member size:     %llu sectors (%.1f GiB)\n",
+		       (unsigned long long)member_size,
+		       (double)member_size * 512 / (1024 * 1024 * 1024));
+	printf("Current usable:  %llu sectors (%.1f GiB)\n",
+	       (unsigned long long)current_usable,
+	       (double)current_usable * 512 / (1024 * 1024 * 1024));
+	printf("Operation:       online reshape via mdadm --grow\n");
+	printf("                 array remains mounted and accessible\n");
+
+	/* ---- Confirmation ---- */
+	if (!yes) {
+		printf("\nType 'YES' to proceed, anything else to abort: ");
+		fflush(stdout);
+		if (!fgets(confirm, sizeof(confirm), stdin)) {
+			printf("Aborted.\n");
+			goto out;
+		}
+		{
+			size_t clen = strlen(confirm);
+			if (clen > 0 && confirm[clen - 1] == '\n')
+				confirm[clen - 1] = '\0';
+		}
+		if (strcmp(confirm, "YES") != 0) {
+			printf("Aborted.\n");
+			goto out;
+		}
+	}
+
+	/* ---- Execute ---- */
+	printf("\nExecuting grow ...\n");
+
+	/* Step 1: mdadm --grow */
+	{
+		char cmd[16384];
+		int pos;
+
+		pos = snprintf(cmd, sizeof(cmd),
+			"/sbin/mdadm --grow /dev/md/%s "
+			"--raid-devices=%d",
+			tier_name, new_raid_disks);
+
+		for (i = 0; i < new_count; i++) {
+			pos += snprintf(cmd + pos, sizeof(cmd) - pos,
+					" --add %s", new_disks[i]);
+			if ((size_t)pos >= sizeof(cmd) - 64) {
+				fprintf(stderr,
+					"Error: mdadm command too long\n");
+				goto out;
+			}
+		}
+
+		printf("\n--- Step 1: mdadm --grow ---\n");
+		if (shr_run_cmd("%s", cmd) < 0) {
+			fprintf(stderr, "Error: mdadm --grow failed.\n");
+			goto out;
+		}
+	}
+
+	/* Step 2: Monitor reshape */
+	printf("\n--- Step 2: Monitor reshape ---\n");
+	{
+		int waited = 0;
+
+		/* Give mdadm/kernel a moment to start reshape */
+		usleep(500000);
+
+		while (1) {
+			snprintf(sysfs_path, sizeof(sysfs_path),
+				 "/sys/block/md%d/md/sync_action", md_num);
+			if (read_sysfs(sysfs_path, buf_ge,
+				       sizeof(buf_ge)) < 0) {
+				fprintf(stderr,
+					"  Warning: cannot read "
+					"sync_action\n");
+				break;
+			}
+
+			if (strcmp(buf_ge, "idle") == 0) {
+				if (waited > 0)
+					printf("\n");
+				printf("  Reshape complete.\n");
+				break;
+			}
+
+			/* Show progress */
+			snprintf(sysfs_path, sizeof(sysfs_path),
+				 "/sys/block/md%d/md/sync_completed",
+				 md_num);
+			if (read_sysfs(sysfs_path, buf_ge,
+				       sizeof(buf_ge)) == 0 && buf_ge[0]) {
+				printf("  Reshape: %-30s\r", buf_ge);
+				fflush(stdout);
+			}
+
+			sleep(2);
+			waited += 2;
+
+			if (waited > 1800) {
+				printf("\n");
+				fprintf(stderr,
+					"  Reshape still in progress "
+					"after 30 minutes.\n"
+					"  Check manually and run:\n"
+					"  pvresize /dev/md/%s && "
+					"lvextend -l +100%%FREE ...\n",
+					tier_name);
+				break;
+			}
+		}
+	}
+
+	/* Read new device size */
+	uint64_t new_size_512 = 0;
+	{
+		snprintf(sysfs_path, sizeof(sysfs_path),
+			 "/sys/block/md%d/size", md_num);
+		if (read_sysfs(sysfs_path, buf_ge, sizeof(buf_ge)) == 0)
+			new_size_512 = strtoull(buf_ge, NULL, 10);
+	}
+
+	printf("  New device size: %llu sectors (%.1f GiB)\n",
+	       (unsigned long long)new_size_512,
+	       (double)new_size_512 * 512 / (1024 * 1024 * 1024));
+
+	/* Step 3: Discover LVM VG and resize PV */
+	printf("\n--- Step 3: LVM PV resize ---\n");
+	{
+		char pv_capture[4096];
+		char md_dev[64];
+		char vg_name[64] = "";
+		int found_vg = 0;
+
+		snprintf(md_dev, sizeof(md_dev), "/dev/md%d", md_num);
+
+		/* Find which VG this PV belongs to */
+		snprintf(sysfs_path, sizeof(sysfs_path),
+			 "lvm pvs --noheadings -o pv_name,vg_name "
+			 "2>/dev/null | grep '%s' || true", md_dev);
+		if (shr_capture(sysfs_path, pv_capture,
+				sizeof(pv_capture)) == 0 && pv_capture[0]) {
+			char pv_buf[256], vg_buf[64];
+			if (sscanf(pv_capture, "%255s %63s",
+				   pv_buf, vg_buf) >= 2) {
+				snprintf(vg_name, sizeof(vg_name),
+					 "%s", vg_buf);
+				found_vg = 1;
+			}
+		}
+
+		if (found_vg) {
+			printf("  PV: %s\n", md_dev);
+			printf("  VG: %s\n", vg_name);
+
+			if (shr_run_cmd("pvresize '%s'", md_dev) < 0) {
+				fprintf(stderr,
+					"  Warning: pvresize failed. "
+					"Run manually:\n"
+					"  pvresize %s\n", md_dev);
+			} else {
+				/* Step 4: Extend LV */
+				printf("\n--- Step 4: LVM LV extend ---\n");
+				char lv_path[128];
+				snprintf(lv_path, sizeof(lv_path),
+					 "%s/shr_vol", vg_name);
+				if (shr_run_cmd(
+					"lvextend -l +100%%FREE "
+					"'%s' --yes", lv_path) < 0) {
+					fprintf(stderr,
+						"  Warning: lvextend "
+						"failed.\n"
+						"  Run manually:\n"
+						"  lvextend -l "
+						"+100%%FREE "
+						"%s --yes\n", lv_path);
+				}
+
+				/* Step 5: Optional filesystem grow */
+				if (!no_growfs) {
+					printf("\n--- Step 5: "
+					       "Filesystem grow ---\n");
+
+					/* Find mount point */
+					char mount_capture[4096];
+					snprintf(sysfs_path,
+						 sizeof(sysfs_path),
+						 "findmnt -n -o TARGET "
+						 "'/dev/%s/shr_vol' "
+						 "2>/dev/null || true",
+						 vg_name);
+					if (shr_capture(sysfs_path,
+							mount_capture,
+							sizeof(mount_capture))
+					    == 0 && mount_capture[0]) {
+						printf("  Mount point: %s\n",
+						       mount_capture);
+
+						/* Try ext4 resize2fs */
+						if (shr_run_cmd(
+							"resize2fs "
+							"'/dev/%s/shr_vol' "
+							"2>/dev/null || "
+							"true",
+							vg_name) == 0) {
+							printf("  ext4: "
+							       "resized\n");
+						} else if (shr_run_cmd(
+							"xfs_growfs '%s' "
+							"2>/dev/null || "
+							"true",
+							mount_capture)
+							   == 0) {
+							printf("  xfs: "
+							       "resized\n");
+						} else {
+							printf(
+							"  Auto-detect "
+							"failed. "
+							"Run manually:\n"
+							"  ext4: resize2fs "
+							"/dev/%s/shr_vol\n"
+							"  xfs:  xfs_growfs "
+							"%s\n",
+							vg_name,
+							mount_capture);
+						}
+					} else {
+						printf("  LV not mounted. "
+						       "Resize later:\n");
+						printf("  ext4: resize2fs "
+						       "/dev/%s/shr_vol\n",
+						       vg_name);
+						printf("  xfs:  xfs_growfs "
+						       "/mount/point\n");
+					}
+				}
+			}
+		} else {
+			printf("  No LVM VG found on %s.\n", md_dev);
+			printf("  Resize PV manually:\n");
+			printf("  pvresize %s\n", md_dev);
+		}
+	}
+
+	/* ---- Success ---- */
+	printf("\n=========================================================\n");
+	printf("  SHR GROWTH SUCCESSFUL\n");
+	printf("=========================================================\n");
+	printf("\nAdded %u disk(s) to %s\n", new_count, tier_name);
+	printf("RAID disks:  %d → %d\n", raid_disks, new_raid_disks);
+	printf("Device size: %llu sectors (%.1f GiB)\n",
+	       (unsigned long long)new_size_512,
+	       (double)new_size_512 * 512 / (1024 * 1024 * 1024));
+	printf("\n");
+
+	ret = 0;
+
+out:
+	free(disk_sizes);
+	return ret;
 }

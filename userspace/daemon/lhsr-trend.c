@@ -162,8 +162,8 @@ int lhsr_trend_record(const char *disk_path, struct disk_health *dh)
 	sqlite3_bind_int(stmt_insert, 4, dh->smart_pending);
 	sqlite3_bind_int(stmt_insert, 5, dh->smart_uncorrectable);
 	sqlite3_bind_int(stmt_insert, 6, dh->temperature);
-	sqlite3_bind_int(stmt_insert, 7, 0);		/* power_on_hours (not yet parsed) */
-	sqlite3_bind_int(stmt_insert, 8, 0);		/* wear_level (NVMe) */
+	sqlite3_bind_int(stmt_insert, 7, dh->power_on_hours);
+	sqlite3_bind_int(stmt_insert, 8, dh->wear_level);
 	sqlite3_bind_int(stmt_insert, 9, dh->health);
 
 	rc = sqlite3_step(stmt_insert);
@@ -284,6 +284,13 @@ int lhsr_trend_warning(const char *disk_path, char *buf, size_t buf_size)
 		len = snprintf(tmp, sizeof(tmp),
 			       "pending sectors increasing %.1f/day ",
 			       trend.pending_slope);
+		if (len < (int)buf_size)
+			strncat(buf, tmp, buf_size - strlen(buf) - 1);
+	}
+	if (trend.uncorrectable_warn) {
+		len = snprintf(tmp, sizeof(tmp),
+			       "uncorrectable sectors increasing %.1f/day ",
+			       trend.uncorrectable_slope);
 		if (len < (int)buf_size)
 			strncat(buf, tmp, buf_size - strlen(buf) - 1);
 	}

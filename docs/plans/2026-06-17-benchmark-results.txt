@@ -1,0 +1,113 @@
+LHSR Performance Baseline
+Date: Wed Jun 17 03:06:05 UTC 2026
+Kernel: 6.12.90+deb13.1-amd64
+Module version: dm_lhsr 77824
+dm_mod 221184
+----------------------------------------
+
+=== Creating test targets ===
+
+=== Warm-up ===
+
+============================================
+ RUNNING BENCHMARKS
+============================================
+
+
+--- RAW: read bs=1M qd=4 size=60M ---
+
+--- MDADM: read bs=1M qd=4 size=60M ---
+
+--- LHSR: read bs=1M qd=4 size=60M ---
+
+--- RAW: write bs=1M qd=4 size=60M ---
+
+--- MDADM: write bs=1M qd=4 size=60M ---
+
+--- LHSR: write bs=1M qd=4 size=60M ---
+
+--- RAW: randread bs=4K qd=16 size=60M ---
+
+--- MDADM: randread bs=4K qd=16 size=60M ---
+
+--- LHSR: randread bs=4K qd=16 size=60M ---
+
+--- RAW: randwrite bs=4K qd=16 size=60M ---
+
+--- MDADM: randwrite bs=4K qd=16 size=60M ---
+
+--- LHSR: randwrite bs=4K qd=16 size=60M ---
+
+--- RAW: randread bs=4K qd=1 size=60M ---
+
+--- MDADM: randread bs=4K qd=1 size=60M ---
+
+--- LHSR: randread bs=4K qd=1 size=60M ---
+
+--- RAW: randwrite bs=4K qd=1 size=60M ---
+
+--- MDADM: randwrite bs=4K qd=1 size=60M ---
+
+--- LHSR: randwrite bs=4K qd=1 size=60M ---
+
+--- RAW: randread bs=4K qd=32 size=60M ---
+
+--- MDADM: randread bs=4K qd=32 size=60M ---
+
+--- LHSR: randread bs=4K qd=32 size=60M ---
+
+--- RAW: randwrite bs=4K qd=32 size=60M ---
+
+--- MDADM: randwrite bs=4K qd=32 size=60M ---
+
+--- LHSR: randwrite bs=4K qd=32 size=60M ---
+
+--- MDADM: rw bs=4K qd=8 size=60M ---
+
+--- LHSR: rw bs=4K qd=8 size=60M ---
+
+============================================
+ BENCHMARKS COMPLETE
+ Results: /tmp/lhsr-benchmark-results-20260617-030605.txt
+============================================
+
+=== SUMMARY TABLE ===
+----------------------------------------
+Target   Pattern    BS       QD         IOPS         Lat(p99)  
+----------------------------------------
+----------------------------------------
+--- RAW: read bs=1M qd=4 size=60M ---
+--- MDADM: read bs=1M qd=4 size=60M ---
+--- LHSR: read bs=1M qd=4 size=60M ---
+--- RAW: write bs=1M qd=4 size=60M ---
+--- MDADM: write bs=1M qd=4 size=60M ---
+--- LHSR: write bs=1M qd=4 size=60M ---
+--- RAW: randread bs=4K qd=16 size=60M ---
+--- MDADM: randread bs=4K qd=16 size=60M ---
+--- LHSR: randread bs=4K qd=16 size=60M ---
+--- RAW: randwrite bs=4K qd=16 size=60M ---
+--- MDADM: randwrite bs=4K qd=16 size=60M ---
+--- LHSR: randwrite bs=4K qd=16 size=60M ---
+--- RAW: randread bs=4K qd=1 size=60M ---
+--- MDADM: randread bs=4K qd=1 size=60M ---
+--- LHSR: randread bs=4K qd=1 size=60M ---
+--- RAW: randwrite bs=4K qd=1 size=60M ---
+--- MDADM: randwrite bs=4K qd=1 size=60M ---
+--- LHSR: randwrite bs=4K qd=1 size=60M ---
+--- RAW: randread bs=4K qd=32 size=60M ---
+--- MDADM: randread bs=4K qd=32 size=60M ---
+--- LHSR: randread bs=4K qd=32 size=60M ---
+--- RAW: randwrite bs=4K qd=32 size=60M ---
+--- MDADM: randwrite bs=4K qd=32 size=60M ---
+--- LHSR: randwrite bs=4K qd=32 size=60M ---
+--- MDADM: rw bs=4K qd=8 size=60M ---
+--- LHSR: rw bs=4K qd=8 size=60M ---
+----------------------------------------
+----------------------------------------
+============================================
+
+To cleanup:
+  sudo /sbin/dmsetup remove bench-lhsr
+  sudo /sbin/mdadm --stop /dev/md/bench-md
+  sudo /sbin/losetup -d /dev/loop0 /dev/loop1 /dev/loop2 /dev/loop3 /dev/loop4 /dev/loop5 /dev/loop6
+  rm -f /tmp/bench_raw /tmp/bench_md* /tmp/bench_lhsr*

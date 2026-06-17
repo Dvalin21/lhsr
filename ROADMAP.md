@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-16 (Phase 8 ALL COMPLETE)
+**Last Updated:** 2026-06-17 (Phase 9-10: C+D ✅, A pending)
 
 ---
 
@@ -621,20 +621,103 @@ lhsrctl shr disk replace <tier_name> <disk_idx> <new_dev>
 
 ---
 
-## Phase 9: Live Migration (NOT YET SCOPED)
+## Phase 9: Live Migration — `shr grow` (COMPLETE)
 
-Online RAID reshape (adding/removing disks, changing RAID levels) is an
-architecture-level feature for the DM target. It is NOT trivial.
+Implements online RAID growth for mdadm-mode SHR tiers via `mdadm --grow`,
+with LVM PV/LV resize and optional filesystem grow (ext4/xfs).
 
-### Approaches
-1. **Stack on mdadm** (recommended): All reshape happens in mdadm. LHSR is the
-   DM target on top. No kernel changes needed.
-2. **Implement reshape in DM target**: Multi-month kernel engineering effort.
-   Likely not worth it given mdadm already works.
+### Scope (v1)
+- **mdadm-mode only** — grows an existing mdadm RAID array by adding disks
+- **Online reshape** — data remains mounted and accessible during migration
+- **LVM integration** — automatic PV resize → LV extend → ext4/xfs growfs
+- **LHSR-mode deferred** — requires kernel reshape infrastructure; redirects to `shr expand`
 
-### This is NOT YET SCOPED
-- Requires architectural decision first
-- No implementation plan exists
+### Usage
+```
+lhsrctl shr grow [--mdadm|--lhsr] [--yes] [--no-growfs] <tier_name> <device>...
+```
+
+### Algorithm
+1. Validate new device(s), check size >= existing members
+2. Discover existing tier via `scan_md_devices("shr_tier_")`
+3. Read mdadm geometry from sysfs (raid_disks, degraded, level, chunk)
+4. Execute `mdadm --grow --raid-devices=N+count --add <dev>...`
+5. Monitor reshape via sysfs `sync_action`/`sync_completed` (2s poll, 30m timeout)
+6. `pvresize <md_dev>` using numeric md%d path (not symlink)
+7. `lvextend -l +100%FREE <vg>/shr_vol`
+8. Auto-detect ext4 (resize2fs) or xfs (xfs_growfs) by mount point
+
+### Verified
+- Tested on VM with 4 loopback devices (3→4 disk RAID5 growth)
+- Data integrity verified via SHA256 before/after grow
+- LVM PV resize, LV extend, and ext4 growfs all sequence correctly
+- Array remains mounted and accessible during reshape
+
+### Future Work (v2)
+- RAID level migration (e.g., RAID5 → RAID6)
+- Disk removal (shr grow --remove)
+- Chunk size migration
+- Stacked LHSR-on-mdadm reshape (requires create-time changes)
+  ```
+
+---
+
+## Phase 10: Production Hardening & Kernel Reshape (IN PROGRESS)
+
+Three sub-phases: C (Monitoring) → D (Benchmarks) → A (Kernel Reshape).
+
+### Phase 10-C: Monitoring & Observability (✅ COMPLETE 2026-06-16)
+
+Adds real SMART telemetry, health-based notifications, Prometheus metrics
+expansion, and `lhsrctl health` command.
+
+- **C1**: `power_on_hours` + `wear_level` parsed from SMART SG_IO
+  (attributes 0x09, 0xE8)
+- **C2**: Fixed `uncorrectable_warn` gap in `lhsr_trend_warning()`; trend DB now
+  stores real power_on_hours/wear_level
+- **C3**: New `lhsr-notify.c` — notification delivery via `sendmail(8)` and
+  `curl` webhook, wired into `check_disk_health()` on health critical + SMART
+  poll failure threshold
+- **C4**: Expanded Prometheus metrics — added `lhsr_daemon_info{version=...}`,
+  `lhsr_array_info{...}`, `lhsr_array_degraded_disks`, `lhsr_power_on_hours`,
+  `lhsr_wear_level`, `lhsr_trend_*_slope`, `lhsr_disk_warning{device,warning}`
+- **C5**: `lhsrctl health` — quick summary from `/run/lhsrd.status`, supports
+  `--json`, exit codes 0/1/2
+- **C6**: `notify_sendmail`, `notify_email_to`, `notify_webhook_url` config keys
+  parsed/saved
+- **Build**: Zero warnings. VM tested: daemon starts, metrics expose, health
+  command returns correct exit codes.
+
+### Phase 10-D: Performance Baseline Benchmarks (✅ COMPLETE 2026-06-17)
+
+Establish regression baseline for kernel module before Phase A changes.
+All benchmarks on VM with 3x80M loopback on tmpfs. Three targets: raw single
+disk, mdadm RAID5, LHSR RAID5.
+
+#### Key Findings
+
+| Workload | Metric | mdadm | LHSR | Ratio |
+|----------|--------|-------|------|-------|
+| Seq Read (1M, QD4) | IOPS | 4226 | 1169 | 3.6x slower |
+| Seq Write (1M, QD4) | IOPS | 668 | 15 | **44.5x slower** |
+| Rand Read (4K, QD16) | IOPS | 66431 | 69016 | **0.96x (similar)** |
+| Rand Write (4K, QD16) | IOPS | 69798 | 5725 | 12.2x slower |
+| Rand Read (4K, QD32) | IOPS | 76560 | 76344 | **1.0x (identical)** |
+| Rand Write (4K, QD32) | IOPS | 75436 | 5146 | 14.7x slower |
+| Rand Write (4K, QD1) | IOPS | 22786 | 5620 | 4.1x slower |
+
+**Write bottleneck**: Current kernel module does synchronous RMW per stripe
+with no pipelining. This baseline quantifies the gap before Phase A targets
+parallel I/O dispatch. See `docs/plans/2026-06-17-phase10-benchmarks-results.md`
+for full results.
+
+### Phase 10-A: Kernel Reshape (NOT YET STARTED)
+
+Targets parallel I/O dispatch in the kernel module to fix the write bottleneck.
+- Parallel RMW pipeline (async_tx offload or workqueue-based)
+- Multi-stripe pipelining to keep disks busy
+- Read path must not regress from baseline
+- Target: writes within 3x of mdadm (currently 12-44x)
 
 ---
 
@@ -650,7 +733,11 @@ architecture-level feature for the DM target. It is NOT trivial.
 | 5 | Recovery tools + kernel degraded mode | 2 weeks | Phase 0 |
 | 6 | SHR userspace (core: plan/create/status) | ~1 week | Phase 0 |
 | 7 | SHR operational commands (destroy/disk/rebuild/scrub/expand) | **1 session** | Phase 6 |
-| 8 | shr disk replace | **1 session** | Phase 7 (kernel device_path handler)
+| 8 | shr disk replace | **1 session** | Phase 7 |
+| 9 | Live migration / shr grow | **1 session** | Phase 6 |
+| 10-C | Monitoring & observability | **1 session** | Phase 4 |
+| 10-D | Performance baseline benchmarks | **1 session** | Phase 0 |
+| 10-A | Kernel reshape (parallel I/O dispatch) | NOT YET STARTED | Phase 10-D
 
 ---
 
