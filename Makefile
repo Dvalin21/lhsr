@@ -31,18 +31,21 @@ clean:
 	rm -rf build/
 
 # Install
-install: modules
+install: lib modules userspace
 	$(MAKE) -C kernel/dm-lhsr install
-	cp -r userspace/cli/lhsrctl /usr/local/bin/
-	cp -r userspace/daemon/lhsrd /usr/local/bin/
-	cp -r userspace/recovery/lhsr-scan /usr/local/bin/
+	cp userspace/cli/lhsrctl /usr/local/bin/lhsrctl
+	cp userspace/cli/lhsrctl /usr/local/sbin/lhsrctl
+	cp userspace/daemon/lhsrd /usr/local/bin/lhsrd
+	cp userspace/daemon/lhsrd /usr/local/sbin/lhsrd
+	cp userspace/recovery/lhsr-scan /usr/local/bin/lhsr-scan
+	cp userspace/recovery/lhsr-scan /usr/local/sbin/lhsr-scan
 
 # Uninstall
 uninstall:
 	rmmod dm-lhsr 2>/dev/null || true
-	rm -f /usr/local/bin/lhsrctl
-	rm -f /usr/local/bin/lhsrd
-	rm -f /usr/local/bin/lhsr-scan
+	rm -f /usr/local/bin/lhsrctl /usr/local/sbin/lhsrctl
+	rm -f /usr/local/bin/lhsrd /usr/local/sbin/lhsrd
+	rm -f /usr/local/bin/lhsr-scan /usr/local/sbin/lhsr-scan
 
 # Package
 package:

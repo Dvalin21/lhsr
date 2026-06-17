@@ -1092,13 +1092,15 @@ int cmd_shr_create(int argc, char **argv)
 	int parity = 1;
 	int use_lhsr = 0;
 	int force = 0;
+	int yes = 0;
+	uint64_t min_part = 0; /* 0 = use default (SHR_MIN_PARTITION) */
 	int ret = 1;
 	int opt_consumed = 1; /* skip "create" */
 	char confirm[64];
 	unsigned int i;
 	struct shr_layout layout;
 
-	/* Parse options: --parity N, --lhsr, --mdadm, --force */
+	/* Parse options: --parity N, --lhsr, --mdadm, --force, --yes, --min-part */
 	for (i = 1; i < (unsigned int)argc; i++) {
 		if (strcmp(argv[i], "--parity") == 0 && i + 1 < (unsigned int)argc) {
 			parity = atoi(argv[++i]);
@@ -1116,10 +1118,21 @@ int cmd_shr_create(int argc, char **argv)
 		} else if (strcmp(argv[i], "--force") == 0) {
 			force = 1;
 			opt_consumed++;
+		} else if (strcmp(argv[i], "--yes") == 0) {
+			yes = 1;
+			opt_consumed++;
+		} else if (strcmp(argv[i], "--min-part") == 0 && i + 1 < (unsigned int)argc) {
+			min_part = strtoull(argv[++i], NULL, 10);
+			if (min_part == 0) {
+				fprintf(stderr, "Error: invalid --min-part value\n");
+				return 1;
+			}
+			opt_consumed += 2;
 		} else if (argv[i][0] == '-') {
 			fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
 			fprintf(stderr, "Usage: lhsrctl shr create [--parity 1|2] "
-				"[--lhsr|--mdadm] [--force] <device>...\n");
+				"[--lhsr|--mdadm] [--force] [--yes] [--min-part N] "
+				"<device>...\n");
 			return 1;
 		}
 	}
@@ -1128,7 +1141,8 @@ int cmd_shr_create(int argc, char **argv)
 	if (disk_count < 3) {
 		fprintf(stderr, "Error: SHR requires at least 3 disks\n");
 		fprintf(stderr, "Usage: lhsrctl shr create [--parity 1|2] "
-			"[--lhsr|--mdadm] [--force] <device>...\n");
+			"[--lhsr|--mdadm] [--force] [--yes] [--min-part N] "
+			"<device>...\n");
 		return 1;
 	}
 
@@ -1194,7 +1208,7 @@ int cmd_shr_create(int argc, char **argv)
 	}
 
 	/* Compute layout */
-	if (shr_plan_layout(sizes, disk_count, parity, 0, 0, &layout) < 0)
+	if (shr_plan_layout(sizes, disk_count, parity, 0, min_part, &layout) < 0)
 		goto out;
 
 	/* Print plan */
@@ -1213,24 +1227,26 @@ int cmd_shr_create(int argc, char **argv)
 	}
 
 	/* Confirmation */
-	printf("\n============================================================\n");
-	printf("  DESTRUCTIVE OPERATION — ALL DATA ON THESE DISKS WILL BE LOST\n");
-	printf("============================================================\n");
-	printf("Type 'YES' to proceed, anything else to abort: ");
-	fflush(stdout);
-	if (!fgets(confirm, sizeof(confirm), stdin)) {
-		fprintf(stderr, "Aborted.\n");
-		goto out;
-	}
-	/* Remove trailing newline */
-	{
-		size_t clen = strlen(confirm);
-		if (clen > 0 && confirm[clen - 1] == '\n')
-			confirm[clen - 1] = '\0';
-	}
-	if (strcmp(confirm, "YES") != 0) {
-		printf("Aborted.\n");
-		goto out;
+	if (!yes) {
+		printf("\n============================================================\n");
+		printf("  DESTRUCTIVE OPERATION — ALL DATA ON THESE DISKS WILL BE LOST\n");
+		printf("============================================================\n");
+		printf("Type 'YES' to proceed, anything else to abort: ");
+		fflush(stdout);
+		if (!fgets(confirm, sizeof(confirm), stdin)) {
+			fprintf(stderr, "Aborted.\n");
+			goto out;
+		}
+		/* Remove trailing newline */
+		{
+			size_t clen = strlen(confirm);
+			if (clen > 0 && confirm[clen - 1] == '\n')
+				confirm[clen - 1] = '\0';
+		}
+		if (strcmp(confirm, "YES") != 0) {
+			printf("Aborted.\n");
+			goto out;
+		}
 	}
 
 	printf("\nExecuting SHR layout ...\n");
@@ -1919,17 +1935,20 @@ int cmd_shr_destroy(int argc, char **argv)
 	int force = 0;
 	unsigned int i;
 	int ret = 0;
+	int yes = 0;
 	char confirm[64];
 	char vg_names[16][64];
 	int nvgs = 0;
 
-	/* Parse --force */
+	/* Parse --force, --yes */
 	for (i = 1; i < (unsigned int)argc; i++) {
 		if (strcmp(argv[i], "--force") == 0)
 			force = 1;
+		else if (strcmp(argv[i], "--yes") == 0)
+			yes = 1;
 		else {
 			fprintf(stderr,
-				"Usage: lhsrctl shr destroy [--force]\n");
+				"Usage: lhsrctl shr destroy [--force] [--yes]\n");
 			return 1;
 		}
 	}
@@ -2082,7 +2101,7 @@ int cmd_shr_destroy(int argc, char **argv)
 	}
 
 	/* Confirmation */
-	if (!force) {
+	if (!force && !yes) {
 		printf("\n======================================"
 		       "==========================\n");
 		printf("  DESTRUCTIVE — DATA ON SHR TIERS "
@@ -2506,6 +2525,7 @@ int cmd_shr_expand(int argc, char **argv)
 	unsigned int new_count = 0;
 	int use_lhsr = 1;
 	int force = 0;
+	int yes = 0;
 	int ret = 1;
 	int opt_consumed = 0;
 	unsigned int i;
@@ -2529,11 +2549,15 @@ int cmd_shr_expand(int argc, char **argv)
 		} else if (strcmp(argv[i], "--force") == 0) {
 			force = 1;
 			opt_consumed++;
+		} else if (strcmp(argv[i], "--yes") == 0) {
+			yes = 1;
+			opt_consumed++;
 		} else if (argv[i][0] == '-') {
 			fprintf(stderr, "Error: unknown option '%s'\n",
 				argv[i]);
 			fprintf(stderr, "Usage: lhsrctl shr expand "
-				"[--lhsr|--mdadm] [--force] <device>...\n");
+				"[--lhsr|--mdadm] [--force] [--yes] "
+				"<device>...\n");
 			return 1;
 		}
 	}
@@ -2696,21 +2720,23 @@ int cmd_shr_expand(int argc, char **argv)
 	printf("  lvextend -l +100%%FREE %s/shr_vol\n", vg_name);
 
 	/* ---- Confirmation ---- */
-	printf("\nThis operation will modify LVM state.\n");
-	printf("Type 'YES' to proceed, anything else to abort: ");
-	fflush(stdout);
-	if (!fgets(confirm, sizeof(confirm), stdin)) {
-		printf("Aborted.\n");
-		goto out;
-	}
-	{
-		size_t clen = strlen(confirm);
-		if (clen > 0 && confirm[clen - 1] == '\n')
-			confirm[clen - 1] = '\0';
-	}
-	if (strcmp(confirm, "YES") != 0) {
-		printf("Aborted.\n");
-		goto out;
+	if (!yes) {
+		printf("\nThis operation will modify LVM state.\n");
+		printf("Type 'YES' to proceed, anything else to abort: ");
+		fflush(stdout);
+		if (!fgets(confirm, sizeof(confirm), stdin)) {
+			printf("Aborted.\n");
+			goto out;
+		}
+		{
+			size_t clen = strlen(confirm);
+			if (clen > 0 && confirm[clen - 1] == '\n')
+				confirm[clen - 1] = '\0';
+		}
+		if (strcmp(confirm, "YES") != 0) {
+			printf("Aborted.\n");
+			goto out;
+		}
 	}
 
 	/* ---- Execute ---- */
@@ -3056,8 +3082,14 @@ static int shr_disk_replace(const char *tier_name,
 				nl[-1] == ' '))
 				*--nl = '\0';
 		}
-		snprintf(dev_paths[i], sizeof(dev_paths[i]),
-			 "/dev/%.31s", dp_resp);
+		/* Convert to partition path (kernel returns parent disk name,
+		 * e.g. "loop0" but we need "/dev/loop0p1" for the dm table) */
+		{
+			char part_str[64];
+			shr_get_part_dev(dp_resp, 1, part_str, sizeof(part_str));
+			snprintf(dev_paths[i], sizeof(dev_paths[i]),
+				 "/dev/%.31s", part_str);
+		}
 		printf("  Disk %d: %s\n", i, dev_paths[i]);
 	}
 
@@ -3113,7 +3145,19 @@ static int shr_disk_replace(const char *tier_name,
 
 		printf("  New table: %s\n", new_table);
 
-		/* 6. Load new table */
+		/* 6. Suspend the tier (required before load) */
+		printf("  Suspending %s ... ", tier_name);
+		fflush(stdout);
+		snprintf(cmd, sizeof(cmd),
+			 "/usr/sbin/dmsetup suspend '%.63s' 2>&1",
+			 tier_name);
+		if (system(cmd) != 0) {
+			fprintf(stderr, "FAILED (suspend)\n");
+			return 1;
+		}
+		printf("OK\n");
+
+		/* 7. Load new table */
 		printf("  Loading new table ... ");
 		fflush(stdout);
 		{
@@ -3143,12 +3187,17 @@ static int shr_disk_replace(const char *tier_name,
 				fprintf(stderr,
 					"FAILED (dmsetup load returned %d)\n",
 					rc);
+				/* Try to resume so device is not stuck */
+				snprintf(cmd, sizeof(cmd),
+					 "/usr/sbin/dmsetup resume "
+					 "'%.63s' 2>&1", tier_name);
+				system(cmd);
 				return 1;
 			}
 		}
 		printf("OK\n");
 
-		/* 7. Resume */
+		/* 8. Resume tier */
 		printf("  Resuming %s ... ", tier_name);
 		fflush(stdout);
 		snprintf(cmd, sizeof(cmd),
@@ -3160,7 +3209,7 @@ static int shr_disk_replace(const char *tier_name,
 		}
 		printf("OK\n");
 
-		/* 8. Mark replaced disk for rebuild */
+		/* 9. Mark replaced disk for rebuild */
 		printf("  Marking disk %u for rebuild ... ", disk_idx);
 		fflush(stdout);
 		snprintf(cmd, sizeof(cmd),
@@ -3172,7 +3221,7 @@ static int shr_disk_replace(const char *tier_name,
 		}
 		printf("OK\n");
 
-		/* 9. Start rebuild */
+		/* 10. Start rebuild */
 		printf("  Starting rebuild of disk %u ... ", disk_idx);
 		fflush(stdout);
 		snprintf(cmd, sizeof(cmd),

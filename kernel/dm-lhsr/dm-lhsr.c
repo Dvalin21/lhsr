@@ -4582,8 +4582,32 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		if (!arr->disk[disk_idx] || !arr->disk[disk_idx]->bd_disk)
 			return -ENXIO;
 
-		scnprintf(result, maxlen, "%s",
-			  arr->disk[disk_idx]->bd_disk->disk_name);
+		/* Return the full device path, including partition suffix.
+		 * For partition devices (e.g. loop0p1, sda1), the disk_name
+		 * is the parent (e.g. "loop0") — we must append "p<N>" for
+		 * devices whose name ends in a digit, else "<N>" directly.
+		 */
+		{
+			const char *dname = arr->disk[disk_idx]->bd_disk->disk_name;
+			struct block_device *bdev = arr->disk[disk_idx];
+
+			if (bdev_is_partition(bdev)) {
+				int partno = bdev_partno(bdev);
+				size_t dlen = strlen(dname);
+
+				/* Append "p<N>" if parent name ends in digit
+				 * (e.g. loop0 → loop0p1), else "<N>" (e.g. sda → sda1).
+				 * Inline the digit check to avoid <ctype.h>.
+				 */
+				if (dlen > 0 && dname[dlen - 1] >= '0' &&
+				    dname[dlen - 1] <= '9')
+					scnprintf(result, maxlen, "%sp%d", dname, partno);
+				else
+					scnprintf(result, maxlen, "%s%d", dname, partno);
+			} else {
+				scnprintf(result, maxlen, "%s", dname);
+			}
+		}
 		return 1;
 	}
 
