@@ -1930,6 +1930,16 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		return -ENOMEM;
 	}
 
+	/* Initialize per-stripe locks BEFORE any goto bad can fire.
+	 * kzalloc gives zeroed memory; mutex_init() writes the proper
+	 * runtime state so mutex_destroy() is safe on all error paths.
+	 */
+	{
+		unsigned int j;
+		for (j = 0; j < LHSR_STRIPE_LOCKS; j++)
+			mutex_init(&arr->stripe_locks[j]);
+	}
+
 	/* Track active device */
 	atomic_inc(&lhsr_active_devices);
 	DMINFO("ctr: Active devices now: %d", atomic_read(&lhsr_active_devices));
@@ -2239,10 +2249,14 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	arr->rebuild_verified = 0;
 	arr->rebuild_wq = NULL;
 
-	/* Create ordered workqueue for RAID5/6 RMW writes (serialized = no write hole) */
-	arr->rmw_wq = alloc_ordered_workqueue("lhsr_rmw_%s", WQ_MEM_RECLAIM,
-					       arr->disk[0] && arr->disk[0]->bd_disk ?
-					       arr->disk[0]->bd_disk->disk_name : "unknown");
+	/* Create workqueue for RAID5/6 RMW writes — up to 8 concurrent workers.
+	 * Per-stripe mutexes prevent concurrent writes to the SAME stripe.
+	 * Different stripes run in parallel, eliminating the single-worker bottleneck
+	 * while preserving the write-hole safety guarantee per-stripe.
+	 */
+	arr->rmw_wq = alloc_workqueue("lhsr_rmw_%s", WQ_UNBOUND | WQ_MEM_RECLAIM, 8,
+				       arr->disk[0] && arr->disk[0]->bd_disk ?
+				       arr->disk[0]->bd_disk->disk_name : "unknown");
 	if (!arr->rmw_wq) {
 		DMERR("ctr: Failed to create RMW workqueue");
 		ti->error = "Failed to create RMW workqueue";
@@ -2320,6 +2334,12 @@ bad:
 		if (arr->dm_devs[i])
 			dm_put_device(ti, arr->dm_devs[i]);
 	}
+	/* Destroy per-stripe locks */
+	{
+		unsigned int j;
+		for (j = 0; j < LHSR_STRIPE_LOCKS; j++)
+			mutex_destroy(&arr->stripe_locks[j]);
+	}
 	/* Decrement active device count on error */
 	atomic_dec(&lhsr_active_devices);
 	DMINFO("ctr: Active devices now (error): %d", atomic_read(&lhsr_active_devices));
@@ -2356,6 +2376,13 @@ static void lhsr_dtr(struct dm_target *ti)
 		destroy_workqueue(arr->rmw_wq);
 		arr->rmw_wq = NULL;
 		DMINFO("dtr: RMW workqueue destroyed");
+	}
+
+	/* Destroy per-stripe locks (no concurrent RMW workers after workqueue destroy) */
+	{
+		unsigned int j;
+		for (j = 0; j < LHSR_STRIPE_LOCKS; j++)
+			mutex_destroy(&arr->stripe_locks[j]);
 	}
 
 	DMINFO("dtr: Stopping health check workqueue (check_wq=%p)", arr->check_wq);
@@ -3542,6 +3569,8 @@ static void lhsr_rmw_worker(struct work_struct *work)
 
 	unsigned int p_disk = data_disks;	/* P parity index */
 	unsigned int q_disk = data_disks + 1;	/* Q parity index (RAID6) */
+	unsigned int lock_idx;			/* Per-stripe mutex hash index */
+	bool locked = false;			/* Did we acquire the stripe lock? */
 
 	/* Allocate page buffers (process context, can use GFP_NOIO) */
 	old_data_page = alloc_page(GFP_NOIO);
@@ -3571,6 +3600,18 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		status = BLK_STS_IOERR;
 		goto out;
 	}
+
+	/*
+	 * Acquire per-stripe mutex.  Ensures that two RMW workers on the
+	 * SAME stripe (same chunk_start) do not interleave their read-modify-
+	 * write cycles.  Different stripes run concurrently on different CPUs
+	 * via the WQ_UNBOUND workqueue.  The hash may collide two different
+	 * stripes to the same lock — this is a harmless false serialization
+	 * that has no correctness impact.
+	 */
+	lock_idx = (chunk_start >> 3) & (LHSR_STRIPE_LOCKS - 1);
+	mutex_lock(&arr->stripe_locks[lock_idx]);
+	locked = true;
 
 	/* Phase 1: Read old data chunk from data disk */
 	status = lhsr_submit_bio_sync(arr->disk[data_disk], old_data_page,
@@ -3726,6 +3767,8 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		DMWARN("RMW: bitmap_clear failed for chunk %llu", (u64)chunk_start);
 
 out:
+	if (locked)
+		mutex_unlock(&arr->stripe_locks[lock_idx]);
 	if (old_data_page)
 		__free_page(old_data_page);
 	if (parity_page)

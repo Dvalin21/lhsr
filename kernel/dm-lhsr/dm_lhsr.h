@@ -104,8 +104,14 @@ struct lhsr_array {
 	struct workqueue_struct *rebuild_wq;
 	struct delayed_work rebuild_work;
 
-	/* RAID5/6 RMW write serialization (ordered workqueue = one write at a time) */
+	/* RAID5/6 RMW write concurrency:
+	 * - Regular (non-ordered) workqueue allows multiple concurrent RMW workers
+	 * - Per-stripe mutex hash prevents concurrent writes to the SAME stripe
+	 *   (stripe_locks[idx]) where idx = (chunk_start / 8) % LHSR_STRIPE_LOCKS
+	 */
+	#define LHSR_STRIPE_LOCKS 128
 	struct workqueue_struct *rmw_wq;
+	struct mutex stripe_locks[LHSR_STRIPE_LOCKS];
 
 	/* Write verification */
 	u32 write_verify_enabled;
