@@ -28,14 +28,18 @@
  *     (no RMW race at rebuild completion)
  *   - RAID6 Q parity compute via GF multiply, verified with live array write+read+
  *     single-disk-failure reconstruction
+ *   - RAID6 double-data-disk failure reconstruction via RS(255,N) Vandermonde
+ *     decode (2 failed data disks reconstructed from P + Q + surviving data)
  *
  * NOT YET PRODUCTION-READY (needs work):
  *   - RAID6 bitmap recovery — reconstructs P parity only, Q parity is NOT
- *     reconstructed (deferred: Q is only needed for double-failure RS decode,
- *     which is also not yet implemented)
+ *     reconstructed (deferred: Q is only needed for double-failure RS(255,N)
+ *     decode, which IS now implemented but bitmap_recover doesn't repair Q)
+ *   - RAID5 double-failure — not recoverable (RAID5 has only 1 parity disk)
+ *   - RAID5/6 data+P failure, data+Q failure, P+Q failure — RS decode for
+ *     parity-involved failures is not implemented (returns IOERR)
  *   - Concurrent stress — only single-threaded testing so far
- *   - RAID5 double-failure / RAID6 double-failure — returns IOERR with TODO
- *     (proper Reed-Solomon decode for double parity recovery)
+ *   - Q parity rebuild in bitmap_recover path (deferred)
  *
  * MIXED DISK SIZES:
  *   Array capacity = min(disk_sectors) for mirror, or data_disks × min(disk_sectors)
@@ -87,6 +91,10 @@ struct lhsr_raid_5_read_ctx;
 static void lhsr_mirror_endio(struct bio *bio);
 static void lhsr_raid_5_read_endio(struct bio *bio);
 static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
+static u8 lhsr_gf_inv(u8 a);
+static int lhsr_rs_decode_2(struct lhsr_array *arr, unsigned int *failed,
+			    unsigned int failed_count,
+			    struct lhsr_raid_5_read_ctx *ctx, size_t len);
 
 /* Write-hole journal bitmap functions */
 static int lhsr_bitmap_init(struct lhsr_array *arr);
@@ -113,6 +121,8 @@ static struct bio_set lhsr_bioset;
 
 /* Precomputed 2^i in GF(2^8) for RAID6 Reed-Solomon */
 static u8 rs_power_table[256];
+/* Discrete log for GF(2^8): gf_log[rs_power_table[i]] = i, gf_log[0] is 0 (unused) */
+static u8 gf_log[256];
 
 /* Active device tracking to prevent use-after-unload */
 static atomic_t lhsr_active_devices = ATOMIC_INIT(0);
@@ -168,7 +178,8 @@ struct lhsr_raid_5_read_ctx {
 	unsigned int target_disk;	/* Which disk we're reconstructing for */
 	unsigned int data_disks;	/* Number of data disks (total - parity) */
 	unsigned int working;		/* Number of working data disks */
-	unsigned int num_slots;		/* Total buffer slots = working + parity_reads */
+	unsigned int data_survivors;	/* Number of surviving data disks in disk_map */
+	unsigned int num_slots;		/* Total buffer slots = data_survivors + parity_survivors */
 	sector_t offset;			/* Sector offset */
 	size_t bio_size;			/* Byte count stored at read start (safe from completion) */
 	void **data_bufs;			/* Array of data+parity buffers */
@@ -562,32 +573,58 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 			       failed_count, all_bufs_valid, ctx->num_slots);
 
 			if (all_bufs_valid) {
-				if (failed_count == 1) {
+				unsigned long fd_local = lhsr_failed_disks_get(arr);
+				unsigned int dd = ctx->data_disks;
+				unsigned int p_idx = dd;
+				bool p_alive = !(fd_local & (1UL << p_idx));
+				/*
+				 * Determine reconstruction method:
+				 *
+				 * 1. Single data failure + P alive → XOR (data + P)
+				 *    Works for both RAID5 and RAID6. Q is in disk_map
+				 *    but excluded from XOR (GF-weighted, not XOR-compatible).
+				 *
+				 * 2. RAID6: 1 data + P dead + Q alive → RS decode from Q
+				 *    (single-equation recover).
+				 *
+				 * 3. RAID6: 2 data failures + P+Q alive → Vandermonde 2x2
+				 *    RS decode from P+Q+survivors.
+				 *
+				 * 4. RAID5 double-failure, or not enough parity → IOERR.
+				 */
+				if (failed_count == 1 && p_alive) {
 					/*
-					 * Single failure: XOR survivors.
-					 * For RAID5: data disks + P parity.
-					 * For RAID6: data disks + P parity (Q is excluded
-					 * from the disk_map earlier — it's a GF-weighted
-					 * sum, NOT XOR-compatible, so including it in
-					 * the XOR would give wrong reconstructed data).
+					 * XOR reconstruction: data survivors + P parity.
+					 * Iterate disk_map and exclude Q (GF-weighted).
+					 * Use a fixed-size array (max LHSR_MAX_DISKS).
 					 */
+					u8 *xor_slots[LHSR_MAX_DISKS];
+					unsigned int xor_count = 0;
+					for (j = 0; j < ctx->num_slots; j++) {
+						unsigned int d = ctx->disk_map[j];
+						if (d < dd || d == p_idx)
+							xor_slots[xor_count++] = ctx->data_bufs[j];
+					}
+					DMINFO("RECON XOR: xor_count=%u", xor_count);
 					lhsr_xor_parity(ctx->recon_buf,
-							 (void **)ctx->data_bufs,
-							 ctx->num_slots, bio_size);
-				} else if (failed_count >= 2) {
+							 (void **)xor_slots, xor_count, bio_size);
+				} else if (failed_count >= 1 && is_raid6) {
 					/*
-					 * RAID6 double-failure (or RAID5 >1 failure).
-					 * Proper Reed-Solomon reconstruction is NOT
-					 * yet implemented.  Return error instead of
-					 * producing garbage data or crashing.
-					 *
-					 * TODO: Implement RS(255,N) Vandermonde decode
-					 * for double-disk failure.  Requires GF(2^8)
-					 * matrix inversion of 2 coefficients from
-					 * rs_power_table[].  The existing gf_mul()
-					 * and rs_power_table[] are available.
+					 * Try Reed-Solomon decode for RAID6.
 					 */
-					DMERR("RAID%c: double-failure reconstruction not implemented (%u failed disks)",
+					int rs_ret = lhsr_rs_decode_2(arr, failed,
+								       failed_count,
+								       ctx, bio_size);
+					if (rs_ret == 0) {
+						DMINFO("RECON RS decode: target=%u failed=%u",
+						       ctx->target_disk, failed_count);
+					} else {
+						DMERR("RAID6: RS decode failed (%d) for %u disks",
+						      rs_ret, failed_count);
+						ctx->status = BLK_STS_IOERR;
+					}
+				} else {
+					DMERR("RAID%c: double-failure not recoverable (%u)",
 					      is_raid6 ? '6' : '5', failed_count);
 					ctx->status = BLK_STS_IOERR;
 				}
@@ -647,8 +684,6 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 }
 
 static int lhsr_update_disk_state(struct lhsr_array *arr, unsigned int disk_idx, u32 new_state);
-static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, size_t len);
-static u8 lhsr_gf_mul(u8 a, u8 b);
 static void lhsr_select_new_primary(struct lhsr_array *arr, unsigned int failed_disk, u32 extra_failed);
 
 /* I/O context to save original completion */
@@ -771,6 +806,131 @@ static inline u8 lhsr_gf_mul(u8 a, u8 b)
 		b >>= 1;
 	}
 	return prod;
+}
+
+/* GF(2^8) inverse using log/antilog tables (power table wraps at 255) */
+static inline u8 lhsr_gf_inv(u8 a)
+{
+	unsigned int idx;
+
+	if (!a)
+		return 0;	/* 0 has no inverse — return 0 harmlessly */
+	idx = 255 - gf_log[a];
+	if (idx >= 255)
+		idx = 0;
+	return rs_power_table[idx];
+}
+
+/*
+ * RS(255,N) decode for RAID6 with exactly 2 failed data disks.
+ *
+ * Solves the Vandermonde system:
+ *   [1     1  ] [D_t]   [S]    S = surviving data ^ P
+ *   [g^t  g^o ] [D_o] = [T]    T = Q ^ sum(g^i * surviving data)
+ *
+ * Only reconstructs ctx->target_disk (the bio target).
+ * Returns 0 on success, -ENOMEM on allocation failure, -EIO if not recoverable.
+ */
+static int lhsr_rs_decode_2(struct lhsr_array *arr, unsigned int *failed,
+			    unsigned int failed_count,
+			    struct lhsr_raid_5_read_ctx *ctx, size_t len)
+{
+	unsigned int i, j;
+	unsigned int data_disks = ctx->data_disks;
+	unsigned int p_idx = data_disks;
+	unsigned int q_idx = data_disks + 1;
+	unsigned long fd = lhsr_failed_disks_get(arr);
+	bool p_alive = !(fd & (1UL << p_idx));
+	bool q_alive = (arr->raid_type == LHSR_RAID6) && !(fd & (1UL << q_idx));
+	unsigned int target = ctx->target_disk;
+	unsigned int other;
+	u8 *tmp;
+	u8 coeff_other, det, inv_det;
+	u8 *recon = ctx->recon_buf;	/* Cast void* to u8* for byte access */
+
+	/* Allocate temp buffer for weighted sum (T) */
+	tmp = kzalloc(len, GFP_NOIO);
+	if (!tmp)
+		return -ENOMEM;
+
+	/*
+	 * Step 1: Compute S = XOR of surviving data + P (if alive).
+	 * Store into recon_buf.
+	 */
+	memset(recon, 0, len);
+	for (j = 0; j < ctx->num_slots; j++) {
+		unsigned int d = ctx->disk_map[j];
+		if (d < data_disks || d == p_idx) {
+			/* Data survivor or P parity */
+			u8 *buf = ctx->data_bufs[j];
+			for (i = 0; i < len; i++)
+				recon[i] ^= buf[i];
+		}
+	}
+
+	/*
+	 * Step 2: Compute T = Q ^ sum(g^i * surviving_data).
+	 */
+	memset(tmp, 0, len);
+	for (j = 0; j < ctx->num_slots; j++) {
+		unsigned int d = ctx->disk_map[j];
+		u8 *buf = ctx->data_bufs[j];
+
+		if (d < data_disks) {
+			/* Surviving data disk: weighted by g^d */
+			u8 coeff = rs_power_table[d];
+			for (i = 0; i < len; i++)
+				tmp[i] ^= lhsr_gf_mul(buf[i], coeff);
+		} else if (d == q_idx) {
+			/* Q parity: XOR directly (already weighted) */
+			for (i = 0; i < len; i++)
+				tmp[i] ^= buf[i];
+		}
+	}
+
+	if (failed_count == 1 && !p_alive && q_alive) {
+		/*
+		 * Case: target data disk + P failed, Q alive.
+		 * D_target = inv(g^target) * (Q ^ sum(g^i * surviving))
+		 * tmp = g^target * D_target → divide by g^target
+		 */
+		u8 inv_g = lhsr_gf_inv(rs_power_table[target]);
+		for (i = 0; i < len; i++)
+			recon[i] = lhsr_gf_mul(tmp[i], inv_g);
+	} else if (failed_count >= 2 && !p_alive && q_alive) {
+		/*
+		 * Case: data + P failed (>=2 failures including P), Q alive.
+		 * Same single-equation from Q as above — P failure doesn't affect
+		 * the Q-weighted-sum formula since P is never included in T.
+		 * D_target = inv(g^target) * T
+		 */
+		u8 inv_g = lhsr_gf_inv(rs_power_table[target]);
+		for (i = 0; i < len; i++)
+			recon[i] = lhsr_gf_mul(tmp[i], inv_g);
+	} else if (failed_count >= 2 && p_alive && q_alive) {
+		/*
+		 * Case: 2 data disks failed, P+Q alive.
+		 * Vandermonde 2x2: D_t = (g^o * S ^ T) * inv(g^t ^ g^o)
+		 * where t = target, o = other failed data disk
+		 */
+		other = (target == failed[0]) ? failed[1] : failed[0];
+		coeff_other = rs_power_table[other];
+		det = rs_power_table[target] ^ rs_power_table[other];
+		inv_det = lhsr_gf_inv(det);
+
+		for (i = 0; i < len; i++) {
+			u8 s = recon[i];
+			u8 t = tmp[i];
+			recon[i] = lhsr_gf_mul(
+				lhsr_gf_mul(coeff_other, s) ^ t, inv_det);
+		}
+	} else {
+		kfree(tmp);
+		return -EIO;
+	}
+
+	kfree(tmp);
+	return 0;
 }
 
 /* Select a new primary disk after a disk failure */
@@ -4186,17 +4346,17 @@ passthrough_single:
 			}
 
 			/* Count total survivor slots.
-			 * For RAID6 single-failure: XOR of survivors (data + P parity)
-			 * recreates the missing data.  Q parity is a GF-weighted sum
-			 * that CANNOT be used with XOR reconstruction — we must
-			 * exclude it from the survivor set here.
+			 * For RAID6: read ALL surviving parity disks (including Q).
+			 * Q is needed by RS(255,N) decode for double-failure recovery.
+			 * In the XOR path (single data failure, P alive), Q is simply
+			 * excluded from the XOR computation.
 			 */
 			total_slots = 0;
 			for (i = 0; i < data_disks; i++) {
 				if (!(lhsr_failed_disks_get(arr) & (1 << i)))
 					total_slots++;
 			}
-			unsigned int parity_to_use = (parity_disks > 1) ? 1 : parity_disks;
+			unsigned int parity_to_use = parity_disks;
 			for (j = 0; j < parity_to_use; j++) {
 				if (!(lhsr_failed_disks_get(arr) & (1 << (data_disks + j))))
 					total_slots++;
@@ -4241,9 +4401,9 @@ passthrough_single:
 			}
 
 			/* Build disk_map: survivors (data then parity)
-			 * NOTE: For RAID6, only P parity (index 0) is used in XOR
-			 * reconstruction. Q parity (index 1) is a GF-weighted sum
-			 * and CANNOT be combined with XOR.
+			 * For RAID6, BOTH P and Q are included in disk_map.
+			 * Q is a GF-weighted sum and CANNOT be combined with XOR,
+			 * but IS needed for RS(255,N) double-failure decode.
 			 */
 			j = 0;
 			for (i = 0; i < data_disks; i++) {
@@ -4252,6 +4412,7 @@ passthrough_single:
 					j++;
 				}
 			}
+			ctx->data_survivors = j;	/* Number of surviving data in disk_map */
 			for (i = 0; i < parity_to_use; i++) {
 				unsigned int pd = data_disks + i;
 				if (!(lhsr_failed_disks_get(arr) & (1 << pd))) {
@@ -5008,6 +5169,13 @@ static void __init lhsr_rs_table_init(void)
 	for (i = 1; i < 256; i++)
 		rs_power_table[i] = (rs_power_table[i-1] << 1) ^
 			(rs_power_table[i-1] & 0x80 ? 0x1d : 0);
+	/* Build discrete log table (inverse mapping of power table).
+	 * gf_log[v] = i such that rs_power_table[i] = v.
+	 * gf_log[0] is deliberately 0 (0 has no log — code checks for 0 before use).
+	 */
+	memset(gf_log, 0, sizeof(gf_log));
+	for (i = 0; i < 255; i++)
+		gf_log[rs_power_table[i]] = i;
 }
 
 module_init(lhsr_init);
