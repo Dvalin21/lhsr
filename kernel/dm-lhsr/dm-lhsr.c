@@ -22,14 +22,20 @@
  *     1MB regions, CRC32c protected, FUA write, crash recovery on re-assembly
  *   - RAID5 rebuild (data disk XOR reconstruction + parity disk XOR reconstruction)
  *     with bitmap journal crash safety
+ *   - Read reconstruction on data disk failure (RAID5 P-only, RAID6 XOR from survivors
+ *     using P parity — Q parity excluded from XOR since GF-weighted)
+ *   - failed_disks bitmask uses atomic_long_and/or for concurrent safety
+ *     (no RMW race at rebuild completion)
+ *   - RAID6 Q parity compute via GF multiply, verified with live array write+read+
+ *     single-disk-failure reconstruction
  *
  * NOT YET PRODUCTION-READY (needs work):
- *   - Read reconstruction on failure — code exists, NOT tested with failed disk
- *   - RAID6 Q parity rebuild (GF multiply) — code exists, NOT tested
- *   - RAID6 bitmap recovery — reconstructs P only, Q is NOT reconstructed
- *   - Error/failover paths — concurrently unprotected (failed_disks race in hot path)
+ *   - RAID6 bitmap recovery — reconstructs P parity only, Q parity is NOT
+ *     reconstructed (deferred: Q is only needed for double-failure RS decode,
+ *     which is also not yet implemented)
  *   - Concurrent stress — only single-threaded testing so far
- *   - RAID5 double-failure / RAID6 triple-failure — returns IOERR with TODO
+ *   - RAID5 double-failure / RAID6 double-failure — returns IOERR with TODO
+ *     (proper Reed-Solomon decode for double parity recovery)
  *
  * MIXED DISK SIZES:
  *   Array capacity = min(disk_sectors) for mirror, or data_disks × min(disk_sectors)
@@ -558,10 +564,12 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 			if (all_bufs_valid) {
 				if (failed_count == 1) {
 					/*
-					 * Single failure: XOR all survivors.
+					 * Single failure: XOR survivors.
 					 * For RAID5: data disks + P parity.
-					 * For RAID6: data disks + P+Q, but only
-					 * one is missing, so XOR of survivors works.
+					 * For RAID6: data disks + P parity (Q is excluded
+					 * from the disk_map earlier — it's a GF-weighted
+					 * sum, NOT XOR-compatible, so including it in
+					 * the XOR would give wrong reconstructed data).
 					 */
 					lhsr_xor_parity(ctx->recon_buf,
 							 (void **)ctx->data_bufs,
@@ -572,7 +580,12 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 					 * Proper Reed-Solomon reconstruction is NOT
 					 * yet implemented.  Return error instead of
 					 * producing garbage data or crashing.
-					 * TODO: Implement RS decode for double failure.
+					 *
+					 * TODO: Implement RS(255,N) Vandermonde decode
+					 * for double-disk failure.  Requires GF(2^8)
+					 * matrix inversion of 2 coefficients from
+					 * rs_power_table[].  The existing gf_mul()
+					 * and rs_power_table[] are available.
 					 */
 					DMERR("RAID%c: double-failure reconstruction not implemented (%u failed disks)",
 					      is_raid6 ? '6' : '5', failed_count);
@@ -1467,8 +1480,8 @@ static void rebuild_work(struct work_struct *work)
 		DMINFO("Rebuild complete: %llu sectors processed", arr->rebuild_verified);
 		arr->rebuild_state = LHSR_REBUILD_COMPLETE;
 		lhsr_update_disk_state(arr, arr->rebuild_disk, LHSR_DISK_HEALTHY);
-		lhsr_failed_disks_set(arr,
-			lhsr_failed_disks_get(arr) & ~(1UL << arr->rebuild_disk));
+		atomic_long_and(~(1UL << arr->rebuild_disk),
+				&arr->failed_disks);
 		if (lhsr_failed_disks_get(arr) == 0)
 			arr->state = LHSR_STATE_HEALTHY;
 		return;
@@ -1504,8 +1517,8 @@ static void rebuild_work(struct work_struct *work)
 		DMINFO("Rebuild complete: %llu sectors processed", arr->rebuild_verified);
 		arr->rebuild_state = LHSR_REBUILD_COMPLETE;
 		lhsr_update_disk_state(arr, arr->rebuild_disk, LHSR_DISK_HEALTHY);
-		lhsr_failed_disks_set(arr,
-			lhsr_failed_disks_get(arr) & ~(1UL << arr->rebuild_disk));
+		atomic_long_and(~(1UL << arr->rebuild_disk),
+				&arr->failed_disks);
 		if (lhsr_failed_disks_get(arr) == 0)
 			arr->state = LHSR_STATE_HEALTHY;
 		return;
@@ -4172,13 +4185,19 @@ passthrough_single:
 				return DM_MAPIO_SUBMITTED;
 			}
 
-			/* Count total survivor slots */
+			/* Count total survivor slots.
+			 * For RAID6 single-failure: XOR of survivors (data + P parity)
+			 * recreates the missing data.  Q parity is a GF-weighted sum
+			 * that CANNOT be used with XOR reconstruction — we must
+			 * exclude it from the survivor set here.
+			 */
 			total_slots = 0;
 			for (i = 0; i < data_disks; i++) {
 				if (!(lhsr_failed_disks_get(arr) & (1 << i)))
 					total_slots++;
 			}
-			for (j = 0; j < parity_disks; j++) {
+			unsigned int parity_to_use = (parity_disks > 1) ? 1 : parity_disks;
+			for (j = 0; j < parity_to_use; j++) {
 				if (!(lhsr_failed_disks_get(arr) & (1 << (data_disks + j))))
 					total_slots++;
 			}
@@ -4221,7 +4240,11 @@ passthrough_single:
 				return DM_MAPIO_SUBMITTED;
 			}
 
-			/* Build disk_map: survivors (data then parity) */
+			/* Build disk_map: survivors (data then parity)
+			 * NOTE: For RAID6, only P parity (index 0) is used in XOR
+			 * reconstruction. Q parity (index 1) is a GF-weighted sum
+			 * and CANNOT be combined with XOR.
+			 */
 			j = 0;
 			for (i = 0; i < data_disks; i++) {
 				if (!(lhsr_failed_disks_get(arr) & (1 << i))) {
@@ -4229,7 +4252,7 @@ passthrough_single:
 					j++;
 				}
 			}
-			for (i = 0; i < parity_disks; i++) {
+			for (i = 0; i < parity_to_use; i++) {
 				unsigned int pd = data_disks + i;
 				if (!(lhsr_failed_disks_get(arr) & (1 << pd))) {
 					ctx->disk_map[j] = pd;

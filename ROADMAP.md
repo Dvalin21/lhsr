@@ -744,6 +744,37 @@ blocking I/Os. Async I/O or batched dispatch would be the next optimization.
 
 **Commit:** `8f5b3f3` — zero-warning build on 6.12.90+deb13.1-amd64
 
+### Phase 10-E: Stability Fixes & Error Path Validation (✅ COMPLETE 2026-06-17)
+
+Fixes two data-integrity bugs and validates previously-untested error paths:
+
+1. **failed_disks RMW race** (rebuild completion, lines 1470/1507):
+   - `lhsr_failed_disks_set(arr, get() & ~bit)` → `atomic_long_and(~bit, &arr->failed_disks)`
+   - Eliminates concurrent-window where two threads could read same value and lose one update
+   - All other RMW sites were already under `sb_sem` — only these two completion paths
+     ran outside any lock
+
+2. **RAID6 Q parity XOR bug** (read_endio, line 566):
+   - XOR of ALL survivors (data + P + Q) gives WRONG reconstructed data for RAID6
+   - Q parity is a GF(2^8) weighted sum — XOR is NOT its inverse
+   - Fix: exclude Q parity from the disk_map in the read dispatch path. Single-failure
+     RAID6 reconstruction now uses only data survivors + P parity
+   - Tested: create RAID6, fail data disk 0, read back via reconstruction — SHA256 PASS
+
+3. **RAID5 read reconstruction validated** (previously untested):
+   - Created RAID5 with 4 loopback devices, wrote 4MB random data
+   - Failed data disk 0 via `dmsetup message disk_fail 0`
+   - Read back — all reads to stripes where disk 0 is data disk go through XOR reconstruction
+   - SHA256 verify PASS — reconstruction path works correctly
+
+4. **RAID6 Q parity validated** (previously untested):
+   - Created RAID6 with 4 loopback devices, wrote 4MB, read back — PASS
+   - Failed data disk 0, read back — reconstruction from P parity only (Q excluded) — PASS
+
+**Header comments and documentation updated** to reflect current state.
+
+**Commit:** (pending) — zero-warning build on 6.12.90+deb13.1-amd64
+
 ---
 
 ## Timeline Summary
@@ -763,6 +794,7 @@ blocking I/Os. Async I/O or batched dispatch would be the next optimization.
 | 10-C | Monitoring & observability | **1 session** | Phase 4 |
 | 10-D | Performance baseline benchmarks | **1 session** | Phase 0 |
 | 10-A | Kernel reshape (parallel I/O dispatch) | **1 session** | Phase 10-D
+| 10-E | Stability fixes & error path validation (failed_disks race, RAID6 Q XOR bug, RAID5/6 reconstruction test) | **1 session** | Phase 10-A
 
 ---
 

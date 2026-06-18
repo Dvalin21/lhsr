@@ -311,7 +311,11 @@ utilities.
   disks.
 - Implement metadata reconstruction — rebuild superblock from remaining disks
   if one superblock is corrupt.
-- Test the read-side reconstruction path (currently untested).
+- ~~Test the read-side reconstruction path~~ ✅ Tested on VM (2026-06-17):
+  RAID5 single-data-disk failure: read reconstruction via XOR of survivors,
+  SHA256 verify PASS.  RAID6 single-data-disk failure: XOR from data+P parity
+  (Q parity correctly excluded from XOR — it's GF-weighted, not XOR-compatible),
+  SHA256 verify PASS.
 
 ---
 
@@ -434,6 +438,8 @@ firmware crash detection.
 | Ephemeral checksum cache | `dm-lhsr.c` - xarray | HIGH | Stack on dm-integrity (preferred) or bypass with integrity flag | ✅ **FIXED Phase 1** |
 | CRC32c seed mismatch in WIB write vs verify | `dm-lhsr.c` - lhsr_wib_load/write_page | HIGH | Use `__crc32c_le(0, ...)` consistently (was mixing `~0` and `0`) | ✅ **FIXED Phase 2** |
 | daemon uses fork+exec for dmsetup + smartctl | `userspace/daemon/lhsrd.c` | MEDIUM | Rewrote: libdevmapper (lhsr-dm.c) + sysfs/SG_IO (lhsr-smart.c). No more fork+exec. | ✅ **FIXED Phase 3** |
+| Rebuild completion RMW race on failed_disks (lines 1470/1507) | `dm-lhsr.c` - rebuild_work() | HIGH | Converted to `atomic_long_and()` — true atomic clear, no get-modify-set window | ✅ **FIXED 2026-06-17** |
+| RAID6 single-failure XOR included Q parity (GF-weighted) in reconstruction | `dm-lhsr.c` - read_endio | HIGH | Exclude Q parity from disk_map for RAID6 — only P parity used in XOR reconstruction | ✅ **FIXED 2026-06-17** |
 | No dm-integrity stacking | Architecture | MEDIUM | Anti-bit-rot requires persistent checksums | ✅ **FIXED Phase 1** |
 | Rebuild message says "copied" for skipped regions | `dm-lhsr.c` - rebuild_work() | LOW | Changed to "sectors processed" | ✅ **FIXED Phase 2** |
 
@@ -532,6 +538,27 @@ has scheduling overhead.
 - Crash recovery with stale WIB (conservative = more copy work, always safe)
 - Fault injection: memory allocation failure in `lhsr_wib_init` (fallback to
   full-disk rebuild)
+
+---
+
+## Phase 10-E Testing (RAID5/6 Stability Fixes & Reconstruction Validation) — 2026-06-17
+
+Tested on VM (6.12.90+deb13.1-amd64) with loopback devices.
+
+| Scenario | Result | Notes |
+|----------|--------|-------|
+| **RAID5 read reconstruction** (4×100MB, fail disk 0) | ✅ PASS | Write 4MB random data, fail disk 0 via `disk_fail` message, read back — SHA256 match (reconstruction via XOR of survivors) |
+| **RAID6 smoke test** (4×100MB) | ✅ PASS | RAID6 create, write 4MB, read back SHA256 verify |
+| **RAID6 read reconstruction** (4×100MB, fail disk 0) | ✅ PASS | Fix verified: Q parity correctly excluded from XOR. `num_slots=2` (data+P only, no Q). SHA256 match. |
+| **failed_disks atomic_long_and** | ✅ PASS | No regressions. Module loads clean, rebuild completion paths use true atomic clear. |
+
+**Fixes applied and verified:**
+1. Rebuild completion `failed_disks` clear: `lhsr_failed_disks_set(arr, get() & ~bit)` → `atomic_long_and(~bit, &arr->failed_disks)` — eliminates RMW race at both completion sites (lines 1470, 1507).
+2. RAID6 read reconstruction: Q parity disk excluded from the disk_map — RAID6 single-failure reconstruction uses only data survivors + P parity. Q parity is a GF-weighted sum and XORing it with P gives wrong data.
+
+**Remaining:**
+- RAID6 double-failure RS decode still not implemented (returns IOERR with TODO)
+- RAID6 Q parity NOT rebuilt in bitmap_recover path (deferred — Q only needed for double-failure RS decode, which is also TODO)
 
 ---
 
