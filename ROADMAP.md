@@ -773,7 +773,7 @@ Fixes two data-integrity bugs and validates previously-untested error paths:
 
 **Header comments and documentation updated** to reflect current state.
 
-**Commit:** (pending) — zero-warning build on 6.12.90+deb13.1-amd64
+**Commit:** `472e8ff` — zero-warning build on 6.12.90+deb13.1-amd64
 
 ---
 
