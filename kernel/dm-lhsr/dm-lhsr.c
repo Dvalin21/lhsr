@@ -32,16 +32,13 @@
  *     decode (2 failed data disks reconstructed from P + Q + surviving data)
  *
  * NOT YET PRODUCTION-READY (needs work):
- *   - RAID6 bitmap recovery — reconstructs P parity only, Q parity is NOT
- *     reconstructed (deferred: Q is only needed for double-failure RS(255,N)
- *     decode, which IS now implemented but bitmap_recover doesn't repair Q)
+ *   - RAID6 bitmap recovery — reconstructs both P AND Q parity (GF weighted-sum)
  *   - RAID5 double-failure — not recoverable (RAID5 has only 1 parity disk)
  *   - RAID6 data+P failure — reconstructs via single-equation from Q (tested PASS)
  *   - RAID6 data+Q failure — handled by existing XOR path (Q excluded from XOR,
  *     data+P XOR produces correct data even with Q dead) — implicit, not tested
  *   - RAID6 P+Q failure (both parity dead) — unrecoverable (no parity available)
  *   - Concurrent stress — only single-threaded testing so far
- *   - Q parity rebuild in bitmap_recover path (deferred)
  *
  * MIXED DISK SIZES:
  *   Array capacity = min(disk_sectors) for mirror, or data_disks × min(disk_sectors)
@@ -2920,6 +2917,9 @@ static int lhsr_bitmap_set(struct lhsr_array *arr, sector_t chunk_start)
 
 	set_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[page_idx]);
 
+	DMINFO("bitmap: SET region=%llu page=%u bit=%u chunk_start=%llu",
+		(u64)region, page_idx, bit_idx, (u64)chunk_start);
+
 	return lhsr_bitmap_write_page(arr, page_idx);
 }
 
@@ -3094,15 +3094,21 @@ static int lhsr_bitmap_load(struct lhsr_array *arr)
 			__free_page(tmp_page);
 		}
 
-		if (any_valid) {
-			arr->bitmap_seqs[p] = best_seq;
-			DMDEBUG("bitmap: page %u loaded from disk %u (seq %llu)",
-				p, best_disk, (u64)best_seq);
-		} else {
-			DMDEBUG("bitmap: page %u uninitialized (no valid copy)", p);
-			memset(dst, 0, 4096);
-			arr->bitmap_seqs[p] = 0;
-		}
+			if (any_valid) {
+				unsigned int set_bits = 0, bb;
+
+				arr->bitmap_seqs[p] = best_seq;
+				for (bb = 0; bb < LHSR_BITMAP_BITS_PER_PAGE; bb++) {
+					if (dst->bits[bb / 8] & (1 << (bb % 8)))
+						set_bits++;
+				}
+				DMINFO("bitmap: page %u loaded from disk %u (seq %llu, %u bits set)",
+					p, best_disk, (u64)best_seq, set_bits);
+			} else {
+				DMINFO("bitmap: page %u uninitialized (no valid copy)", p);
+				memset(dst, 0, 4096);
+				arr->bitmap_seqs[p] = 0;
+			}
 
 		kunmap_local(dst);
 	}
@@ -3135,8 +3141,8 @@ static int lhsr_bitmap_recover(struct lhsr_array *arr)
 	       data_disks, parity_disks, (u64)arr->disk_sectors);
 
 	for (p = 0; p < LHSR_BITMAP_PAGES; p++) {
-		struct page *parity_page = NULL, *temp_page = NULL;
-		void *parity_buf, *temp_buf;
+		struct page *parity_page = NULL, *temp_page = NULL, *q_page = NULL;
+		void *parity_buf, *temp_buf, *q_buf = NULL;
 		size_t chunk_bytes = arr->chunk_sectors * 512;
 		int ret;
 
@@ -3149,8 +3155,16 @@ static int lhsr_bitmap_recover(struct lhsr_array *arr)
 			goto out;
 		}
 
+		if (arr->raid_type == LHSR_RAID6) {
+			q_page = alloc_page(GFP_KERNEL);
+			if (!q_page)
+				DMWARN("bitmap: Q page OOM, skipping Q parity rebuild");
+		}
+
 		parity_buf = kmap_local_page(parity_page);
 		temp_buf   = kmap_local_page(temp_page);
+		if (q_page)
+			q_buf = kmap_local_page(q_page);
 
 		/*
 		 * Process dirty regions one at a time.
@@ -3202,6 +3216,8 @@ static int lhsr_bitmap_recover(struct lhsr_array *arr)
 					sector_t s = stripe * arr->chunk_sectors;
 
 					memset(parity_buf, 0, chunk_bytes);
+					if (q_buf)
+						memset(q_buf, 0, chunk_bytes);
 
 					/* XOR all readable data disks */
 					for (d = 0; d < data_disks; d++) {
@@ -3222,13 +3238,22 @@ static int lhsr_bitmap_recover(struct lhsr_array *arr)
 							continue;
 						}
 
-						/* XOR temp into parity */
+						/* XOR temp into parity, GF multiply into Q */
 						{
 							size_t i;
 							u8 *p8 = parity_buf;
 							u8 *t8 = temp_buf;
-							for (i = 0; i < chunk_bytes; i++)
-								p8[i] ^= t8[i];
+							if (q_buf && arr->raid_type == LHSR_RAID6) {
+								u8 coeff = rs_power_table[d];
+								u8 *q8 = q_buf;
+								for (i = 0; i < chunk_bytes; i++) {
+									p8[i] ^= t8[i];
+									q8[i] ^= lhsr_gf_mul(t8[i], coeff);
+								}
+							} else {
+								for (i = 0; i < chunk_bytes; i++)
+									p8[i] ^= t8[i];
+							}
 						}
 					}
 
@@ -3245,6 +3270,23 @@ static int lhsr_bitmap_recover(struct lhsr_array *arr)
 							      pd, (u64)(s + arr->disk_offset[pd]));
 					}
 
+					/* Write Q parity with FUA (RAID6) */
+					if (q_buf && q_page &&
+					    arr->raid_type == LHSR_RAID6) {
+						unsigned int qd = data_disks + 1;
+						if (!(lhsr_failed_disks_get(arr) & (1 << qd)) &&
+						    arr->disk[qd]) {
+							blk_status_t st;
+							st = lhsr_submit_bio_sync(arr->disk[qd],
+								q_page, chunk_bytes,
+								s + arr->disk_offset[qd],
+								REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
+							if (st != BLK_STS_OK)
+								DMERR("bitmap: recover write Q disk %u sector %llu failed",
+								      qd, (u64)(s + arr->disk_offset[qd]));
+						}
+					}
+
 					sectors_recovered += arr->chunk_sectors;
 				}
 			}
@@ -3258,10 +3300,14 @@ static int lhsr_bitmap_recover(struct lhsr_array *arr)
 				DMERR("bitmap: write page %u after recovery failed", p);
 		}
 
+		if (q_buf)
+			kunmap_local(q_buf);
 		kunmap_local(temp_buf);
 		kunmap_local(parity_buf);
 		__free_page(temp_page);
 		__free_page(parity_page);
+		if (q_page)
+			__free_page(q_page);
 	}
 
 out:
@@ -4274,9 +4320,9 @@ passthrough_single:
 			struct lhsr_rmw_work *rmw;
 			size_t chunk_bytes = (size_t)chunk_sects << SECTOR_SHIFT;
 
-			DMDEBUG("RAID5/6 write: offset=%llu data_disk=%u chunk_start=%llu bio_bytes=%u chunk_bytes=%zu",
+			DMINFO("RAID5/6 write: offset=%llu data_disk=%u chunk_start=%llu bio_bytes=%u",
 				(u64)offset, data_disk, (u64)chunk_start,
-				bio->bi_iter.bi_size, chunk_bytes);
+				bio->bi_iter.bi_size);
 
 			/* Fail if target data disk is failed or missing */
 			if (lhsr_failed_disks_get(arr) & (1 << data_disk) || !arr->disk[data_disk]) {
