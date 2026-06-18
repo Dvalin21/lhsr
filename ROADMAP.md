@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-17 (Phase 11 ✅ — RS decode complete)
+**Last Updated:** 2026-06-18 (Phase 12 ✅ — bitmap Q parity rebuild)
 
 ---
 
@@ -807,10 +807,43 @@ and data+P failure recovery, closing the last correctness gap in the read path.
      data+P XOR produces correct data even with Q dead)
 
 ### Remaining gaps
-   - Q parity rebuild in `bitmap_recover` path
    - Concurrent stress testing beyond single-threaded
 
 **Commit:** `34b966b` — zero-warning build on 6.12.90+deb13.1-amd64
+
+---
+
+## Phase 12: RAID6 Bitmap Q Parity Reconstruction ✅ COMPLETE (2026-06-18)
+
+**Duration:** 1 session
+
+Implements Q parity reconstruction in the bitmap-driven recovery path, closing the
+last parity-correction gap. Previously only P parity was rebuilt; dirty regions would
+leave stale Q parity on RAID6.
+
+### What changed
+
+1. **`lhsr_bitmap_recover()`** — GF(2^8) weighted-sum Q reconstruction:
+   - Q page allocated per bitmap page, freed on loop exit or OOM
+   - For each dirty region, Q buffer zeroed then accumulated with `lhsr_gf_mul(t8[i], coeff)`
+   - Reconstructed Q written with `REQ_SYNC | REQ_FUA` to Q disk
+   - Falls back silently to P-only if Q page allocation fails (OOM)
+
+2. **Bitmap logging upgraded** — key messages promoted from DMDEBUG to DMINFO:
+   - SET/CLEAR/load messages always visible (was DEBUG-only)
+   - Load message includes set-bits count for observability
+
+3. **Crash-power-fail bitmap persistence confirmed** (root-cause analysis):
+   - Traced sector calculation: write and read use identical `disk_offset + disk_sectors + page_idx * 8`
+   - SET/clear/write cycle verified with sector-level debug: page 0 written at correct sector
+   - Re-create loads page with correct seq and 0 bits set
+   - Original report of "all pages uninitialized on re-create" could NOT be reproduced
+     — most likely caused by backing file re-initialization between test script runs
+
+### Remaining gaps
+   - Concurrent stress testing beyond single-threaded
+
+**Commit:** `bdd43bc` — zero-warning build on 6.12.90+deb13.1-amd64
 
 ---
 
@@ -833,6 +866,7 @@ and data+P failure recovery, closing the last correctness gap in the read path.
 | 10-A | Kernel reshape (parallel I/O dispatch) | **1 session** | Phase 10-D
 | 10-E | Stability fixes & error path validation (failed_disks race, RAID6 Q XOR bug, RAID5/6 reconstruction test) | **1 session** | Phase 10-A
 | 11 | RAID6 RS(255,N) double-failure decode (Vandermonde 2x2 + data+P recovery) | **1 session** | Phase 10-E
+| 12 | RAID6 bitmap Q parity reconstruction (bitmap_recover GF weighted-sum) | **1 session** | Phase 11
 
 ---
 

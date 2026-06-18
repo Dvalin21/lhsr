@@ -30,11 +30,13 @@
  *     single-disk-failure reconstruction
  *   - RAID6 double-data-disk failure reconstruction via RS(255,N) Vandermonde
  *     decode (2 failed data disks reconstructed from P + Q + surviving data)
+ *   - RAID6 data+P failure — reconstructs data from Q parity via single-equation
+ *     RS decode (tested PASS)
+ *   - RAID6 bitmap recovery — reconstructs both P AND Q parity (GF weighted-sum
+ *     for Q, XOR for P) with FUA writes
  *
  * NOT YET PRODUCTION-READY (needs work):
- *   - RAID6 bitmap recovery — reconstructs both P AND Q parity (GF weighted-sum)
  *   - RAID5 double-failure — not recoverable (RAID5 has only 1 parity disk)
- *   - RAID6 data+P failure — reconstructs via single-equation from Q (tested PASS)
  *   - RAID6 data+Q failure — handled by existing XOR path (Q excluded from XOR,
  *     data+P XOR produces correct data even with Q dead) — implicit, not tested
  *   - RAID6 P+Q failure (both parity dead) — unrecoverable (no parity available)
