@@ -801,9 +801,10 @@ and data+P failure recovery, closing the last correctness gap in the read path.
    - `test-raid6-data-plus-p.sh` — fail data disk 0 + P disk, read back, SHA256 ✓
 
 ### Still returning IOERR (documented in PRODUCTION READINESS):
-   - RAID6 data+Q failure (P alive, Q dead) — different math needed
    - RAID6 P+Q failure (both parity dead) — unrecoverable
    - RAID5 double-failure — not recoverable (single parity)
+   - (data+Q failure already works via existing XOR path — Q is excluded from XOR,
+     data+P XOR produces correct data even with Q dead)
 
 ### Remaining gaps
    - Q parity rebuild in `bitmap_recover` path
