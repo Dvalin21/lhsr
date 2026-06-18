@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-17 (Phase 10: C+D+A ✅ — all complete)
+**Last Updated:** 2026-06-17 (Phase 11 ✅ — RS decode complete)
 
 ---
 
@@ -777,6 +777,42 @@ Fixes two data-integrity bugs and validates previously-untested error paths:
 
 ---
 
+## Phase 11: RAID6 RS(255,N) Double-Failure Decode ✅ COMPLETE (2026-06-17)
+
+**Duration:** 1 session
+
+Implements Reed-Solomon decode for RAID6 data-disk double-failure reconstruction
+and data+P failure recovery, closing the last correctness gap in the read path.
+
+### What changed
+
+1. **`lhsr_rs_decode_2()`** — RS(255,N) Vandermonde 2×2 decode:
+   - Two data disks fail, P+Q alive → solves `[1 1; g^t g^o] * [D_t; D_o] = [S; T]`
+   - Single data disk + P fail, Q alive → `D_t = inv(g^t) * T`
+   - GF(2^8) inverse via log-table lookup (O(1), `gf_log[256]` + power table wrap)
+
+2. **Read dispatch path** — `parity_to_use = parity_disks` (always read both P and Q):
+   - Q is now included in `disk_map` for RAID6 reads
+   - XOR path builds temp pointer array excluding Q (GF-incompatible with XOR)
+   - RS decode handles Q directly from the survivor slots
+
+3. **New tests:**
+   - `test-raid6-double-failure.sh` — fail data disks 0+1, read back, SHA256 ✓
+   - `test-raid6-data-plus-p.sh` — fail data disk 0 + P disk, read back, SHA256 ✓
+
+### Still returning IOERR (documented in PRODUCTION READINESS):
+   - RAID6 data+Q failure (P alive, Q dead) — different math needed
+   - RAID6 P+Q failure (both parity dead) — unrecoverable
+   - RAID5 double-failure — not recoverable (single parity)
+
+### Remaining gaps
+   - Q parity rebuild in `bitmap_recover` path
+   - Concurrent stress testing beyond single-threaded
+
+**Commit:** `34b966b` — zero-warning build on 6.12.90+deb13.1-amd64
+
+---
+
 ## Timeline Summary
 
 | Phase | What | Duration | Depends On |
@@ -795,6 +831,7 @@ Fixes two data-integrity bugs and validates previously-untested error paths:
 | 10-D | Performance baseline benchmarks | **1 session** | Phase 0 |
 | 10-A | Kernel reshape (parallel I/O dispatch) | **1 session** | Phase 10-D
 | 10-E | Stability fixes & error path validation (failed_disks race, RAID6 Q XOR bug, RAID5/6 reconstruction test) | **1 session** | Phase 10-A
+| 11 | RAID6 RS(255,N) double-failure decode (Vandermonde 2x2 + data+P recovery) | **1 session** | Phase 10-E
 
 ---
 

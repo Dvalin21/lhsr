@@ -36,8 +36,9 @@
  *     reconstructed (deferred: Q is only needed for double-failure RS(255,N)
  *     decode, which IS now implemented but bitmap_recover doesn't repair Q)
  *   - RAID5 double-failure — not recoverable (RAID5 has only 1 parity disk)
- *   - RAID5/6 data+P failure, data+Q failure, P+Q failure — RS decode for
- *     parity-involved failures is not implemented (returns IOERR)
+ *   - RAID6 data+P failure — reconstructs via single-equation from Q (tested PASS)
+ *   - RAID6 data+Q failure (P alive, Q dead) — NOT implemented (returns IOERR)
+ *   - RAID6 P+Q failure (both parity dead) — unrecoverable (no parity available)
  *   - Concurrent stress — only single-threaded testing so far
  *   - Q parity rebuild in bitmap_recover path (deferred)
  *
