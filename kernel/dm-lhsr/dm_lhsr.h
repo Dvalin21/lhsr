@@ -88,10 +88,12 @@ struct lhsr_array {
 	struct delayed_work scrub_work;
 	u32 scrub_state;
 	u32 scrub_disk;
+	u32 scrub_disks_done;
 	u64 scrub_offset;
 	u64 scrub_blocks;
 	u64 scrub_verified;
 	u64 scrub_corrupted;
+	u64 scrub_retry_resolved;
 	u64 scrub_last_offset;
 	unsigned long scrub_start_jiffies;
 

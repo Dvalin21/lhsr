@@ -468,6 +468,12 @@ static void lhsr_init_superblock(struct lhsr_superblock *sb, u64 array_uuid,
 #define cksum_unpack_cksum(val)		((u32)(val))
 #define cksum_unpack_flags(val)		((u32)((val) >> 32))
 
+/* Key the checksum cache by (disk_idx << 56) | offset so each disk
+ * has its own checksum namespace. 56 bits gives 2^56 sectors = 128 PB
+ * per disk — enough for any practical deployment.
+ */
+#define CKSUM_KEY(disk, off)		((u64)(disk) << 56 | (u64)(off))
+
 /* RAID5/6 READ reconstruction completion */
 static void lhsr_raid_5_read_endio(struct bio *bio)
 {
@@ -1071,6 +1077,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	unsigned int nr_pages;
 	int ret = 0;
 	int i;
+	bool retried = false;
 
 	if (lhsr_failed_disks_get(arr) & (1 << disk_idx))
 		return -EINVAL;
@@ -1138,13 +1145,14 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	 * ephemeral xarray cache.
 	 */
 
-	/* Look up stored checksum for this offset in xarray */
-	xa_val = xa_load(&arr->cksum_cache, offset);
+	/* Look up stored checksum for this (disk, offset) in xarray */
+	xa_val = xa_load(&arr->cksum_cache, CKSUM_KEY(disk_idx, offset));
 	if (xa_val) {
 		stored_csum = cksum_unpack_cksum(xa_to_value(xa_val));
 		stored_flags = cksum_unpack_flags(xa_to_value(xa_val));
 	}
 
+retry:
 	nr_pages = (LHSR_SCRUB_BLOCK_SIZE + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
 	/* Allocate pages for I/O — proper struct page backing */
@@ -1223,7 +1231,7 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 	if (stored_csum == 0) {
 		/* No stored checksum — new block, store it */
 		xa_val = xa_mk_value(cksum_pack(calc_csum, LHSR_BLOCK_VERIFIED));
-		ret = xa_err(xa_store(&arr->cksum_cache, offset, xa_val, GFP_KERNEL));
+		ret = xa_err(xa_store(&arr->cksum_cache, CKSUM_KEY(disk_idx, offset), xa_val, GFP_KERNEL));
 		if (ret)
 			DMWARN("Scrub: Failed to store checksum for offset 0x%llx: %d",
 			       offset, ret);
@@ -1235,20 +1243,46 @@ static int lhsr_scrub_block(struct lhsr_array *arr, unsigned int disk_idx, u64 o
 
 	/* Verify checksum */
 	if (calc_csum != stored_csum) {
-		DMERR("Scrub: Checksum mismatch at offset 0x%llx (stored=0x%08x, calc=0x%08x)",
+		if (!retried) {
+			/*
+			 * First CRC mismatch — could be a transient race with a
+			 * concurrent write. Retry the read to rule it out before
+			 * declaring corruption.
+			 */
+			retried = true;
+			kfree(buf);
+			DMINFO("Scrub: Retrying read at offset 0x%llx (stored=0x%08x, calc=0x%08x)",
+			       offset, stored_csum, calc_csum);
+			goto retry;
+		}
+
+		/*
+		 * Still mismatched after retry — genuine data corruption.
+		 * Mark the block CORRUPT and return error.
+		 */
+		DMERR("Scrub: VERIFIED corruption at offset 0x%llx (stored=0x%08x, calc=0x%08x)",
 		       offset, stored_csum, calc_csum);
 		xa_val = xa_mk_value(cksum_pack(stored_csum,
 				       stored_flags | LHSR_BLOCK_CORRUPT));
-		xa_store(&arr->cksum_cache, offset, xa_val, GFP_KERNEL);
+		xa_store(&arr->cksum_cache, CKSUM_KEY(disk_idx, offset),
+			 xa_val, GFP_KERNEL);
 		atomic_inc(&arr->corruptions_detected);
 		kfree(buf);
 		return -EIO;
 	}
 
-	/* Checksum verified successfully — update flags */
+	/*
+	 * Checksum verified. If this was a retry that resolved the mismatch,
+	 * count it as a transient resolved by retry.
+	 */
+	if (retried)
+		arr->scrub_retry_resolved++;
+
+	/* Update flags to VERIFIED */
 	xa_val = xa_mk_value(cksum_pack(stored_csum,
 			       stored_flags | LHSR_BLOCK_VERIFIED));
-	xa_store(&arr->cksum_cache, offset, xa_val, GFP_KERNEL);
+	xa_store(&arr->cksum_cache, CKSUM_KEY(disk_idx, offset),
+		 xa_val, GFP_KERNEL);
 	kfree(buf);
 	return 0;
 }
@@ -1273,18 +1307,23 @@ static void scrub_work(struct work_struct *work)
 
 	/* Check if we're done with current disk */
 	if (arr->scrub_offset >= arr->disk_sectors) {
-		/* Move to next disk */
-		disk_idx = (arr->scrub_disk + 1) % arr->disks;
-		while (disk_idx != arr->scrub_disk && (lhsr_failed_disks_get(arr) & (1 << disk_idx)))
-			disk_idx = (disk_idx + 1) % arr->disks;
+		/* Count this disk as completed */
+		arr->scrub_disks_done++;
 
-		if (disk_idx == arr->scrub_disk) {
+		/* If all disks are done, we're finished */
+		if (arr->scrub_disks_done >= arr->disks) {
 			/* All disks done */
-			DMINFO("Scrub completed: %llu blocks verified, %llu corruptions detected",
-			       arr->scrub_verified, arr->scrub_corrupted);
+			DMINFO("Scrub completed: %llu verified, %llu corrupt, %llu transient-retry",
+			       arr->scrub_verified, arr->scrub_corrupted,
+			       arr->scrub_retry_resolved);
 			arr->scrub_state = LHSR_SCRUB_COMPLETED;
 			return;
 		}
+
+		/* Advance to next healthy disk */
+		disk_idx = (arr->scrub_disk + 1) % arr->disks;
+		while (lhsr_failed_disks_get(arr) & (1 << disk_idx))
+			disk_idx = (disk_idx + 1) % arr->disks;
 
 		arr->scrub_disk = disk_idx;
 		arr->scrub_offset = 0;
@@ -1300,6 +1339,7 @@ static void scrub_work(struct work_struct *work)
 		arr->scrub_last_offset = arr->scrub_offset;
 	} else {
 		DMERR("Scrub failed at disk %u offset 0x%llx: %d", disk_idx, arr->scrub_offset, ret);
+		arr->scrub_corrupted++;
 	}
 
 	arr->scrub_offset += block_size;
@@ -1322,6 +1362,7 @@ static int lhsr_scrub_start(struct lhsr_array *arr)
 
 	arr->scrub_state = LHSR_SCRUB_RUNNING;
 	arr->scrub_disk = 0;
+	arr->scrub_disks_done = 0;
 	arr->scrub_offset = 0;
 	arr->scrub_verified = 0;
 	arr->scrub_corrupted = 0;
@@ -2408,9 +2449,12 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	/* Initialize scrubber state */
 	arr->scrub_state = LHSR_SCRUB_IDLE;
 	arr->scrub_wq = NULL;
+	arr->scrub_disk = 0;
+	arr->scrub_disks_done = 0;
 	arr->scrub_offset = 0;
 	arr->scrub_verified = 0;
 	arr->scrub_corrupted = 0;
+	arr->scrub_retry_resolved = 0;
 	xa_init(&arr->cksum_cache);  /* Initialize checksum cache (xarray) */
 	atomic_set(&arr->corruptions_detected, 0);
 	atomic_set(&arr->repairs, 0);
