@@ -158,6 +158,8 @@ struct lhsr_array {
 	u64 *wib_seqs;					/* Per-page sequence numbers */
 	unsigned int wib_npages;			/* Number of allocated pages */
 	unsigned int wib_nbits;				/* Total number of valid bits */
+	struct workqueue_struct *wib_wq;		/* WIB periodic flush workqueue */
+	struct delayed_work wib_work;			/* WIB periodic flush work */
 };
 
 /* Accessor helpers for failed_disks bitmask (concurrent hot-path field) */

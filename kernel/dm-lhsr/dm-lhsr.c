@@ -109,7 +109,8 @@ static int lhsr_bitmap_clear(struct lhsr_array *arr, sector_t chunk_start);
 static int lhsr_wib_init(struct lhsr_array *arr);
 static void lhsr_wib_destroy(struct lhsr_array *arr);
 static int lhsr_wib_load(struct lhsr_array *arr);
-static int __maybe_unused lhsr_wib_flush(struct lhsr_array *arr);
+static int lhsr_wib_flush(struct lhsr_array *arr);
+static void lhsr_wib_work(struct work_struct *work);
 static void lhsr_wib_set(struct lhsr_array *arr, sector_t sector);
 static void lhsr_wib_clear(struct lhsr_array *arr, sector_t sector);
 static int lhsr_wib_test(struct lhsr_array *arr, sector_t sector);
@@ -2466,6 +2467,7 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	arr->rebuild_total = 0;
 	arr->rebuild_verified = 0;
 	arr->rebuild_wq = NULL;
+	arr->wib_wq = NULL;
 
 	/* Create workqueue for RAID5/6 RMW writes — up to 8 concurrent workers.
 	 * Per-stripe mutexes prevent concurrent writes to the SAME stripe.
@@ -2512,6 +2514,20 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		ti->error = "Failed to initialize WIB";
 		goto bad;
 	}
+
+	/* Create workqueue for periodic WIB flush (30s interval) */
+	arr->wib_wq = alloc_workqueue("lhsr_wib_%s", WQ_MEM_RECLAIM | WQ_UNBOUND, 1,
+				      arr->disk[0] && arr->disk[0]->bd_disk ?
+				      arr->disk[0]->bd_disk->disk_name : "unknown");
+	if (!arr->wib_wq) {
+		DMERR("ctr: Failed to create WIB workqueue");
+		ti->error = "Failed to create WIB workqueue";
+		r = -ENOMEM;
+		goto bad;
+	}
+	INIT_DELAYED_WORK(&arr->wib_work, lhsr_wib_work);
+	queue_delayed_work(arr->wib_wq, &arr->wib_work, 30 * HZ);
+	DMINFO("ctr: WIB periodic flush workqueue created (30s interval)");
 
 	ti->private = arr;
 	ti->len = size;
@@ -2671,6 +2687,19 @@ static void lhsr_dtr(struct dm_target *ti)
 		destroy_workqueue(arr->rebuild_wq);
 		arr->rebuild_wq = NULL;
 		DMINFO("dtr: Rebuild stopped");
+	}
+
+	/* Stop periodic WIB flush before flushing dirty pages */
+	DMINFO("dtr: Stopping WIB workqueue (wib_wq=%p)", arr->wib_wq);
+	if (arr->wib_wq) {
+		DMINFO("dtr: Canceling WIB work...");
+		if (!cancel_delayed_work_sync(&arr->wib_work)) {
+			DMWARN("dtr: wib_work did not complete in time, forcing");
+			flush_workqueue(arr->wib_wq);
+		}
+		destroy_workqueue(arr->wib_wq);
+		arr->wib_wq = NULL;
+		DMINFO("dtr: WIB workqueue destroyed");
 	}
 
 	/* Flush and free write-intent bitmap (WIB) */
@@ -3599,7 +3628,7 @@ static void lhsr_wib_clear_all(struct lhsr_array *arr)
  * Flush all dirty WIB pages to disk.
  * Returns 0 if all writes succeeded, -EIO on any failure.
  * --------------------------------------------------------------- */
-static int __maybe_unused lhsr_wib_flush(struct lhsr_array *arr)
+static int lhsr_wib_flush(struct lhsr_array *arr)
 {
 	unsigned int p;
 	int ret = 0;
@@ -3615,6 +3644,32 @@ static int __maybe_unused lhsr_wib_flush(struct lhsr_array *arr)
 		}
 	}
 	return ret;
+}
+
+/* ---------------------------------------------------------------
+ * Periodic WIB flush — writes dirty WIB pages to disk every 30s.
+ * Keeps the write-intent bitmap reasonably current so that after a
+ * crash, rebuild copies fewer regions.  Conservative: stale WIB
+ * after crash means more copy work, never data loss.
+ * --------------------------------------------------------------- */
+static void lhsr_wib_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct lhsr_array *arr = container_of(dwork, struct lhsr_array, wib_work);
+
+	/* Bail if array is being destroyed */
+	if (atomic_read(&arr->destroying)) {
+		DMDEBUG("wib_work: array being destroyed, skipping");
+		return;
+	}
+
+	DMINFO("wib_work: starting periodic WIB flush");
+	lhsr_wib_flush(arr);
+	DMINFO("wib_work: periodic WIB flush complete");
+
+	/* Re-schedule if workqueue still exists */
+	if (arr->wib_wq)
+		queue_delayed_work(arr->wib_wq, &arr->wib_work, 30 * HZ);
 }
 
 /* ---------------------------------------------------------------
