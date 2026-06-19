@@ -2780,6 +2780,74 @@ static void lhsr_xor_parity(void *parity, void **data, unsigned int data_disks, 
  *   8. Complete orig_bio
  */
 
+/* Parallel I/O completion context — multiple bios share one completion */
+struct lhsr_parallel_io {
+	struct completion done;
+	atomic_t pending;
+	blk_status_t status;
+};
+
+/* Completion callback for parallel I/O: last one to finish wakes the waiter */
+static void lhsr_parallel_endio(struct bio *bio)
+{
+	struct lhsr_parallel_io *pio = bio->bi_private;
+
+	if (bio->bi_status && pio->status == BLK_STS_OK)
+		pio->status = bio->bi_status;
+	if (atomic_dec_and_test(&pio->pending))
+		complete(&pio->done);
+	bio_put(bio);
+}
+
+/* Submit one page-aligned I/O as part of a parallel batch.
+ * If the target disk is failed or missing:
+ *   - For reads: zero the page and skip (no I/O submitted)
+ *   - For writes: skip entirely (parity write to failed disk is meaningless)
+ * Returns 0 on success (or skip), -ENOMEM on bio allocation failure.
+ */
+static int lhsr_submit_parallel(struct lhsr_array *arr, unsigned int disk_idx,
+				struct page *page, size_t len,
+				sector_t sector, blk_opf_t opf,
+				struct lhsr_parallel_io *pio)
+{
+	struct bio *bio;
+	struct block_device *bdev;
+
+	if (!page)
+		return 0;
+	if (!arr->disk[disk_idx])
+		return 0;
+
+	/* Failed disk handling */
+	if (lhsr_failed_disks_get(arr) & (1 << disk_idx)) {
+		if (opf == REQ_OP_READ) {
+			/* Zero the page — reads from a failed disk return zeroes */
+			void *ptr = kmap_local_page(page);
+			memset(ptr, 0, len);
+			kunmap_local(ptr);
+		}
+		return 0;	/* Skipped — not an error */
+	}
+
+	bdev = arr->disk[disk_idx];
+	bio = bio_alloc_bioset(bdev, 1, opf, GFP_NOIO, &lhsr_bioset);
+	if (!bio)
+		return -ENOMEM;
+
+	bio->bi_iter.bi_sector = sector + arr->disk_offset[disk_idx];
+	bio->bi_private = pio;
+	bio->bi_end_io = lhsr_parallel_endio;
+
+	if (!bio_add_page(bio, page, len, 0)) {
+		bio_put(bio);
+		return -EIO;
+	}
+
+	atomic_inc(&pio->pending);
+	submit_bio(bio);
+	return 0;
+}
+
 /* Synchronous bio completion callback */
 struct lhsr_bio_done {
 	struct completion done;
@@ -3935,53 +4003,42 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	mutex_lock(&arr->stripe_locks[lock_idx]);
 	locked = true;
 
-	/* Phase 1: Read old data chunk from data disk */
-	status = lhsr_submit_bio_sync(arr->disk[data_disk], old_data_page,
-				       chunk_bytes,
-				       chunk_start + arr->disk_offset[data_disk],
-				       REQ_OP_READ);
-	if (status != BLK_STS_OK) {
-		DMERR("RMW worker: read old data disk %u failed", data_disk);
-		goto out;
-	}
+	/* Parallel read phase: submit all reads at once, wait once.
+	 * On real hardware (NVMe/SSD) this lets the device reorder and
+	 * coalesce the three I/Os.  On loopback+tmpfs it eliminates
+	 * scheduling gaps between sequential submissions.
+	 */
+	{
+		struct lhsr_parallel_io pio;
 
-	/* Phase 2: Read P parity (or zero if parity disk failed) */
-	if (!(lhsr_failed_disks_get(arr) & (1 << p_disk)) && arr->disk[p_disk]) {
-		status = lhsr_submit_bio_sync(arr->disk[p_disk], parity_page,
-					       chunk_bytes,
-					       chunk_start + arr->disk_offset[p_disk],
-					       REQ_OP_READ);
-		if (status != BLK_STS_OK) {
-			/*
-			 * If the parity disk is not marked failed but read fails,
-			 * something is seriously wrong — propagate error rather
-			 * than writing wrong parity.
-			 */
-			DMERR("RMW worker: read P parity disk %u failed", p_disk);
+		init_completion(&pio.done);
+		atomic_set(&pio.pending, 0);
+		pio.status = BLK_STS_OK;
+
+		/* Read old data (always needed) */
+		lhsr_submit_parallel(arr, data_disk, old_data_page,
+				     chunk_bytes, chunk_start,
+				     REQ_OP_READ, &pio);
+
+		/* Read P parity (lhsr_submit_parallel zeroes page if disk failed) */
+		lhsr_submit_parallel(arr, p_disk, parity_page,
+				     chunk_bytes, chunk_start,
+				     REQ_OP_READ, &pio);
+
+		/* Read Q parity for RAID6 (skipped/zeroed if Q disk failed) */
+		if (parity_disks > 1)
+			lhsr_submit_parallel(arr, q_disk, q_parity_page,
+					     chunk_bytes, chunk_start,
+					     REQ_OP_READ, &pio);
+
+		/* Wait for all submitted reads */
+		if (atomic_read(&pio.pending) > 0)
+			wait_for_completion_io(&pio.done);
+		if (pio.status != BLK_STS_OK) {
+			DMERR("RMW worker: parallel read phase failed "
+			      "(status=%d)", pio.status);
+			status = pio.status;
 			goto out;
-		}
-	} else {
-		/* Parity disk failed: assume zeroes */
-		void *p = kmap_local_page(parity_page);
-		memset(p, 0, chunk_bytes);
-		kunmap_local(p);
-	}
-
-	/* Phase 3: (RAID6) Read Q parity (or zero if Q disk failed) */
-	if (parity_disks > 1) {
-		if (!(lhsr_failed_disks_get(arr) & (1 << q_disk)) && arr->disk[q_disk]) {
-			status = lhsr_submit_bio_sync(arr->disk[q_disk], q_parity_page,
-						       chunk_bytes,
-						       chunk_start + arr->disk_offset[q_disk],
-						       REQ_OP_READ);
-			if (status != BLK_STS_OK) {
-				DMERR("RMW worker: read Q parity disk %u failed", q_disk);
-				goto out;
-			}
-		} else {
-			void *q = kmap_local_page(q_parity_page);
-			memset(q, 0, chunk_bytes);
-			kunmap_local(q);
 		}
 	}
 
@@ -4046,41 +4103,39 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	if (lhsr_bitmap_set(arr, chunk_start))
 		DMWARN("RMW: bitmap_set failed for chunk %llu", (u64)chunk_start);
 
-	/* Phase 5: Write new data to data disk */
-	status = lhsr_submit_bio_sync(arr->disk[data_disk], new_data_page,
-				       chunk_bytes,
-				       chunk_start + arr->disk_offset[data_disk],
-				       REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
-	if (status != BLK_STS_OK) {
-		DMERR("RMW worker: write data disk %u failed", data_disk);
-		goto out;
-	}
+	/* Parallel write phase: submit all writes at once, wait once.
+	 * REQ_FUA forces each write to stable storage.  Submitting all
+	 * three concurrently allows the block layer/device to pipeline
+	 * cache flushes instead of doing three sequential FUA waits.
+	 * The write-hole bitmap (set above) guarantees crash recovery
+	 * can reconstruct parity if any write fails mid-batch.
+	 */
+	{
+		struct lhsr_parallel_io pio;
 
-	/* Phase 6: Write new P parity */
-	if (!(lhsr_failed_disks_get(arr) & (1 << p_disk)) && arr->disk[p_disk]) {
-		status = lhsr_submit_bio_sync(arr->disk[p_disk], parity_page,
-					       chunk_bytes,
-					       chunk_start + arr->disk_offset[p_disk],
-					       REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
-		if (status != BLK_STS_OK) {
-			DMERR("RMW worker: write P parity disk %u failed", p_disk);
-			/* Data was already written but parity failed — data is at risk */
+		init_completion(&pio.done);
+		atomic_set(&pio.pending, 0);
+		pio.status = BLK_STS_OK;
+
+		lhsr_submit_parallel(arr, data_disk, new_data_page,
+				     chunk_bytes, chunk_start,
+				     REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio);
+		lhsr_submit_parallel(arr, p_disk, parity_page,
+				     chunk_bytes, chunk_start,
+				     REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio);
+		if (parity_disks > 1)
+			lhsr_submit_parallel(arr, q_disk, q_parity_page,
+					     chunk_bytes, chunk_start,
+					     REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio);
+
+		/* Wait for all submitted writes */
+		if (atomic_read(&pio.pending) > 0)
+			wait_for_completion_io(&pio.done);
+		if (pio.status != BLK_STS_OK) {
+			DMERR("RMW worker: parallel write phase failed "
+			      "(status=%d)", pio.status);
+			status = pio.status;
 			goto out;
-		}
-	}
-
-	/* Phase 7: (RAID6) Write new Q parity */
-	if (parity_disks > 1) {
-		if (!(lhsr_failed_disks_get(arr) & (1 << q_disk)) && arr->disk[q_disk]) {
-			status = lhsr_submit_bio_sync(arr->disk[q_disk], q_parity_page,
-						       chunk_bytes,
-						       chunk_start + arr->disk_offset[q_disk],
-						       REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
-			if (status != BLK_STS_OK) {
-				DMERR("RMW worker: write Q parity disk %u failed", q_disk);
-				/* Data + P written, Q failed — degraded but readable */
-				goto out;
-			}
 		}
 	}
 
