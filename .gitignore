@@ -19,6 +19,9 @@ userspace/daemon/lhsrd
 userspace/daemon/lhsrd.o
 userspace/recovery/lhsr-scan
 userspace/recovery/lhsr-scan.o
+
+# Test binaries
+tests/set_bitmap_bit
 lib/*.a
 lib/raid_engine/*.o
 
