@@ -2821,18 +2821,19 @@ static int lhsr_submit_parallel(struct lhsr_array *arr, unsigned int disk_idx,
 	/* Failed disk handling */
 	if (lhsr_failed_disks_get(arr) & (1 << disk_idx)) {
 		if (opf == REQ_OP_READ) {
-			/* Zero the page — reads from a failed disk return zeroes */
 			void *ptr = kmap_local_page(page);
 			memset(ptr, 0, len);
 			kunmap_local(ptr);
 		}
-		return 0;	/* Skipped — not an error */
+		return 0;
 	}
 
 	bdev = arr->disk[disk_idx];
 	bio = bio_alloc_bioset(bdev, 1, opf, GFP_NOIO, &lhsr_bioset);
-	if (!bio)
+	if (!bio) {
+		atomic_dec(&pio->pending);
 		return -ENOMEM;
+	}
 
 	bio->bi_iter.bi_sector = sector + arr->disk_offset[disk_idx];
 	bio->bi_private = pio;
@@ -2840,10 +2841,10 @@ static int lhsr_submit_parallel(struct lhsr_array *arr, unsigned int disk_idx,
 
 	if (!bio_add_page(bio, page, len, 0)) {
 		bio_put(bio);
+		atomic_dec(&pio->pending);
 		return -EIO;
 	}
 
-	atomic_inc(&pio->pending);
 	submit_bio(bio);
 	return 0;
 }
@@ -4003,19 +4004,29 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	mutex_lock(&arr->stripe_locks[lock_idx]);
 	locked = true;
 
-	/* Parallel read phase: submit all reads at once, wait once.
-	 * On real hardware (NVMe/SSD) this lets the device reorder and
-	 * coalesce the three I/Os.  On loopback+tmpfs it eliminates
-	 * scheduling gaps between sequential submissions.
+	/* Parallel read phase: count bios first, set pending, submit all, wait once.
+	 * Counting BEFORE submission prevents a race where a bio completes
+	 * synchronously (loopback/tmpfs) inside submit_bio(), which would fire
+	 * complete() before the other bios are even allocated.
 	 */
 	{
 		struct lhsr_parallel_io pio;
+		unsigned int failed = lhsr_failed_disks_get(arr);
+		int nr_reads = 1;  /* data disk read always needed */
 
 		init_completion(&pio.done);
-		atomic_set(&pio.pending, 0);
 		pio.status = BLK_STS_OK;
 
-		/* Read old data (always needed) */
+		/* Count P parity read (skipped if disk failed) */
+		if (!(failed & (1 << p_disk)))
+			nr_reads++;
+		/* Count Q parity read for RAID6 (skipped if disk failed) */
+		if (parity_disks > 1 && !(failed & (1 << q_disk)))
+			nr_reads++;
+
+		atomic_set(&pio.pending, nr_reads);
+
+		/* Read old data */
 		lhsr_submit_parallel(arr, data_disk, old_data_page,
 				     chunk_bytes, chunk_start,
 				     REQ_OP_READ, &pio);
@@ -4032,7 +4043,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 					     REQ_OP_READ, &pio);
 
 		/* Wait for all submitted reads */
-		if (atomic_read(&pio.pending) > 0)
+		if (nr_reads > 0)
 			wait_for_completion_io(&pio.done);
 		if (pio.status != BLK_STS_OK) {
 			DMERR("RMW worker: parallel read phase failed "
@@ -4109,13 +4120,26 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	 * cache flushes instead of doing three sequential FUA waits.
 	 * The write-hole bitmap (set above) guarantees crash recovery
 	 * can reconstruct parity if any write fails mid-batch.
+	 * Count bios first to prevent synchronous-completion race (see
+	 * read phase comment).
 	 */
 	{
 		struct lhsr_parallel_io pio;
+		unsigned int failed = lhsr_failed_disks_get(arr);
+		int nr_writes = 0;
 
 		init_completion(&pio.done);
-		atomic_set(&pio.pending, 0);
 		pio.status = BLK_STS_OK;
+
+		/* Count non-failed disks for write */
+		if (!(failed & (1 << data_disk)))
+			nr_writes++;
+		if (!(failed & (1 << p_disk)))
+			nr_writes++;
+		if (parity_disks > 1 && !(failed & (1 << q_disk)))
+			nr_writes++;
+
+		atomic_set(&pio.pending, nr_writes);
 
 		lhsr_submit_parallel(arr, data_disk, new_data_page,
 				     chunk_bytes, chunk_start,
@@ -4129,7 +4153,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 					     REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio);
 
 		/* Wait for all submitted writes */
-		if (atomic_read(&pio.pending) > 0)
+		if (nr_writes > 0)
 			wait_for_completion_io(&pio.done);
 		if (pio.status != BLK_STS_OK) {
 			DMERR("RMW worker: parallel write phase failed "
