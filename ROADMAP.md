@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-18 (Phase 12 ✅ — bitmap Q parity rebuild)
+**Last Updated:** 2026-06-19 (Phase 16 ✅ — SHR userspace mdadm purge)
 
 ---
 
@@ -10,8 +10,8 @@
    superblock structs can cause corruption. Fix that first.
 2. **Don't reimplement the kernel.** dm-integrity, mdadm bitmap, and device
    quirks already exist upstream. Use them.
-3. **Stack, don't replace.** LHSR should stack on top of mdadm and dm-integrity,
-   not reinvent their features.
+3. **Stack, don't replace.** LHSR stacks on dm-integrity for checksums,
+   not mdadm. SHR is a userspace tool, not kernel code.
 4. **Ship working code incrementally.** Each phase must produce a testable,
    deployable improvement. No speculative architecture.
 
@@ -470,11 +470,15 @@ Options:
 
 ## Phase 6: SHR Userspace
 
+> **2026-06-19 update:** mdadm support removed in Phase 16. All SHR tiers now
+> use LHSR dmsetup targets. This historical entry documents the original design
+> decisions that included mdadm as an option.
+
 **Status:** Scoping document complete — see `docs/plans/2026-06-13-shr-userspace-design.md`
 
 Synology Hybrid RAID support is a userspace feature that partitions disks of
-varying sizes into equal-sized chunks, creates RAID arrays per tier (mdadm or
-LHSR), and merges them with LVM. It does NOT belong in the kernel module.
+varying sizes into equal-sized chunks, creates RAID arrays per tier (LHSR
+dmsetup), and merges them with LVM. It does NOT belong in the kernel module.
 
 ### Approach
 1. Write a tool that takes N disks of varying sizes
@@ -621,44 +625,23 @@ lhsrctl shr disk replace <tier_name> <disk_idx> <new_dev>
 
 ---
 
-## Phase 9: Live Migration — `shr grow` (COMPLETE)
+## Phase 9: Live Migration — `shr grow` (REMOVED — replaced by Phase 16 purge)
 
-Implements online RAID growth for mdadm-mode SHR tiers via `mdadm --grow`,
-with LVM PV/LV resize and optional filesystem grow (ext4/xfs).
+**Status:** `shr grow` was originally implemented for mdadm-mode SHR tiers.
+With the mdadm purge (Phase 16), `shr grow` is now a stub that redirects
+users to `shr expand`. LHSR has no kernel reshape infrastructure — add
+capacity via new tiers, not by growing existing ones.
 
-### Scope (v1)
-- **mdadm-mode only** — grows an existing mdadm RAID array by adding disks
-- **Online reshape** — data remains mounted and accessible during migration
-- **LVM integration** — automatic PV resize → LV extend → ext4/xfs growfs
-- **LHSR-mode deferred** — requires kernel reshape infrastructure; redirects to `shr expand`
+### Why removed
+- mdadm is no longer a supported SHR backend
+- LHSR kernel module has no online reshape (would require multi-month
+  kernel engineering comparable to md's reshape infrastructure)
+- `shr expand` already provides the tier-addition workflow
 
-### Usage
+### Alternative
 ```
-lhsrctl shr grow [--mdadm|--lhsr] [--yes] [--no-growfs] <tier_name> <device>...
+lhsrctl shr expand <device>...   # add as new tier + lvextend
 ```
-
-### Algorithm
-1. Validate new device(s), check size >= existing members
-2. Discover existing tier via `scan_md_devices("shr_tier_")`
-3. Read mdadm geometry from sysfs (raid_disks, degraded, level, chunk)
-4. Execute `mdadm --grow --raid-devices=N+count --add <dev>...`
-5. Monitor reshape via sysfs `sync_action`/`sync_completed` (2s poll, 30m timeout)
-6. `pvresize <md_dev>` using numeric md%d path (not symlink)
-7. `lvextend -l +100%FREE <vg>/shr_vol`
-8. Auto-detect ext4 (resize2fs) or xfs (xfs_growfs) by mount point
-
-### Verified
-- Tested on VM with 4 loopback devices (3→4 disk RAID5 growth)
-- Data integrity verified via SHA256 before/after grow
-- LVM PV resize, LV extend, and ext4 growfs all sequence correctly
-- Array remains mounted and accessible during reshape
-
-### Future Work (v2)
-- RAID level migration (e.g., RAID5 → RAID6)
-- Disk removal (shr grow --remove)
-- Chunk size migration
-- Stacked LHSR-on-mdadm reshape (requires create-time changes)
-  ```
 
 ---
 
@@ -928,41 +911,41 @@ per-I/O overhead. Test on real hardware before investing in Option A-D.
 
 ---
 
-## Phase 16: SHR Userspace Implementation (Scoped — not started)
+## Phase 16: SHR Userspace — mdadm Purge ✅ COMPLETE (2026-06-19)
 
-**Goal:** Userspace tool for Synology Hybrid RAID (mixed-size disks) using
-partition → RAID tier → LVM stacking.
+**Duration:** 1 session
 
-### Design
-Full design document: `docs/plans/2026-06-13-shr-userspace-design.md`
+**What changed:** All mdadm code paths removed from the SHR userspace CLI.
+The tool now exclusively uses LHSR dmsetup targets. This eliminates ~1000
+lines of dead mdadm code and simplifies future maintenance.
 
-### Scope
-- **v1**: `lhsrctl shr plan` — layout calculator + command generator only
-- Prints `sgdisk` + `mdadm`/`dmsetup` commands for user to execute
-- Supports `--mdadm` (default, battle-tested) and `--lhsr` (self-healing) modes
-- Greedy tiering algorithm partitions disks into equal-sized chunks per tier
-- Each tier becomes a RAID5/6 array (mdadm or LHSR dm target)
-- All tiers combined via LVM VG + single LV
+### What was removed
+- `shr_print_commands()`, `shr_create_raid()`, `shr_create_lvm()`: all
+  mdadm branches eliminated; `use_lhsr` parameter removed
+- `cmd_shr_plan()`, `cmd_shr_create()`: `--mdadm`/`--lhsr` flags removed
+- `cmd_shr_status()`: mdadm sysfs reads removed; PV detection uses
+  `/dev/mapper/` paths only
+- `cmd_shr_destroy()`: rewritten LHSR-only (no mdadm teardown)
+- `cmd_shr_grow()`: replaced with stub redirecting to `shr expand`
+- `cmd_shr_expand()`: mdadm creation branch removed; RAID5 table params
+  fixed (`8 %u %u` → `8 1 8` — was passing wrong values as kernel geometry)
+- Deleted: `struct md_entry`, `scan_md_devices()`, `md_entry_read_members()`
+- Deleted: `#include <dirent.h>` (no longer needed)
+- Net: **-978 lines**, zero new compiler warnings
 
-### Benefits
-- Mixed disk sizes without waste
-- Self-healing per tier via LHSR mode (dm-integrity CRC32c scrubbing)
-- No kernel changes needed (pure userspace)
+### Why
+- LHSR is the only RAID backend; dual-mode (mdadm + dm-lhsr) adds
+  complexity without benefit
+- All SHR testing uses LHSR mode; mdadm was never tested post-Phase 7
+- Fewer code paths → fewer bugs (Linus: "If 50 lines solve it, 500
+  lines is a confession of failure")
 
-### Costs
-- ~500 lines for v1 (plan only), ~2000 lines for full tool
-- 3-4 sessions for v1, ~11 sessions for full tool
-- Adds mdadm + LVM as runtime dependencies for mdadm mode
-- Recovery is more complex (tiered layout vs single RAID array)
+### Impact on other phases
+- **Phase 9 (`shr grow`)**: Replaced with stub — no mdadm, no reshape
+- **Phase 15 (Write Perf)**: Unchanged — kernel module, not SHR
+- **Phase 6-7 (SHR core)**: Unchanged logic, mdadm paths only removed
 
-### Decision
-**Build v1 (`shr plan` only).** The algorithm is the hard part. The execution
-(sgdisk + mdadm/LVM) is delegating to existing battle-tested tools. v1 avoids
-all rollback and error-handling complexity by generating commands instead of
-executing them.
-
-**Commit:** None yet. See `docs/plans/2026-06-13-shr-userspace-design.md` for
-full design.
+**Commit:** `285c578` — zero-warning build on 6.12.90+deb13.1-amd64
 
 ---
 
@@ -989,7 +972,7 @@ full design.
 | 13 | Parallel I/O waves in RMW (concurrent bio submission) | **1 session** | Phase 12
 | 14 | Concurrent RMW stress testing (4-way fio, 15/15 PASS) | **1 session** | Phase 13
 | 15 | Write performance optimization (close 5-11x gap vs mdadm) | TBD | Phase 14
-| 16 | SHR userspace v1 (layout calculator + command generator) | 3-4 sessions | Phase 12
+| 16 | SHR mdadm purge (LHSR-only userspace, -978 lines) | **1 session** | Phase 7
 
 ---
 
