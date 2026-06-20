@@ -148,40 +148,44 @@ int lhsr_dm_list_arrays(struct array_state *arrays, int max_arrays)
 
 		dm_task_set_name(infot, names->name);
 		if (dm_task_run(infot)) {
+			struct dm_info info;
 			void *next_ptr = NULL;
 			uint64_t start, length;
 			char *target_type = NULL;
 			char *params = NULL;
 
-			dm_get_next_target(infot, &next_ptr, &start, &length,
+			/* MUST call get_info before get_next_target — libdevmapper
+			 * populates internal target list only after info read.
+			 * (tested on libdevmapper 1.02.205, kernel 6.12)
+			 *
+			 * NOTE: second arg is the PREVIOUS return value (or NULL
+			 * for first call).  Do NOT take address of next_ptr here
+			 * — that would pass void** instead of void*.
+			 */
+			dm_task_get_info(infot, &info);
+
+			dm_get_next_target(infot, next_ptr, &start, &length,
 					   &target_type, &params);
 
 			if (target_type && strcmp(target_type, "lhsr") == 0) {
 				struct array_state *as = &arrays[count];
 				memset(as, 0, sizeof(*as));
 				strncpy(as->dm_name, names->name, sizeof(as->dm_name) - 1);
-				/* Parse raid_type from params if present */
+				/* Parse params (STATUSTYPE_TABLE format):
+				 *   UUID=<hex> RAID=<type> DISKS=<count>
+				 *   INTEGRITY=<0|1> DEGRADED=<0|1>
+				 */
 				if (params) {
-					char *tok = strtok(params, " ");
-					if (tok) {
-						char type_name[32];
-						strncpy(type_name, tok, sizeof(type_name) - 1);
-						if (strcmp(type_name, "raid0") == 0)
-							as->raid_type = 0;
-						else if (strcmp(type_name, "raid1") == 0)
-							as->raid_type = 1;
-						else if (strcmp(type_name, "raid5") == 0)
-							as->raid_type = 5;
-						else if (strcmp(type_name, "raid10") == 0)
-							as->raid_type = 10;
-						/* count remaining args (device offset pairs) */
-						int pairs = 0;
-						while (tok) {
-							tok = strtok(NULL, " ");
-							pairs++;
-						}
-						as->num_disks = pairs / 2;
-					}
+					char *p;
+					unsigned int val;
+					/* RAID level */
+					if ((p = strstr(params, "RAID=")) &&
+					    sscanf(p + 5, "%u", &val) == 1)
+						as->raid_type = (int)val;
+					/* Disk count */
+					if ((p = strstr(params, "DISKS=")) &&
+					    sscanf(p + 6, "%u", &val) == 1)
+						as->num_disks = (int)val;
 				}
 				as->last_status = time(NULL);
 				count++;

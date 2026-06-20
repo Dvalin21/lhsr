@@ -1,6 +1,6 @@
 # LHSR Production Readiness Registry
 
-**Last Updated:** 2026-06-19 (Phase 16 ✅ — SHR mdadm purge, all SHR tiers LHSR-only)
+**Last Updated:** 2026-06-19 (Phase 16+ — daemon DM discovery bugfix, predict gap closed)
 **Version:** 5.1.0
 **Status:** Honest assessment of every claimed feature vs. reality.
 
@@ -23,7 +23,7 @@ No hype. No marketing. Just what works, what doesn't, and what's needed.
 | 1 | SHR flexible disk sizes | Phase 6-7 | ✅ Userspace tool (`lhsrctl shr plan/create`), LHSR-only after Phase 16 purge | Medium | Phases 6-7, 16 |
 | 2 | Self-healing with auto repair | Phase 1 | ⚠️ Scrub/read-repair work, checksums persistent via dm-integrity stacking | High | Phase 1 |
 | 3 | Anti-bit-rot protection | Phase 1 | ✅ Functional via dm-integrity stacking (persistent CRC32c per-block) | Medium | Phase 1 |
-| 4 | Predictive failure detection | Phase 3 | ✅ SMART polling + SQLite trends + control socket (`predict` CLI stub still not wired) | Low | Phase 3 |
+| 4 | Predictive failure detection | Phase 3 | ✅ SMART polling + SQLite trends + control socket + `predict` CLI wired (daemon discovers real arrays) | Low | Phase 3 |
 | 5 | Live block migration | Phase 16 | ❌ NOT POSSIBLE — mdadm purged, LHSR has no kernel reshape. Use `shr expand` for new tiers | Low | Very Large (would need kernel reshape) |
 | 6 | Instant RAID recovery | Phase 5 | ⚠️ Read-side reconstruction works, `lhsrctl recover/reconstruct` exist, no partial mount | Medium | Phase 5 |
 | 7 | Incremental rebuild | Phase 2 | ✅ Write-Intent Bitmap (WIB) — persistent, 1MB granularity, rebuild skips clean regions | High | Phase 2 |
@@ -233,10 +233,11 @@ Linux APIs:
   analysis).
 - **No live block migration**: Feature #5 still doesn't exist, so even if
   the predictor worked, there's nothing to migrate to.
-- **`lhsrctl predict` is still a stub**: The CLI command needs updating to
-  query the daemon control socket instead of printing placeholder text.
 - **No argus-disk integration**: Option A (external tool integration) is not
   implemented — the daemon uses its own internal trend tracking instead.
+- **No real-drive trend data**: Daemon trending has been tested only with
+  loopback devices (no SMART data). Integration with real SATA/NVMe drives
+  has not been tested.
 
 **Required for production:**
 - ✅ ~~Refactor daemon to not use fork()+exec()~~ Done (Phase 3).
@@ -245,7 +246,9 @@ Linux APIs:
 - ✅ ~~Add control socket for live queries~~ Done.
 - ✅ ~~Add JSON machine-parseable status~~ Done.
 - ✅ ~~Create systemd unit with hardening~~ Done.
-- ⏳ Update `lhsrctl predict` to query daemon control socket.
+- ✅ ~~`lhsrctl predict` wired to daemon control socket~~ Done.
+- ✅ ~~Daemon DM device discovery fixed (`&next_ptr` → `next_ptr` bug)~~ Done.
+- ⏳ Test with real drives (SATA + NVMe) to populate trend DB with meaningful data.
 - ⏳ Add probabilistic failure prediction model (ML or statistical).
 
 ---
@@ -697,7 +700,7 @@ testing against kernel module, and functional verification of each component.
 | Security hardening directives | ✅ PASS | NoNewPrivileges, PrivateTmp, ProtectSystem, ProtectHome set |
 | Capability bounding | ✅ PASS | CAP_SYS_ADMIN, CAP_NET_ADMIN, CAP_SYS_RAWIO |
 | **`lhsrctl` CLI (existing)** | | |
-| `predict` command (stub, known limitation) | ⚠️ STUB | CLI placeholder — queries control socket not yet wired up |
+| `predict` command | ✅ PASS | Queries daemon `/run/lhsrd.sock`, receives trend JSON, prints time-to-threshold analysis (VM shows "No disks tracked" — expected with loopback devices) |
 
 **Verified behaviors:**
 - ✅ Zero `fork()` + `exec()` calls in the daemon monitoring path. All DM operations
@@ -715,8 +718,6 @@ testing against kernel module, and functional verification of each component.
   linear regression — performed by design; regression needs N≥3 data points).
 - RAID5/6 auto-failover through daemon (RAID1 tested during Phase 2; daemon
   auto-failover reuses same kernel message infrastructure).
-- `lhsrctl predict` integration with daemon control socket (CLI stub still prints
-  placeholder text — deferred to post-Phase 3 cleanup).
 - SG_IO on NVMe devices (NVMe uses a different command set — sysfs Tier 1
   handles basic NVMe health; full NVMe SMART via SG_IO not tested).
 
@@ -886,7 +887,7 @@ than mdadm (known issue, Phase 15)."
 
 **Remaining gaps (see ROADMAP.md for phases):**
 1. Write performance (5-11x gap vs mdadm, Phase 15 — real hardware needed)
-2. `lhsrctl predict` still a stub (needs control socket wiring)
+2. ~~`lhsrctl predict` stub~~ (✅ resolved: CLI wired, daemon DM discovery fixed)
 3. RAID6 dual-disk RS decode (returns IOERR with TODO)
 4. Periodic WIB flush (timer-based writeback)
 5. Integration test: SHR LHSR-only create → expand → status → destroy
