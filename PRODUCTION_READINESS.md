@@ -1,6 +1,6 @@
 # LHSR Production Readiness Registry
 
-**Last Updated:** 2026-06-19 (Phase 16+ — daemon DM discovery bugfix, predict gap closed)
+**Last Updated:** 2026-06-20 (Phase 16+ — doc refresh: WIB flush, RAID6 decode, SHR test confirmed)
 **Version:** 5.1.0
 **Status:** Honest assessment of every claimed feature vs. reality.
 
@@ -306,7 +306,7 @@ utilities.
   from parity/mirror. This happens per-I/O, not as a recovery operation.
 - **`lhsr-scan`** (userspace recovery tool): Reads superblocks from raw disks,
   validates CRC32c, displays metadata. Works for offline recovery.
-- **`lhsr-ctl recover`**: Stub command, not implemented.
+- **`lhsrctl recover`**: Scans devices for LHSR superblocks, groups by UUID, validates disk health, generates dmsetup assembly commands with dm-zero placeholders for missing disks.
 
 **What's missing:**
 - **No partial-array mount**: If multiple disks are missing, the array cannot be
@@ -373,8 +373,9 @@ utilities.
   write-hole journal — same format, same recovery, single set of correctness
   guarantees.
 - CRC seed = 0 consistently (`__crc32c_le(0, ...)`) for both write and verify.
-- No periodic flush: dirty WIB pages flushed only on dtr (destructor). After
-  crash, stale WIB means more copy work (conservative, always safe).
+- Periodic flush: dirty WIB pages flushed every 30 seconds via `wib_wq` +
+  `delayed_work`. After crash, at most 30 seconds of WIB updates lost
+  (conservative, always safe).
 - WIB only benefits RAID1 (mirror) rebuild. RAID5/6 dead-disk replacement always
   needs full parity reconstruction — WIB bits are set but never cleared in the
   RAID5/6 write path.
@@ -384,10 +385,10 @@ utilities.
 
 **Required for production:**
 - ✅ ~~Implement write-intent bitmap~~ Done (Phase 2).
-- ⏳ Add periodic WIB flush (background writeback of dirty pages on a timer).
-- ⏳ Add `dmsetup message` interface to query WIB status (dirty page count, etc.).
+- ✅ ~~Add periodic WIB flush~~ (Done: 30-second timer via `wib_wq` + `delayed_work` in ctr path)
+- ⏳ Add `dmsetup message` interface to query WIB status (dirty page count, etc.)
 - ⏳ Consider RAID5/6 WIB support: clear WIB bits on RAID5/6 writes only if the
-  write covers a full stripe (no read-modify-write needed for recovery).
+  write covers a full stripe (no read-modify-write needed for recovery)
 
 ---
 
@@ -647,8 +648,8 @@ Tested on VM (6.12.90+deb13.1-amd64) with loopback devices.
 2. RAID6 read reconstruction: Q parity disk excluded from the disk_map — RAID6 single-failure reconstruction uses only data survivors + P parity. Q parity is a GF-weighted sum and XORing it with P gives wrong data.
 
 **Remaining:**
-- RAID6 double-failure RS decode still not implemented (returns IOERR with TODO)
-- RAID6 Q parity NOT rebuilt in bitmap_recover path (deferred — Q only needed for double-failure RS decode, which is also TODO)
+- RAID6 double-failure RS decode — implemented in `lhsr_rs_decode_2()` (Vandermonde 2x2, see Phase 11)
+- RAID6 Q parity rebuilt in bitmap_recover path — code confirmed (q_page alloc + GF-multiply compute + FUA writeback at lines 3302, 3390-3396, 3417-3432)
 
 ---
 
@@ -744,7 +745,7 @@ Tested on VM (6.12.90+deb13.1-amd64) with loopback devices. Tools compiled from
 | Validation: reject all-disks-present | ✅ PASS | "All disks present — no reconstruction needed" |
 
 **Remaining:**
-- RAID6 dual-disk Reed-Solomon decode (returns IOERR with TODO in code)
+- RAID6 dual-disk Reed-Solomon decode — implemented in kernel `lhsr_rs_decode_2()` (Vandermonde 2x2, see Phase 11)
 - `lhsrctl recover` — no end-to-end `dmsetup create` + `mount` tested (assembly verified, mount not)
 
 ---
@@ -766,8 +767,8 @@ Tested on VM (6.12.90+deb13.1-amd64) with loopback devices.
 - RAID6 single-failure XOR only uses data + P (Q parity excluded from disk_map)
 
 **Remaining:**
-- RAID6 dual-disk failure recovery (RS decode, IOERR with TODO)
-- RAID6 Q parity NOT rebuilt in bitmap_recover path (deferred)
+- RAID6 dual-disk failure recovery — implemented in `lhsr_rs_decode_2()` (Vandermonde 2x2)
+- RAID6 Q parity rebuilt in bitmap_recover path — code confirmed (q_page alloc + GF-multiply compute + FUA writeback at lines 3302, 3390-3396, 3417-3432)
 
 ---
 
@@ -831,9 +832,9 @@ handles concurrent I/O correctly. The primary remaining issue is performance
 | No `struct md_entry` / `scan_md_devices()` | ✅ PASS | Dead struct and functions removed |
 | No `#include <dirent.h>` | ✅ PASS | Deleted with dead code |
 
-**Not yet tested (requires VM session):**
+**Not yet tested (VM session, Jun 19):**
 - End-to-end: `shr create` → `expand` → `status` → `destroy` with LHSR-only
-  (no mdadm arrays created during workflow)
+  — ✅ **PASS** (3×128MB loopbacks → RAID5 tier, expand 4th disk → 2 tiers, status shows 2 PVs, destroy clean)
 
 ---
 
@@ -862,9 +863,9 @@ handles concurrent I/O correctly. The primary remaining issue is performance
 - ✅ ~~RAID6 single-failure read reconstruction~~ (Done: Q parity excluded from XOR, Phase 10-E)
 - ✅ ~~Parallel I/O waves~~ (Done: concurrent bio submission, Phase 13)
 - ✅ ~~RMW state machine stress-tested~~ (Done: 15/15 PASS, Phases 12-14)
-- ⏳ Periodic WIB flush (background writeback on timer)
+- ✅ ~~Periodic WIB flush~~ (Done: 30-second timer via `wib_wq` + `delayed_work`)
 - ⏳ RAID5/6 WIB support (clear bits on full-stripe writes)
-- ⏳ RAID6 dual-disk failure Reed-Solomon decode (returns IOERR with TODO)
+- ✅ ~~RAID6 dual-disk failure Reed-Solomon decode~~ (Done: Vandermonde 2x2 in `lhsr_rs_decode_2()`, Phase 11)
 
 ---
 
@@ -888,6 +889,7 @@ than mdadm (known issue, Phase 15)."
 **Remaining gaps (see ROADMAP.md for phases):**
 1. Write performance (5-11x gap vs mdadm, Phase 15 — real hardware needed)
 2. ~~`lhsrctl predict` stub~~ (✅ resolved: CLI wired, daemon DM discovery fixed)
-3. RAID6 dual-disk RS decode (returns IOERR with TODO)
-4. Periodic WIB flush (timer-based writeback)
-5. Integration test: SHR LHSR-only create → expand → status → destroy
+3. ~~RAID6 dual-disk RS decode~~ (✅ resolved: Vandermonde 2x2 in `lhsr_rs_decode_2()`)
+4. ~~Periodic WIB flush~~ (✅ resolved: 30-second timer via `wib_wq` + `delayed_work`)
+5. ~~Integration test: SHR LHSR-only create → expand → status → destroy~~ (✅ PASS on VM, Jun 19)
+6. RAID5/6 WIB clear on full-stripe write (minor optimization, not correctness-critical)

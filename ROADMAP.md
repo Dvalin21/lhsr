@@ -142,15 +142,16 @@ from the write-hole journal — same format, same recovery, no new on-disk forma
 - `lhsr_wib_clear(arr, sector)` — mark a chunk clean (called on rebuild completion)
 - `lhsr_wib_test(arr, sector)` — test if a chunk is dirty
 - `lhsr_wib_clear_all(arr)` — mark all chunks clean (full resync fallback)
-- `lhsr_wib_flush(arr)` — write all dirty WIB pages to disk (reserved for future periodic flush)
+- `lhsr_wib_flush(arr)` — write all dirty WIB pages to disk (used by periodic flush timer)
 - `lhsr_wib_write_page(arr, page)` — write one WIB page to disk
 - `lhsr_wib_load(arr)` — read WIB pages from disk on array assembly
 
 **Key design decisions:**
 - WIB granularity = 1MB per bit (LHSR_WIB_CHUNK_SECTORS = 2048), matching write-hole journal
 - CRC seed = 0 (`__crc32c_le(0, ...)`) consistently for both write and verify
-- No periodic flush timer yet — dirty WIB pages flushed only on dtr. After crash, stale WIB
-  means more copy work (conservative, always safe)
+- No periodic flush at Phase 2 — added later (2026-06-19: 30-second timer via `wib_wq` + `delayed_work`).
+  Before this addition: dirty WIB pages flushed only on dtr; after crash, stale WIB meant more copy
+  work (conservative, always safe)
 - WIB only benefits RAID1 (mirror) rebuild where clean regions can be skipped. RAID5/6
   dead-disk replacement always needs full parity reconstruction
 
@@ -176,6 +177,7 @@ from the write-hole journal — same format, same recovery, no new on-disk forma
 - ✅ Full-disk rebuild fallback: `lhsr_wib_clear_all()` for initial sync or missing WIB
 - ✅ Superblock v2 with dynamic metadata reservation
 - ✅ v1 superblock rejected at assembly
+- ✅ WIB periodic flush (30-second timer via `wib_wq` + `delayed_work` — added 2026-06-19)
 - ✅ RAID1 WIB rebuild test on VM (2×100MB loopbacks): dirty/clean/dirty pattern,
   SHA256 verified PASS
 - ✅ RAID5 smoke test on VM (3×64MB loopbacks): data integrity verified PASS
