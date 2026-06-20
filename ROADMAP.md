@@ -840,10 +840,129 @@ leave stale Q parity on RAID6.
    - Original report of "all pages uninitialized on re-create" could NOT be reproduced
      — most likely caused by backing file re-initialization between test script runs
 
-### Remaining gaps
-   - Concurrent stress testing beyond single-threaded
-
 **Commit:** `bdd43bc` — zero-warning build on 6.12.90+deb13.1-amd64
+
+---
+
+## Phase 13: Parallel I/O Waves in RMW Read/Write Phases ✅ COMPLETE (2026-06-19)
+
+**Duration:** 1 session
+
+Replaced 6 sequential `submit_bio_wait()` calls in RMW (3 reads + 3 writes) with
+2 parallel I/O waves: submit-all-reads → wait → submit-all-writes → wait. Each
+wave uses `struct lhsr_parallel_io` with per-bio completion tracking via `atomic_t pending`
+and a `completion` for the wait side.
+
+### Changes
+1. **`struct lhsr_parallel_io`** — `atomic_t pending`, `struct completion done`, `blk_status_t status`
+2. **`lhsr_parallel_endio()`** — completion callback, decrements pending, fires `complete()` on last
+3. **`lhsr_submit_parallel()`** — single-page bio allocator with failed-disk skip logic
+4. **Counting fix** (`ddef015`): bios counted upfront before submission to prevent
+   synchronous-completion race (loopback/tmpfs bio completes inside `submit_bio()`,
+   firing `complete()` before other bios allocated)
+
+### Results
+- Read and write phases submit 3 concurrent bios per wave instead of 6 sequential I/Os
+- Same page allocation and compute pattern as sequential code
+- Per-stripe mutex still held across entire RMW (correctness invariant)
+- Write-hole bitmap set before writes (unchanged)
+
+### Remaining gaps
+   - On real hardware (NVMe with >1 queue depth) this eliminates scheduling-gap
+     waste between sequential submissions. On loopback+tmpfs the benefit is
+     latency reduction from pooled submissions. Real hardware benchmark needed.
+
+**Commits:** `612999a`, `ddef015` — zero-warning build on 6.12.90+deb13.1-amd64
+
+---
+
+## Phase 14: Concurrent RMW Stress Testing ✅ COMPLETE (2026-06-19)
+
+**Duration:** 1 session
+
+### Stress test 1: 4-way concurrent fio on RAID6
+- 4 parallel fio jobs × 8MB random 16KB writes to non-overlapping regions
+- iodepth=4, sha512 verify per-block written inline
+- RAID6 with 4 loopback devices, 8-sector chunk
+
+### Results: **15/15 PASS**
+- All 4 regions readable with SHA256 match
+- fio read-back verification PASSED (all blocks match)
+- dmesg clean — no warnings, no I/O errors
+- Zero module warnings across all build targets
+
+### Remaining gaps
+   - Multi-device concurrent RMW (stripes on different RAID arrays)
+   - RAID5 concurrent RMW (single-parity stress)
+   - Long-duration soak test (hours of sustained write load)
+
+**Commit:** `b262e6e` — test script only, no kernel changes
+
+---
+
+## Phase 15: Write Performance Optimization (Planned)
+
+**Goal:** Close the 5-11x write performance gap vs mdadm on the VM benchmark.
+
+### Current bottleneck
+Each RMW does 2 synchronous I/O waves (read phase + write phase), each wave
+blocking on `wait_for_completion_io()`. Total latency per stripe = read-wave
+completion + compute + write-wave completion. On loopback this is dominated
+by per-I/O scheduling overhead.
+
+### Options
+
+| Option | Effort | Expected Gain | Risk |
+|--------|--------|---------------|------|
+| **A: Async pipe** — Pipeline multiple RMW workers per stripe (split read/compute/write into chained work items) | Large | 2-3x | Write-hole bitmap ordering must be preserved |
+| **B: Batch dispatch** — Coalesce adjacent stripe writes into single RMW batch (submit N reads, compute N, submit N writes) | Large | 2-5x | Complex batching logic, memory pressure |
+| **C: io_uring bypass** — Use io_uring for bio submission instead of submit_bio | Very large | 2x | Kernel ABI dependency, LHSR is a DM target, can't bypass block layer |
+| **D: Nothing (accept current perf)** | Zero | 1x | Write perf is adequate for NAS workload (sequential write bandwidth matters more) |
+
+### Recommendation
+Defer to real-hardware testing. On real NVMe/SSD with NCQ, the parallel I/O
+waves may already eliminate most of the gap. Loopback+tmpfs exaggerates
+per-I/O overhead. Test on real hardware before investing in Option A-D.
+
+**Commits:** None yet.
+
+---
+
+## Phase 16: SHR Userspace Implementation (Scoped — not started)
+
+**Goal:** Userspace tool for Synology Hybrid RAID (mixed-size disks) using
+partition → RAID tier → LVM stacking.
+
+### Design
+Full design document: `docs/plans/2026-06-13-shr-userspace-design.md`
+
+### Scope
+- **v1**: `lhsrctl shr plan` — layout calculator + command generator only
+- Prints `sgdisk` + `mdadm`/`dmsetup` commands for user to execute
+- Supports `--mdadm` (default, battle-tested) and `--lhsr` (self-healing) modes
+- Greedy tiering algorithm partitions disks into equal-sized chunks per tier
+- Each tier becomes a RAID5/6 array (mdadm or LHSR dm target)
+- All tiers combined via LVM VG + single LV
+
+### Benefits
+- Mixed disk sizes without waste
+- Self-healing per tier via LHSR mode (dm-integrity CRC32c scrubbing)
+- No kernel changes needed (pure userspace)
+
+### Costs
+- ~500 lines for v1 (plan only), ~2000 lines for full tool
+- 3-4 sessions for v1, ~11 sessions for full tool
+- Adds mdadm + LVM as runtime dependencies for mdadm mode
+- Recovery is more complex (tiered layout vs single RAID array)
+
+### Decision
+**Build v1 (`shr plan` only).** The algorithm is the hard part. The execution
+(sgdisk + mdadm/LVM) is delegating to existing battle-tested tools. v1 avoids
+all rollback and error-handling complexity by generating commands instead of
+executing them.
+
+**Commit:** None yet. See `docs/plans/2026-06-13-shr-userspace-design.md` for
+full design.
 
 ---
 
@@ -867,6 +986,10 @@ leave stale Q parity on RAID6.
 | 10-E | Stability fixes & error path validation (failed_disks race, RAID6 Q XOR bug, RAID5/6 reconstruction test) | **1 session** | Phase 10-A
 | 11 | RAID6 RS(255,N) double-failure decode (Vandermonde 2x2 + data+P recovery) | **1 session** | Phase 10-E
 | 12 | RAID6 bitmap Q parity reconstruction (bitmap_recover GF weighted-sum) | **1 session** | Phase 11
+| 13 | Parallel I/O waves in RMW (concurrent bio submission) | **1 session** | Phase 12
+| 14 | Concurrent RMW stress testing (4-way fio, 15/15 PASS) | **1 session** | Phase 13
+| 15 | Write performance optimization (close 5-11x gap vs mdadm) | TBD | Phase 14
+| 16 | SHR userspace v1 (layout calculator + command generator) | 3-4 sessions | Phase 12
 
 ---
 

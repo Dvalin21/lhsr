@@ -34,7 +34,7 @@
  *  data structures and their relationships."         — Linus Torvalds
  *
  * The partition is the fundamental unit.  Every partition in a tier
- * is exactly the same size.  This is what mdadm sees.  The disk is
+ * is exactly the same size.  The disk is
  * the physical container.  The layout is the complete picture.
  * =================================================================== */
 
@@ -106,10 +106,10 @@ void shr_print_plan(const struct shr_layout *layout,
 
 /*
  * Print shell commands to execute the plan.
- * Generates sgdisk + mdadm/dmsetup + LVM commands.
+ * Generates sgdisk + dmsetup (LHSR) + LVM commands.
  */
 void shr_print_commands(const struct shr_layout *layout,
-			const char * const *disk_paths, int use_lhsr);
+			const char * const *disk_paths);
 
 /*
  * Execute the SHR layout: partition disks, create RAID arrays,
