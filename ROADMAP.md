@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-20 (Phase 3.7 HTTP metrics ✅, Phase 5.3 RS decode ✅, Phase 16 ✅)
+**Last Updated:** 2026-06-20 (Phase 5 ✅ COMPLETE, Phase 3.7 HTTP metrics ✅, Phase 5.3 RS decode ✅)
 
 ---
 
@@ -363,9 +363,9 @@ Disk: /dev/sdb
 
 ---
 
-## Phase 5: Recovery Tools — IN PROGRESS (2026-06-12)
+## Phase 5: Recovery Tools — ✅ COMPLETE (2026-06-12 — 2026-06-20)
 
-**Duration:** Estimated 2 weeks (5.1-5.3 done, 5.4 remaining)
+**Duration:** ~2 weeks (5.1-5.3, 5.4 degraded assembly, RS decode all verified)
 
 **What changed:** Userspace recovery tools to find, assemble, and recover LHSR arrays after disk failure.
 
@@ -421,7 +421,7 @@ $ lhsrctl recover /dev/sdb /dev/sdc /dev/sdd
 
 #### 5.3 Offline data reconstruction (`lhsrctl reconstruct`) — ✅ COMPLETE (RS decode added 2026-06-20)
 
-**Commit:** (pending)
+**Commit:** `aec1db8`
 
 The `lhsrctl reconstruct` command performs offline XOR reconstruction of a complete
 disk image for a missing RAID5/6 array member from N-1 surviving devices. The output

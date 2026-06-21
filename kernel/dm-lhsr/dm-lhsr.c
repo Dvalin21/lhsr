@@ -1738,8 +1738,14 @@ static void rebuild_work(struct work_struct *work)
 	 *
 	 * For RAID5/6, every region needs reconstruction from parity
 	 * on dead-disk replacement.  The WIB check is conservative:
-	 * WIB bits are never cleared by writes in the RAID5/6 path,
-	 * so the check always falls through to reconstruction.
+	 * WIB bits are cleared on RMW write completion in the RAID5/6
+	 * path, but a set bit only means "write was queued", not that
+	 * it completed — the RMW worker may still be in flight (or
+	 * may have failed).  We cannot skip reconstruction based on
+	 * a cleared WIB bit alone during rebuild because parity may
+	 * not be consistent if we are rebuilding THE parity disk.
+	 * The RAID5/6 rebuild path always reconstructs from parity,
+	 * which is the only safe approach regardless of WIB state.
 	 *
 	 * If WIB is absent (v1 array or alloc failure), this check
 	 * always returns "needs copy" and we fall through.
@@ -4166,6 +4172,15 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	/* All writes committed — clear the dirty bit */
 	if (lhsr_bitmap_clear(arr, chunk_start))
 		DMWARN("RMW: bitmap_clear failed for chunk %llu", (u64)chunk_start);
+
+	/*
+	 * Clear WIB bit: the entire stripe is now self-consistent because
+	 * every data chunk and parity chunk was written with REQ_FUA.
+	 * WIB granularity is 1MB (LHSR_WIB_CHUNK_SECTORS), which is much
+	 * larger than any stripe, so all chunks in the stripe share the
+	 * same WIB bit — clearing once is correct.
+	 */
+	lhsr_wib_clear(arr, chunk_start);
 
 out:
 	if (locked)
