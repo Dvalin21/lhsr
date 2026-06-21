@@ -9,7 +9,8 @@ CFLAGS   := -Wall -Wextra -O2 -g -I../../include -I../../lib
 
 TARGET   = lhsrd
 SOURCES  = lhsrd.c lhsr-dm.c lhsr-smart.c lhsr-config.c \
-           lhsr-trend.c lhsr-control.c lhsr-health.c lhsr-notify.c
+           lhsr-trend.c lhsr-control.c lhsr-health.c lhsr-notify.c \
+           lhsr-http.c
 OBJECTS  = $(SOURCES:.c=.o)
 
 LIBS     := -lpthread -ldevmapper -lsqlite3

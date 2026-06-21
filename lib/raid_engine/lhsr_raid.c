@@ -17,6 +17,7 @@
 #include <linux/fs.h>
 #include <sys/random.h>
 #include <time.h>
+#include <stdint.h>
 
 #include "../raid_engine.h"
 
@@ -181,17 +182,234 @@ int lhsr_raid5_reconstruct(void *result, void **disks, unsigned int count,
 }
 
 /*
- * Reconstruct block from RAID6 (dual parity)
+ * GF(2^8) arithmetic for Reed-Solomon RAID6 reconstruction.
+ *
+ * Uses polynomial 0x1d (x^8 + x^4 + x^3 + x^2 + 1) with generator
+ * g=2, matching the kernel RAID6 implementation.
+ */
+
+static uint8_t rs_power_table[256];
+static uint8_t gf_log[256];
+static int rs_initialized;
+
+static void rs_tables_init(void)
+{
+	unsigned int i;
+	if (rs_initialized)
+		return;
+	rs_power_table[0] = 1;
+	for (i = 1; i < 256; i++)
+		rs_power_table[i] = (rs_power_table[i-1] << 1) ^
+			(rs_power_table[i-1] & 0x80 ? 0x1d : 0);
+	memset(gf_log, 0, sizeof(gf_log));
+	for (i = 0; i < 255; i++)
+		gf_log[rs_power_table[i]] = i;
+	rs_initialized = 1;
+}
+
+/* GF(2^8) multiply: shift-and-add (constant-time) */
+static inline uint8_t gf_mul(uint8_t a, uint8_t b)
+{
+	uint8_t prod = 0;
+	uint8_t val = a;
+	while (b) {
+		if (b & 1)
+			prod ^= val;
+		val = (val << 1) ^ (val & 0x80 ? 0x1d : 0);
+		b >>= 1;
+	}
+	return prod;
+}
+
+/* GF(2^8) inverse: 1/a via log/antilog table.  Returns 0 for a=0. */
+static inline uint8_t gf_inv(uint8_t a)
+{
+	unsigned int idx;
+	if (!a)
+		return 0;
+	idx = 255 - gf_log[a];
+	if (idx >= 255)
+		idx = 0;
+	return rs_power_table[idx];
+}
+
+/*
+ * Reconstruct block from RAID6 (dual parity).
+ *
+ * Handles all 2-disk-failure combinations:
+ *   - 1 data + P alive   → XOR reconstruct from survivors
+ *   - 1 data + Q alive   → RS single-equation from Q + survivors
+ *   - 2 data + P+Q alive → Vandermonde 2x2 solve
+ *   - P dead only         → XOR reconstruct P
+ *   - Q dead only         → GF-weighted sum reconstruct Q
+ *
+ * @p and @q are scratch buffers (block_size bytes each), pre-allocated
+ * by the caller.  They may be used as temporary workspace.
+ *
+ * For 2 data failures, call twice (once per failed disk index).
+ * Returns 0 on success, -EINVAL for unsupported combinations.
  */
 int lhsr_raid6_reconstruct(void *result, void *p, void *q,
 			    void **disks, unsigned int count,
 			    unsigned int failed1, unsigned int failed2, size_t block_size)
 {
-	(void)p;
-	(void)q;
-	(void)failed1;
-	/* Simplified reconstruction - in production would use proper GF math */
-	return lhsr_raid5_reconstruct(result, disks, count - 2, failed2, block_size);
+	uint8_t *res = result;
+	uint8_t *scratch = p;
+	(void)q;	/* Data accessed from disks[count-1] */
+	unsigned int data_count = count - 2;
+	unsigned int p_idx = count - 2;
+	unsigned int q_idx = count - 1;
+
+	/* Determine which of P, Q are available */
+	int p_ok = (failed1 != p_idx && failed2 != p_idx);
+	int q_ok = (failed1 != q_idx && failed2 != q_idx);
+
+	/* Collect distinct data disk failures */
+	unsigned int dfail[2];
+	int n_data_fail = 0;
+	if (failed1 < data_count)
+		dfail[n_data_fail++] = failed1;
+	if (failed2 < data_count && failed2 != failed1)
+		dfail[n_data_fail++] = failed2;
+
+	/* Reconstruct P */
+	if (n_data_fail == 0 && !p_ok) {
+		memset(result, 0, block_size);
+		for (unsigned int i = 0; i < data_count; i++) {
+			uint32_t *src = disks[i];
+			uint32_t *dst = (uint32_t *)result;
+			for (size_t j = 0; j < block_size / 4; j++)
+				dst[j] ^= src[j];
+		}
+		return 0;
+	}
+
+	/* Reconstruct Q */
+	if (n_data_fail == 0 && !q_ok) {
+		rs_tables_init();
+		memset(result, 0, block_size);
+		for (unsigned int i = 0; i < data_count; i++) {
+			uint8_t coeff = rs_power_table[i];
+			uint8_t *src = disks[i];
+			for (size_t j = 0; j < block_size; j++)
+				res[j] ^= gf_mul(src[j], coeff);
+		}
+		return 0;
+	}
+
+	/* Need at least P or Q for single data failure */
+	if (n_data_fail == 1 && !p_ok && !q_ok)
+		return -EINVAL;
+
+	/* Need both P and Q for two data failures */
+	if (n_data_fail == 2 && (!p_ok || !q_ok))
+		return -EINVAL;
+
+	/* Single data failure */
+	if (n_data_fail == 1) {
+		unsigned int target = dfail[0];
+
+		if (p_ok) {
+			/* XOR: result = sum(all alive except target and Q) */
+			memset(result, 0, block_size);
+			for (unsigned int i = 0; i < count; i++) {
+				if (i == target || i == q_idx)
+					continue;
+				uint32_t *src = disks[i];
+				uint32_t *dst = (uint32_t *)result;
+				for (size_t j = 0; j < block_size / 4; j++)
+					dst[j] ^= src[j];
+			}
+			return 0;
+		} else {
+			/* RS single equation: T = sum(g^i * D_i) + Q
+			 * D_target = inv(g^target) * T */
+			rs_tables_init();
+			memset(scratch, 0, block_size);
+			/* Accumulate T for all alive data disks */
+			for (unsigned int i = 0; i < data_count; i++) {
+				if (i == target)
+					continue;
+				uint8_t coeff = rs_power_table[i];
+				uint8_t *src = disks[i];
+				for (size_t j = 0; j < block_size; j++)
+					scratch[j] ^= gf_mul(src[j], coeff);
+			}
+			/* T ^= Q */
+			{
+				uint8_t *qdata = disks[q_idx];
+				for (size_t j = 0; j < block_size; j++)
+					scratch[j] ^= qdata[j];
+			}
+			/* D_target = inv(g^target) * T */
+			{
+				uint8_t invg = gf_inv(rs_power_table[target]);
+				for (size_t j = 0; j < block_size; j++)
+					res[j] = gf_mul(scratch[j], invg);
+			}
+			return 0;
+		}
+	}
+
+	/* Two data failures: Vandermonde 2x2 solve
+	 *   P = D_a + D_b + D_c + ...   (XOR of all data)
+	 *   Q = g^a*D_a + g^b*D_b + ... (GF-weighted sum)
+	 *
+	 * For two unknowns D_t, D_o:
+	 *   S = P + sum(alive data) = D_t + D_o
+	 *   T = Q + sum(g^i * D_i) = g^t*D_t + g^o*D_o
+	 *
+	 * D_t = inv(g^t ^ g^o) * (g^o * S ^ T)
+	 */
+	if (n_data_fail == 2) {
+		unsigned int target = dfail[0];
+		unsigned int other  = dfail[1];
+
+		rs_tables_init();
+
+		uint8_t coeff_t = rs_power_table[target];
+		uint8_t coeff_o = rs_power_table[other];
+		uint8_t det = coeff_t ^ coeff_o;
+		uint8_t inv_det = gf_inv(det);
+
+		/* S = XOR of all alive disks (exclude both failed + Q) */
+		memset(result, 0, block_size);
+		for (unsigned int i = 0; i < count; i++) {
+			if (i == target || i == other || i == q_idx)
+				continue;
+			uint32_t *src = disks[i];
+			uint32_t *dst = (uint32_t *)result;
+			for (size_t j = 0; j < block_size / 4; j++)
+				dst[j] ^= src[j];
+		}
+
+		/* T = GF-weighted sum of alive data + Q */
+		memset(scratch, 0, block_size);
+		for (unsigned int i = 0; i < data_count; i++) {
+			if (i == target || i == other)
+				continue;
+			uint8_t coeff = rs_power_table[i];
+			uint8_t *src = disks[i];
+			for (size_t j = 0; j < block_size; j++)
+				scratch[j] ^= gf_mul(src[j], coeff);
+		}
+		/* T ^= Q */
+		{
+			uint8_t *qdata = disks[q_idx];
+			for (size_t j = 0; j < block_size; j++)
+				scratch[j] ^= qdata[j];
+		}
+
+		/* D_target = inv_det * (coeff_o * S ^ T) */
+		for (size_t j = 0; j < block_size; j++) {
+			uint8_t s = ((uint8_t *)result)[j];
+			uint8_t t = scratch[j];
+			((uint8_t *)result)[j] = gf_mul(gf_mul(coeff_o, s) ^ t, inv_det);
+		}
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 /*

@@ -32,13 +32,15 @@
 #define SMART_HEALTH_LOW             50
 
 /* Max arrays and disks */
-#define LHSRD_MAX_ARRAYS  16
-#define LHSRD_MAX_DISKS   32
+#define LHSRD_MAX_ARRAYS          16
+#define LHSRD_MAX_DISKS           32
+#define LHSRD_MAX_DISKS_PER_ARRAY 16
 
 /* Disk health state */
 struct disk_health {
 	char   device_path[256];
-	int    disk_index;
+	int    disk_index;		/* index within its array */
+	int    array_idx;		/* index into daemon_state::arrays[] */
 	int    smart_reallocated;
 	int    smart_pending;
 	int    smart_uncorrectable;
@@ -136,6 +138,12 @@ int lhsr_dm_remove(const char *name);
  * Returns number of devices found, or -1 on error.
  */
 int lhsr_dm_get_devices(const char *dm_name, char devices[][256], int max_devices);
+
+/*
+ * Convert a "major:minor" string (from lhsr_dm_get_devices) to a /dev path.
+ * Returns 0 on success, -1 on error.
+ */
+int lhsr_dm_resolve_device(const char *majmin, char *path, size_t pathsz);
 
 /*
  * Suspend / resume an LHSR DM device.

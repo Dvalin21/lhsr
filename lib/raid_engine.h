@@ -16,42 +16,16 @@
 #include <string.h>
 #include <errno.h>
 
-/*
- * RAID type constants — must match include/lhsr.h values.
- * The kernel module uses #define constants from the shared on-disk
- * header; the userspace library uses an enum.  Values are the same.
- * Function signatures use unsigned int so they're compatible.
- */
-enum lhsr_raid_type {
-	LHSR_RAID_SINGLE = 0,
-	LHSR_RAID_MIRROR = 1,
-	LHSR_RAID5    = 2,
-	LHSR_RAID6    = 3,
-	LHSR_RAID_SHR = 4,
-	LHSR_RAID_SHR2 = 5,
-};
+#include "lhsr.h"		/* LHSR constants — single source of truth */
 
 /* Version */
 #define LHSR_VERSION_MAJOR  1
 #define LHSR_VERSION_MINOR   0
 #define LHSR_VERSION_PATCH  0
 
-/* States */
-enum lhsr_state {
-	LHSR_STATE_OFFLINE    = 0,
-	LHSR_STATE_ONLINE     = 1,
-	LHSR_STATE_HEALTHY   = 2,
-	LHSR_STATE_DEGRADED = 3,
-	LHSR_STATE_REBUILDING = 4,
-	LHSR_STATE_FAILED   = 5,
-};
+/* States (constants in lhsr.h) */
 
-/* Checksum algorithms */
-enum lhsr_checksum {
-	LHSR_CHECKSUM_NONE   = 0,
-	LHSR_CHECKSUM_CRC32C = 1,
-	LHSR_CHECKSUM_BLAKE3 = 2,
-};
+/* Checksum algorithm constants in lhsr.h; LHSR_CHECKSUM_NONE also in lhsr.h */
 
 /* Self-healing modes */
 enum lhsr_heal_mode {
@@ -62,7 +36,7 @@ enum lhsr_heal_mode {
 };
 
 /* Maximums */
-#define LHSR_MAX_DISKS  32
+/* LHSR_MAX_DISKS from lhsr.h */
 #define LHSR_MAX_DISK_PATH 256
 
 /* Context */
@@ -167,25 +141,9 @@ enum lhsr_integrity_state {
 	LHSR_INTEGRITY_REBUILDING = 3,
 };
 
-/* Corruption severity */
-enum lhsr_corrupt_severity {
-	LHSR_CORRUPT_NONE = 0,
-	LHSR_CORRUPT_SINGLE_BIT = 1,
-	LHSR_CORRUPT_MULTI_BIT = 2,
-	LHSR_CORRUPT_FULL_BLOCK = 3,
-};
+/* Corruption severity constants in lhsr.h */
 
-/* Corruption log entry */
-struct lhsr_corruption_entry {
-	uint64_t block_offset;
-	uint32_t disk_index;
-	uint32_t severity;
-	uint64_t detected_time;
-	uint32_t expected_checksum;
-	uint32_t actual_checksum;
-	uint8_t resolved;
-	uint8_t padding[7];
-};
+/* Corruption log entry (struct lhsr_corruption_entry from lhsr.h) */
 
 /* Integrity verification result */
 struct lhsr_integrity_result {
@@ -263,14 +221,7 @@ const char *lhsr_raid_name(unsigned int type);
 /* Checksum */
 uint32_t lhsr_checksum_crc32c(const void *data, size_t len);
 
-/* Scrubber states */
-enum lhsr_scrub_state {
-	LHSR_SCRUB_IDLE = 0,
-	LHSR_SCRUB_RUNNING = 1,
-	LHSR_SCRUB_PAUSED = 2,
-	LHSR_SCRUB_COMPLETED = 3,
-	LHSR_SCRUB_FAILED = 4,
-};
+/* Scrubber states (constants in lhsr.h) */
 
 /* Scrubber configuration */
 struct lhsr_scrub_config {
@@ -285,7 +236,7 @@ struct lhsr_scrub_config {
 
 /* Scrubber progress */
 struct lhsr_scrub_progress {
-	enum lhsr_scrub_state state;
+	unsigned int state;	/* LHSR_SCRUB_* from lhsr.h */
 	uint64_t total_blocks;
 	uint64_t processed_blocks;
 	uint64_t verified_blocks;

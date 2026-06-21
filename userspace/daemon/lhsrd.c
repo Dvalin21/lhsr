@@ -33,6 +33,7 @@
 #include "lhsr-config.h"
 #include "lhsr-trend.h"
 #include "lhsr-control.h"
+#include "lhsr-http.h"
 #include "lhsr-health.h"
 
 /* Global state for signal handler */
@@ -233,6 +234,47 @@ static void *monitor_thread(void *arg)
 			}
 		}
 
+		/* Initialize num_working to num_disks (optimistic: all healthy
+		 * until health thread proves otherwise) */
+		for (int i = 0; i < st->num_arrays; i++)
+			st->arrays[i].num_working = st->arrays[i].num_disks;
+
+		/* Discover component disks of each array */
+		st->num_disks = 0;
+		for (int i = 0; i < st->num_arrays; i++) {
+			char devices[LHSRD_MAX_DISKS_PER_ARRAY][256];
+			int nd = lhsr_dm_get_devices(st->arrays[i].dm_name,
+						     devices,
+						     LHSRD_MAX_DISKS_PER_ARRAY);
+			for (int d = 0; d < nd && st->num_disks < LHSRD_MAX_DISKS; d++) {
+				char devpath[256];
+				if (lhsr_dm_resolve_device(devices[d], devpath,
+							   sizeof(devpath)) < 0)
+					continue;
+				/* Avoid duplicates (same disk may appear once) */
+				int found = 0;
+				for (int j = 0; j < st->num_disks; j++) {
+					if (strcmp(st->disks[j].device_path,
+						   devpath) == 0) {
+						found = 1;
+						break;
+					}
+				}
+				if (!found) {
+					struct disk_health *dh;
+					dh = &st->disks[st->num_disks];
+					memset(dh, 0, sizeof(*dh));
+					strncpy(dh->device_path, devpath,
+						sizeof(dh->device_path) - 1);
+					dh->disk_index = d;	/* index within this array */
+					dh->array_idx = i;	/* which array owns this disk */
+					dh->health = 100;
+					dh->health_score = 100;
+					st->num_disks++;
+				}
+			}
+		}
+
 		pthread_cleanup_pop(0);
 		pthread_mutex_unlock(&st->lock);
 
@@ -265,12 +307,9 @@ static void *health_monitor_thread(void *arg)
 		for (int i = 0; i < st->num_disks; i++) {
 			/* Find which array this disk belongs to */
 			const char *dm_name = NULL;
-			for (int j = 0; j < st->num_arrays; j++) {
-				if (i < st->arrays[j].num_disks) {
-					/* Rough mapping: assume disk i belongs to this array */
-					dm_name = st->arrays[j].dm_name;
-					break;
-				}
+			if (st->disks[i].array_idx >= 0 &&
+			    st->disks[i].array_idx < st->num_arrays) {
+				dm_name = st->arrays[st->disks[i].array_idx].dm_name;
 			}
 			check_disk_health(&st->disks[i], dm_name);
 			/* Record trend snapshot if enabled */
@@ -278,6 +317,17 @@ static void *health_monitor_thread(void *arg)
 				lhsr_trend_record(st->disks[i].device_path,
 						  &st->disks[i]);
 			}
+		}
+
+		/* Recompute num_working for each array */
+		for (int i = 0; i < st->num_arrays; i++)
+			st->arrays[i].num_working = 0;
+		for (int i = 0; i < st->num_disks; i++) {
+			int aidx = st->disks[i].array_idx;
+			if (aidx >= 0 && aidx < st->num_arrays &&
+			    !st->disks[i].failed &&
+			    st->disks[i].health_score >= 50)
+				st->arrays[aidx].num_working++;
 		}
 
 		pthread_cleanup_pop(0);
@@ -563,6 +613,9 @@ int main(int argc, char **argv)
 	/* Start control socket (best-effort, not fatal if fails) */
 	lhsr_control_start(&state);
 
+	/* Start HTTP metrics server (best-effort, not fatal if fails) */
+	lhsr_http_start(&state);
+
 	/* Create monitor thread */
 	ret = pthread_create(&monitor_tid, NULL, monitor_thread, &state);
 	if (ret != 0) {
@@ -595,8 +648,9 @@ int main(int argc, char **argv)
 
 	syslog(LOG_INFO, "LHSR daemon stopping");
 
-	/* Stop control socket, cancel and join threads */
+	/* Stop control socket, HTTP server, cancel and join threads */
 	lhsr_control_stop(&state);
+	lhsr_http_stop();
 	pthread_cancel(monitor_tid);
 	pthread_join(monitor_tid, NULL);
 	if (health_tid) {

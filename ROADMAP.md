@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-19 (Phase 16 ✅ — SHR userspace mdadm purge)
+**Last Updated:** 2026-06-20 (Phase 3.7 HTTP metrics ✅, Phase 5.3 RS decode ✅, Phase 16 ✅)
 
 ---
 
@@ -185,7 +185,7 @@ from the write-hole journal — same format, same recovery, no new on-disk forma
 
 ---
 
-## Phase 3: Userspace Daemon — SMART Trending, Control Socket, systemd — ✅ COMPLETE (2026-06-12)
+## Phase 3: Userspace Daemon — SMART Trending, Control Socket, systemd, HTTP Metrics — ✅ COMPLETE (2026-06-12, HTTP added 2026-06-20)
 
 **Duration:** 1 day (was estimated 2-3 weeks — 3.1 and 3.2 were already done; 3.3 was well-scoped)
 
@@ -242,6 +242,16 @@ from the write-hole journal — same format, same recovery, no new on-disk forma
 - Security hardening: `NoNewPrivileges=yes`, `PrivateTmp=yes`,
   `ProtectSystem=full`, `CapabilityBoundingSet` for DM and SG_IO access
 - Makefile install target installs to `/usr/lib/systemd/system/`
+
+### 3.7 HTTP metrics endpoint (port 9101) — ✅ NEW (2026-06-20)
+- Minimal HTTP/1.0 server in daemon, no external dependency
+- Listens on TCP `0.0.0.0:9101`, single-threaded accept loop
+- `GET /metrics` serves Prometheus text format from
+  `/var/lib/lhsrd/metrics.prom` (same file written by daemon's main loop)
+- `GET /` redirects to `/metrics`; other paths return 404
+- Start/stop wired into daemon lifecycle via `lhsr_http_start()`/`lhsr_http_stop()`
+- Best-effort start (not fatal if port is unavailable)
+- Prometheus can scrape directly without node_exporter textfile collector
 
 ### Files changed/created
 | File | Status | Lines |
@@ -409,7 +419,7 @@ $ lhsrctl recover /dev/sdb /dev/sdc /dev/sdd
 - Degraded 2-disk RAID5 (1 missing disk) → placeholder + main command
 - dm-zero target verified on VM (creates, reads zeros, removes cleanly)
 
-#### 5.3 Offline data reconstruction (`lhsrctl reconstruct`) — ✅ COMPLETE
+#### 5.3 Offline data reconstruction (`lhsrctl reconstruct`) — ✅ COMPLETE (RS decode added 2026-06-20)
 
 **Commit:** (pending)
 
@@ -448,6 +458,19 @@ Options:
   Does NOT affect XOR (layout-independent).
 
 **Tested on:** Built clean with zero warnings across all 4 targets.
+
+**Library RS decode fix (2026-06-20):**
+- `lhsr_raid6_reconstruct()` in `lib/raid_engine/lhsr_raid.c` was a stub that
+  called the RAID5 XOR path when both P and Q survivors were present. Replaced
+  with full GF(2^8) Reed-Solomon implementation supporting all RAID6
+  single/double-failure combinations:
+  - XOR path (data+P, Q excluded) — single data or P failure
+  - RS single-equation (`inv(g^t) * T`) — data+P failure, Q alive
+  - Vandermonde 2×2 solve — data+data or data+P (no Q) double failure
+  - Static GF log/exp tables (`gf_log[256]`, `gf_exp[510]`) and helpers
+    (`gf_mul`, `gf_inv`)
+- CLI reconstruct command verified on VM: both data disks reconstructed
+  from P+Q only — SHA256 matches original disk images.
 
 ### Remaining
 

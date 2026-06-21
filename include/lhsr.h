@@ -181,6 +181,8 @@ typedef uint64_t __u64;
 #define LHSR_STATE_ONLINE      1
 #define LHSR_STATE_HEALTHY     2
 #define LHSR_STATE_DEGRADED    3
+#define LHSR_STATE_REBUILDING  4
+#define LHSR_STATE_FAILED      5
 
 /* ===================================================================
  * Scrubber states (shared between kernel module and userspace tools)
@@ -190,6 +192,7 @@ typedef uint64_t __u64;
 #define LHSR_SCRUB_RUNNING     1
 #define LHSR_SCRUB_PAUSED      2
 #define LHSR_SCRUB_COMPLETED   3
+#define LHSR_SCRUB_FAILED      4
 
 /* ===================================================================
  * Rebuild states
@@ -251,6 +254,7 @@ struct lhsr_superblock {
  * Checksum algorithms (for future per-block checksum metadata)
  * =================================================================== */
 
+#define LHSR_CHECKSUM_NONE      255	/* Only used by userspace library; not stored on-disk */
 #define LHSR_CHECKSUM_CRC32C    0
 #define LHSR_CHECKSUM_BLAKE3    1
 #define LHSR_CHECKSUM_XXHASH64  2

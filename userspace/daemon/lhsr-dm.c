@@ -20,6 +20,8 @@
 #include <errno.h>
 #include <syslog.h>
 #include <sys/sysmacros.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <libdevmapper.h>
 
 #include "lhsrd.h"
@@ -275,6 +277,38 @@ int lhsr_dm_get_devices(const char *dm_name, char devices[][256], int max_device
 int lhsr_dm_suspend(const char *name)
 {
 	return dm_simple_task(name, DM_DEVICE_SUSPEND);
+}
+
+/*
+ * Convert a "major:minor" string (as returned by lhsr_dm_get_devices())
+ * to a /dev path (e.g. "8:0" -> "/dev/sda", "7:0" -> "/dev/loop0").
+ * Reads the /sys/dev/block/<major>:<minor> symlink to find the kernel name.
+ * Returns 0 on success, -1 on error.
+ */
+int lhsr_dm_resolve_device(const char *majmin, char *path, size_t pathsz)
+{
+	char link[512];
+	char resolved[512];
+	ssize_t len;
+
+	snprintf(link, sizeof(link), "/sys/dev/block/%s", majmin);
+
+	len = readlink(link, resolved, sizeof(resolved) - 1);
+	if (len < 0)
+		return -1;
+	resolved[len] = '\0';
+
+	/* Symlink target is like "../../devices/virtual/block/loop0"
+	 * or "../../devices/pci0000:00/.../block/sda".
+	 * We need just the basename. */
+	const char *base = strrchr(resolved, '/');
+	if (base)
+		base++;
+	else
+		base = resolved;
+
+	snprintf(path, pathsz, "/dev/%s", base);
+	return 0;
 }
 
 int lhsr_dm_resume(const char *name)

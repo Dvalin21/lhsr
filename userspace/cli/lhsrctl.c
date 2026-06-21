@@ -27,39 +27,7 @@
 #include "../../lib/raid_engine.h"
 #include "shr.h"
 
-/*
- * Superblock struct for recovery scanning.
- * This is a local copy to avoid conflicts with raid_engine.h which
- * independently defines some of the same types (lhsr_corruption_entry).
- * The canonical definition lives in include/lhsr.h — keep in sync.
- */
-#define LHSR_MAGIC             "LHSRDISK"
-#define LHSR_MAGIC_LEN         8
-#define LHSR_SB_SECTORS        16
-#define LHSR_SB_VERSION        1
-
-#define LHSR_DISK_HEALTHY      0
-#define LHSR_DISK_DEGRADED     1
-#define LHSR_DISK_FAILED       2
-#define LHSR_DISK_REBUILDING   3
-
-struct lhsr_superblock {
-	__u8  magic[8];
-	__u32 version;
-	__u64 array_uuid;
-	__u64 disk_uuid;
-	__u64 creation_time;
-	__u64 last_update;
-	__u32 disk_index;
-	__u32 disk_state;
-	__u32 raid_type;
-	__u32 disk_count;
-	__u64 total_sectors;
-	__u64 generation;
-	__u32 checksum;
-	__u32 flags;
-	__u8  reserved[44];
-} __attribute__((packed));
+#include "lhsr.h"		/* canonical on-disk format definitions */
 
 #define PROGNAME "lhsrctl"
 #define DM_DEV_PATH "/dev/mapper/control"
@@ -181,7 +149,7 @@ static void usage(const char *prog)
 }
 
 /* Command create */
-static int cmd_create(int argc, char **argv, enum lhsr_raid_type raid_type)
+static int cmd_create(int argc, char **argv, unsigned int raid_type)
 {
 	struct lhsr_context *ctx;
 	struct lhsr_array *arr;
@@ -824,11 +792,18 @@ static int cmd_scrub(int argc, char **argv)
 }
 
 /*
- * CRC32c table-based checksum (userspace copy — matches kernel crypto API)
+ * CRC32c checksum — MUST match kernel crypto API convention.
+ *
+ * The kernel's crc32c_le(seed, buf, len) uses seed=0 and returns the raw
+ * CRC WITHOUT a final XOR.  This is NOT the Castagnoli "standard" which
+ * uses seed=0xFFFFFFFF and XORs 0xFFFFFFFF at the end.
+ *
+ * Verified: kernel __crc32c_le(0, buf, len) computes the same value as
+ * crc32c_le(0, buf) in this function.
  */
 static uint32_t crc32c_calc(uint8_t *buf, size_t len)
 {
-	uint32_t crc = 0xFFFFFFFF;
+	uint32_t crc = 0;
 	static uint32_t table[256];
 	static int table_init = 0;
 	int i, j;
@@ -845,7 +820,7 @@ static uint32_t crc32c_calc(uint8_t *buf, size_t len)
 
 	while (len--)
 		crc = (crc >> 8) ^ table[(crc ^ *buf++) & 0xFF];
-	return crc ^ 0xFFFFFFFF;
+	return crc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1138,10 +1113,25 @@ static int get_dev_sectors(const char *device, uint64_t *sectors)
 	return 0;
 }
 
-/* Superblock locations (must match kernel module) */
-#define REC_SB_SECTORS           LHSR_SB_SECTORS  /* 16 sectors reserved */
-#define REC_SB_PRIMARY(sec)      ((sec) - REC_SB_SECTORS)
-#define REC_SB_BACKUP(sec)       ((sec) - REC_SB_SECTORS + (REC_SB_SECTORS / 2))
+/* Superblock locations — scan both old and kernel v2 positions.
+ *
+ * Kernel v2 metadata layout (per device):
+ *   sector 0 .. disk_sectors-1           user data
+ *   disk_sectors .. +255                 write-hole bitmap (256 sectors)
+ *   disk_sectors+256 .. +271             superblock primary (+ backup)
+ *   disk_sectors+272 .. +271+wib_sectors WIB pages
+ *
+ * The old userspace convention looked at (raw_sectors - 16) which
+ * happens to equal the kernel's BACKUP position for small disks
+ * (WIB=8 sectors).  For large disks with multi-page WIB, the old
+ * position is well past the actual superblock area.
+ *
+ * We scan the entire metadata region at the end of the device for
+ * any valid superblock, picking the one with the highest generation.
+ * Max metadata region scanned = 4096 sectors (2 MB) which covers
+ * disks up to ~32 TB with worst-case WIB.
+ */
+#define REC_SB_SCAN_MAX_SECTORS  4096
 
 /*
  * Scan a single device for an LHSR superblock.
@@ -1149,8 +1139,9 @@ static int get_dev_sectors(const char *device, uint64_t *sectors)
  */
 static void scan_one_device(const char *device, struct disk_info *info)
 {
-	struct lhsr_superblock sb_pri, sb_bak;
-	int have_pri = 0, have_bak = 0;
+	struct lhsr_superblock sb_candidate;
+	int have = 0;
+	uint64_t best_gen = 0;
 
 	memset(info, 0, sizeof(*info));
 	strncpy(info->path, device, sizeof(info->path) - 1);
@@ -1160,25 +1151,28 @@ static void scan_one_device(const char *device, struct disk_info *info)
 		return;
 	}
 
-	have_pri = (read_sb(device, REC_SB_PRIMARY(info->total_sectors), &sb_pri) == 0);
-	have_bak = (read_sb(device, REC_SB_BACKUP(info->total_sectors), &sb_bak) == 0);
+	/* Scan metadata region from the end of device backwards.
+	 * We do a forward scan from (total - REC_SB_SCAN_MAX_SECTORS)
+	 * to total, trying each sector for a valid superblock.
+	 * This handles any WIB size and is robust. */
+	uint64_t start_scan = (info->total_sectors > REC_SB_SCAN_MAX_SECTORS)
+		? (info->total_sectors - REC_SB_SCAN_MAX_SECTORS) : 0;
 
-	if (!have_pri && !have_bak)
+	for (uint64_t s = start_scan; s < info->total_sectors; s++) {
+		if (read_sb(device, s, &sb_candidate) == 0) {
+			/* Found a valid superblock — keep the highest generation */
+			if (!have || sb_candidate.generation > best_gen) {
+				info->sb = sb_candidate;
+				best_gen = sb_candidate.generation;
+				have = 1;
+			}
+		}
+	}
+
+	if (!have)
 		return;
 
 	info->found = 1;
-
-	if (have_pri && have_bak) {
-		/* Use the one with the higher generation */
-		if (sb_pri.generation >= sb_bak.generation)
-			info->sb = sb_pri;
-		else
-			info->sb = sb_bak;
-	} else if (have_pri) {
-		info->sb = sb_pri;
-	} else {
-		info->sb = sb_bak;
-	}
 }
 
 static const char *raid_type_name(unsigned int t)
@@ -1228,6 +1222,59 @@ static void xor_buf_into(unsigned char *dst, const unsigned char *src, size_t le
 		dst[i] ^= src[i];
 }
 
+/* =================================================================
+ * GF(2^8) Reed-Solomon arithmetic for RAID6 reconstruction
+ *
+ * Uses polynomial 0x1d (x^8 + x^4 + x^3 + x^2 + 1) with generator
+ * g=2, matching the kernel RAID6 implementation.  Power table:
+ * rs_power_table[i] = 2^i in GF(2^8).  Discrete log maps back.
+ * ================================================================= */
+
+static uint8_t rs_power_table[256];
+static uint8_t gf_log[256];
+static int rs_initialized;
+
+static void rs_tables_init(void)
+{
+	unsigned int i;
+	if (rs_initialized)
+		return;
+	rs_power_table[0] = 1;
+	for (i = 1; i < 256; i++)
+		rs_power_table[i] = (rs_power_table[i-1] << 1) ^
+			(rs_power_table[i-1] & 0x80 ? 0x1d : 0);
+	memset(gf_log, 0, sizeof(gf_log));
+	for (i = 0; i < 255; i++)
+		gf_log[rs_power_table[i]] = i;
+	rs_initialized = 1;
+}
+
+/* GF(2^8) multiply: shift-and-add (constant-time) */
+static inline uint8_t gf_mul(uint8_t a, uint8_t b)
+{
+	uint8_t prod = 0;
+	uint8_t val = a;
+	while (b) {
+		if (b & 1)
+			prod ^= val;
+		val = (val << 1) ^ (val & 0x80 ? 0x1d : 0);
+		b >>= 1;
+	}
+	return prod;
+}
+
+/* GF(2^8) inverse: 1/a via log/antilog table.  Returns 0 for a=0. */
+static inline uint8_t gf_inv(uint8_t a)
+{
+	unsigned int idx;
+	if (!a)
+		return 0;
+	idx = 255 - gf_log[a];
+	if (idx >= 255)
+		idx = 0;
+	return rs_power_table[idx];
+}
+
 /*
  * Placeholder device name for missing disks.
  * Full name: lhsr_<array_short>_ph_<disk_idx>
@@ -1268,14 +1315,17 @@ static int cmd_reconstruct(int argc, char **argv)
 {
 	const char *output_path = NULL;
 	int chunk_sectors = 8;  /* LHSR_DEFAULT_CHUNK_SECTORS */
+	int target_idx = -1;    /* --target: which disk to reconstruct (auto if unspecified) */
 	int dev_start, dev_count;
 	int i, d, ret = 1;
 	int missing_idx = -1;
+	int n_missing = 0;
 	uint64_t raw_sectors = 0, user_sectors = 0;
 	uint64_t pos;
 	struct disk_info *scanned = NULL;
 	int *fds = NULL;
-	unsigned char *xor_buf = NULL, *read_buf = NULL;
+	unsigned char *xor_buf = NULL, *read_buf = NULL, *tmp_buf = NULL;
+	int *survivor_idx = NULL;
 	size_t buf_size = 1024 * 1024;  /* 1 MB I/O buffer */
 	int out_fd = -1;
 
@@ -1302,6 +1352,19 @@ static int cmd_reconstruct(int argc, char **argv)
 					" 1-4096 sectors\n");
 				return 1;
 			}
+		} else if (strcmp(argv[i], "--target") == 0 ||
+			   strcmp(argv[i], "-t") == 0) {
+			if (i + 1 >= argc) {
+				fprintf(stderr, "Error: --target requires"
+					" a disk index\n");
+				return 1;
+			}
+			target_idx = atoi(argv[++i]);
+			if (target_idx < 0) {
+				fprintf(stderr, "Error: --target must be"
+					" a non-negative disk index\n");
+				return 1;
+			}
 		} else if (argv[i][0] == '-') {
 			fprintf(stderr, "Error: Unknown option '%s'\n",
 				argv[i]);
@@ -1317,12 +1380,14 @@ static int cmd_reconstruct(int argc, char **argv)
 	if (!output_path || dev_count < 2) {
 		fprintf(stderr,
 			"Usage: %s reconstruct [--chunk-size N]"
-			" --output <file> <device>...\n"
+			" [--target N] --output <file> <device>...\n"
 			"Reconstructs a missing disk in a RAID5/6 array"
-			" from N-1 survivors.\n"
+			" from N-1 (or N-2) survivors.\n"
+			"  --target N   Disk index to reconstruct"
+			" (default: auto-detect)\n"
 			"Example:"
 			" %s reconstruct --output /tmp/rec.img"
-			" /dev/sdb /dev/sdc\n",
+			" /dev/sdb /dev/sdc /dev/sdd\n",
 			PROGNAME, PROGNAME);
 		return 1;
 	}
@@ -1407,8 +1472,9 @@ static int cmd_reconstruct(int argc, char **argv)
 			gen = scanned[i].sb.generation;
 	}
 
-	/* ---- Phase 3: Identify missing disk ---- */
+	/* ---- Phase 3: Identify missing disks ---- */
 	unsigned int disk_present[LHSR_MAX_DISKS];
+	int missing_list[LHSR_MAX_DISKS];
 	memset(disk_present, 0, sizeof(disk_present));
 	for (i = 0; i < dev_count; i++) {
 		unsigned int idx = scanned[i].sb.disk_index;
@@ -1420,27 +1486,54 @@ static int cmd_reconstruct(int argc, char **argv)
 		disk_present[idx] = 1;
 	}
 
-	missing_idx = -1;
+	n_missing = 0;
 	for (d = 0; d < (int)disk_count; d++) {
-		if (!disk_present[d]) {
-			if (missing_idx >= 0) {
-				fprintf(stderr, "Error: Multiple missing disks"
-					" (%d and %d).\n"
-					"  Single-disk reconstruction only."
-					"  RAID6 dual-disk needs Reed-Solomon"
-					" (not yet implemented).\n",
-					missing_idx, d);
-				goto out;
-			}
-			missing_idx = d;
-		}
+		if (!disk_present[d])
+			missing_list[n_missing++] = d;
 	}
 
-	if (missing_idx < 0) {
+	if (n_missing == 0) {
 		fprintf(stderr, "Error: All disks present."
 			" No reconstruction needed.\n");
 		goto out;
 	}
+
+	if (raid_type == LHSR_RAID5 && n_missing > 1) {
+		fprintf(stderr, "Error: RAID5 cannot have %d missing disks"
+			" (reconstruction requires N-1 survivors).\n",
+			n_missing);
+		goto out;
+	}
+
+	if (raid_type == LHSR_RAID6 && n_missing > 2) {
+		fprintf(stderr, "Error: RAID6 cannot have %d missing disks"
+			" (reconstruction requires at least N-2 survivors"
+			" with P+Q).\n", n_missing);
+		goto out;
+	}
+
+	/* Pick target: user-specified or first missing */
+	missing_idx = (target_idx >= 0) ? target_idx : missing_list[0];
+
+	if (target_idx >= 0 && disk_present[target_idx]) {
+		fprintf(stderr, "Error: --target disk %d is not missing"
+			" (it is among the survivors).\n", target_idx);
+		goto out;
+	}
+
+	if (disk_present[missing_idx]) {
+		fprintf(stderr, "Error: Target disk %d is present"
+			" (not a survivor).  Pick a missing disk.\n",
+			missing_idx);
+		goto out;
+	}
+
+	if (n_missing == 2 && raid_type == LHSR_RAID6)
+		printf("  Dual-disk recovery: "
+		       "target=disk[%d]  other_missing=disk[%d]\n",
+		       missing_idx,
+		       missing_list[0] == missing_idx ? missing_list[1]
+		       : missing_list[0]);
 
 	/* parity (1 for RAID5, 2 for RAID6) is not needed here because
 	 * right-static layout means XOR of ALL survivors at any byte
@@ -1497,38 +1590,160 @@ static int cmd_reconstruct(int argc, char **argv)
 		}
 	}
 
-	/* ---- Phase 6: Allocate XOR buffers ---- */
+	/* ---- Phase 6: Allocate buffers ---- */
 	xor_buf  = malloc(buf_size);
 	read_buf = malloc(buf_size);
-	if (!xor_buf || !read_buf) {
+	tmp_buf  = malloc(buf_size);
+	if (!xor_buf || !read_buf || !tmp_buf) {
 		fprintf(stderr, "Error: Out of memory\n");
 		goto out_close;
 	}
 
-	/* ---- Phase 7: XOR reconstruct user data area ---- */
+	/* Build survivor disk index mapping */
+	survivor_idx = malloc(dev_count * sizeof(int));
+	if (!survivor_idx) {
+		fprintf(stderr, "Error: Out of memory\n");
+		goto out_close;
+	}
+	for (i = 0; i < dev_count; i++)
+		survivor_idx[i] = scanned[i].sb.disk_index;
+
+	/* Determine if RS decode is needed (RAID6 complex cases) */
+	unsigned int parity = (raid_type == LHSR_RAID6) ? 2 : 1;
+	unsigned int data_disks = disk_count - parity;
+	int q_idx = (int)(data_disks + 1);
+	int need_rs = (raid_type == LHSR_RAID6) &&
+		      (n_missing >= 2 ||			 /* dual-disk */
+		       missing_idx == q_idx ||		 /* Q-target */
+		       !disk_present[(int)data_disks]); /* P-missing */
+	if (need_rs)
+		rs_tables_init();
+
+	/* ---- Phase 7: Reconstruct user data area ---- */
 	uint64_t user_bytes = user_sectors * 512;
-	printf("Reconstructing %llu bytes from %d survivors...\n",
-	       (unsigned long long)user_bytes, dev_count);
+	printf("Reconstructing %llu bytes from %d survivors"
+	       " (RAID%d, %d missing, target=disk[%d])...\n",
+	       (unsigned long long)user_bytes, dev_count,
+	       raid_type == LHSR_RAID5 ? 5 : 6, n_missing, missing_idx);
 
 	for (pos = 0; pos < user_bytes; pos += buf_size) {
 		size_t chunk = buf_size;
 		if (pos + buf_size > user_bytes)
 			chunk = (size_t)(user_bytes - pos);
 
-		memset(xor_buf, 0, chunk);
-		for (i = 0; i < dev_count; i++) {
-			ssize_t r = pread(fds[i], read_buf, chunk,
-					  (off_t)pos);
-			if (r != (ssize_t)chunk) {
-				fprintf(stderr,
-					"\nError: Short read from %s"
-					" at offset %llu"
-					" (got %zd, expected %zu)\n",
-					argv[dev_start + i],
-					(unsigned long long)pos, r, chunk);
-				goto out_close;
+		if (need_rs) {
+			/*
+			 * RS-aware reconstruction: accumulate S (XOR of
+			 * data+P) and T (Q + weighted data), then solve
+			 * for the target disk.
+			 */
+			memset(xor_buf, 0, chunk);
+			memset(tmp_buf, 0, chunk);
+
+			for (i = 0; i < dev_count; i++) {
+				ssize_t r = pread(fds[i], read_buf,
+						  chunk, (off_t)pos);
+				if (r != (ssize_t)chunk) {
+					fprintf(stderr,
+						"\nError: Short read from %s"
+						" at offset %llu\n",
+						argv[dev_start + i],
+						(unsigned long long)pos);
+					goto out_close;
+				}
+
+				int idx = survivor_idx[i];
+				/* S: accumulate data + P */
+				if (idx < (int)data_disks ||
+				    idx == (int)data_disks)
+					xor_buf_into(xor_buf, read_buf,
+						     chunk);
+				/* T: accumulate weighted data + Q */
+				if (idx < (int)data_disks) {
+					uint8_t coeff =
+						rs_power_table[idx];
+					size_t j;
+					for (j = 0; j < chunk; j++)
+						tmp_buf[j] ^=
+							gf_mul(read_buf[j],
+							       coeff);
+				} else if (idx == q_idx) {
+					xor_buf_into(tmp_buf, read_buf,
+						     chunk);
+				}
 			}
-			xor_buf_into(xor_buf, read_buf, chunk);
+
+			/* Solve for target (xor_buf=S, tmp_buf=T) */
+			if (missing_idx == q_idx &&
+			    n_missing == 1) {
+				/* Q target, all data alive: T = Q */
+				memcpy(xor_buf, tmp_buf, chunk);
+			} else if (!disk_present[(int)data_disks] &&
+				   disk_present[q_idx] &&
+				   n_missing == 1) {
+				/* P dead, Q alive, 1 data missing:
+				 * D_t = inv(g^t) * T */
+				uint8_t inv_g =
+					gf_inv(rs_power_table[missing_idx]);
+				size_t j;
+				for (j = 0; j < chunk; j++)
+					xor_buf[j] = gf_mul(tmp_buf[j],
+							    inv_g);
+			} else if (n_missing >= 2 &&
+				   disk_present[(int)data_disks] &&
+				   disk_present[q_idx]) {
+				/* Vandermonde 2x2: P+Q alive,
+				 * 2+ data missing */
+				int other_failed = -1;
+				for (d = 0; d < n_missing; d++) {
+					if (missing_list[d] !=
+					    missing_idx &&
+					    missing_list[d] <
+					    (int)data_disks) {
+						other_failed =
+							missing_list[d];
+						break;
+					}
+				}
+				if (other_failed >= 0) {
+					uint8_t coeff_o =
+					    rs_power_table[other_failed];
+					uint8_t det =
+					    rs_power_table[missing_idx]
+					    ^ coeff_o;
+					uint8_t inv_det = gf_inv(det);
+					size_t j;
+					for (j = 0; j < chunk; j++) {
+						uint8_t s = xor_buf[j];
+						uint8_t t = tmp_buf[j];
+						xor_buf[j] =
+						    gf_mul(gf_mul(coeff_o,
+								  s) ^ t,
+							   inv_det);
+					}
+				}
+			}
+			/* else: xor_buf = S = target already
+			 * (single data missing, P alive) */
+		} else {
+			/* Simple XOR: exclude Q for RAID6 */
+			memset(xor_buf, 0, chunk);
+			for (i = 0; i < dev_count; i++) {
+				ssize_t r = pread(fds[i], read_buf,
+						  chunk, (off_t)pos);
+				if (r != (ssize_t)chunk) {
+					fprintf(stderr,
+						"\nError: Short read from %s"
+						" at offset %llu\n",
+						argv[dev_start + i],
+						(unsigned long long)pos);
+					goto out_close;
+				}
+				if (raid_type == LHSR_RAID6 &&
+				    survivor_idx[i] == q_idx)
+					continue; /* Q excluded */
+				xor_buf_into(xor_buf, read_buf, chunk);
+			}
 		}
 
 		ssize_t w = pwrite(out_fd, xor_buf, chunk, (off_t)pos);
@@ -1568,8 +1783,19 @@ static int cmd_reconstruct(int argc, char **argv)
 		sb.checksum    = 0;
 		sb.checksum    = crc32c_calc((uint8_t *)&sb, sizeof(sb));
 
-		off_t sb_pri = (off_t)((raw_sectors - LHSR_SB_SECTORS) * 512);
-		off_t sb_bak = (off_t)((raw_sectors - LHSR_SB_SECTORS
+		/*
+		 * Write position MUST match the kernel module's layout:
+		 *   primary = disk_sectors + LHSR_BITMAP_TOTAL_SECTORS
+		 *   backup  = primary + (LHSR_SB_SECTORS / 2)
+		 * where disk_sectors = user_sectors (sb.total_sectors).
+		 *
+		 * Old code used (raw_sectors - 16) which put the superblock
+		 * in the wrong position (array assembly would fail).
+		 * Fixed 2026-06-20: use kernel's convention.
+		 */
+		off_t sb_pri = (off_t)((user_sectors + LHSR_BITMAP_TOTAL_SECTORS)
+				      * 512);
+		off_t sb_bak = (off_t)((user_sectors + LHSR_BITMAP_TOTAL_SECTORS
 					+ LHSR_SB_SECTORS / 2) * 512);
 
 		if (pwrite(out_fd, &sb, sizeof(sb), sb_pri) != sizeof(sb))
@@ -1586,8 +1812,14 @@ static int cmd_reconstruct(int argc, char **argv)
 	/* ---- Phase 9: Report success ---- */
 	for (i = 0; i < dev_count; i++) close(fds[i]);
 	free(fds);
+	free(survivor_idx);
+	survivor_idx = NULL;
 	free(xor_buf);
+	xor_buf = NULL;
 	free(read_buf);
+	read_buf = NULL;
+	free(tmp_buf);
+	tmp_buf = NULL;
 	close(out_fd);
 	out_fd = -1;
 
@@ -1614,8 +1846,10 @@ out_close:
 			if (fds[i] > 0) close(fds[i]);
 		free(fds);
 	}
+	free(survivor_idx);
 	free(xor_buf);
 	free(read_buf);
+	free(tmp_buf);
 out:
 	free(scanned);
 	return ret;
@@ -1912,7 +2146,7 @@ int main(int argc, char **argv)
 {
 	int cmd = CMD_NONE;
 	const char *raid_type_str = NULL;
-	enum lhsr_raid_type raid_type = LHSR_RAID5;
+	unsigned int raid_type = LHSR_RAID5;
 	int ret;
 
 	if (argc < 2) {
