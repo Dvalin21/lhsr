@@ -104,6 +104,8 @@ static int lhsr_bitmap_load(struct lhsr_array *arr);
 static int lhsr_bitmap_recover(struct lhsr_array *arr);
 static int lhsr_bitmap_set(struct lhsr_array *arr, sector_t chunk_start);
 static int lhsr_bitmap_clear(struct lhsr_array *arr, sector_t chunk_start);
+static void lhsr_bitmap_flush(struct lhsr_array *arr);
+static void lhsr_bitmap_work(struct work_struct *work);
 
 /* Write-intent bitmap (WIB) functions */
 static int lhsr_wib_init(struct lhsr_array *arr);
@@ -145,16 +147,17 @@ static int lhsr_module_exiting;
  *   7 = PHASE_DONE           (complete orig_bio + cleanup)
  */
 /*
- * RAID5/6 RMW work item — executed on the ordered rmw_wq.
+ * RAID5/6 RMW work item — executed on the WQ_UNBOUND rmw_wq
+ * (max_active=8, per-array).  The per-stripe mutex hash
+ * (stripe_locks[], 128 buckets) serializes writes to the SAME
+ * stripe for write-hole safety.  Different stripes run concurrently
+ * across CPUs via the WQ_UNBOUND workqueue.
  *
- * Each work item does the full RMW cycle synchronously:
+ * Each work item does the full RMW cycle synchronously on one worker:
  *   read old data → read P parity → (RAID6) read Q parity →
  *   compute new data + new P + new Q →
  *   write new data → write P → (RAID6) write Q →
  *   complete orig_bio
- *
- * The ordered workqueue ensures only ONE RMW runs at a time,
- * eliminating the write hole (concurrent parity updates).
  */
 struct lhsr_rmw_work {
 	struct work_struct work;
@@ -533,8 +536,8 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 
 		kunmap_local(kaddr);
 
-		DMINFO("read_endio: slot=%u disk=%u non_zero_first64=%d bio_size=%zu",
-		       slot, ctx->disk_map[slot], non_zero, ctx->bio_size);
+		DMDEBUG("read_endio: slot=%u disk=%u non_zero_first64=%d bio_size=%zu",
+		        slot, ctx->disk_map[slot], non_zero, ctx->bio_size);
 
 		/* Free our per-clone page (not shared, safe to free here) */
 		if (ctx->pages && slot < ctx->num_slots && ctx->pages[slot]) {
@@ -577,8 +580,8 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 				}
 			}
 
-			DMINFO("RECON complete: pending=0 failed_count=%u all_bufs_valid=%d num_slots=%u",
-			       failed_count, all_bufs_valid, ctx->num_slots);
+			DMDEBUG("RECON complete: pending=0 failed_count=%u all_bufs_valid=%d num_slots=%u",
+			        failed_count, all_bufs_valid, ctx->num_slots);
 
 			if (all_bufs_valid) {
 				unsigned long fd_local = lhsr_failed_disks_get(arr);
@@ -613,7 +616,7 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 						if (d < dd || d == p_idx)
 							xor_slots[xor_count++] = ctx->data_bufs[j];
 					}
-					DMINFO("RECON XOR: xor_count=%u", xor_count);
+					DMDEBUG("RECON XOR: xor_count=%u", xor_count);
 					lhsr_xor_parity(ctx->recon_buf,
 							 (void **)xor_slots, xor_count, bio_size);
 				} else if (failed_count >= 1 && is_raid6) {
@@ -624,8 +627,8 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 								       failed_count,
 								       ctx, bio_size);
 					if (rs_ret == 0) {
-						DMINFO("RECON RS decode: target=%u failed=%u",
-						       ctx->target_disk, failed_count);
+						DMDEBUG("RECON RS decode: target=%u failed=%u",
+						        ctx->target_disk, failed_count);
 					} else {
 						DMERR("RAID6: RS decode failed (%d) for %u disks",
 						      rs_ret, failed_count);
@@ -653,8 +656,8 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 						if (tmp[k]) non_zero++;
 					}
 				}
-				DMINFO("RECON XOR: recon_buf non_zero_first64=%d bio_size=%zu",
-				       non_zero, bio_size);
+				DMDEBUG("RECON XOR: recon_buf non_zero_first64=%d bio_size=%zu",
+				        non_zero, bio_size);
 				bio_for_each_segment(bv, ctx->orig_bio, iter) {
 					void *kaddr = kmap_local_page(bv.bv_page);
 					void *dst = kaddr + bv.bv_offset;
@@ -1004,7 +1007,7 @@ static void __used disk_check_work(struct work_struct *work)
 		return;
 	}
 
-	DMINFO("Running periodic disk health check");
+	DMDEBUG("Running periodic disk health check");
 
 	for (i = 0; i < arr->disks; i++) {
 		if (lhsr_failed_disks_get(arr) & (1 << i))
@@ -2477,10 +2480,12 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 
 	/* Create workqueue for RAID5/6 RMW writes — up to 8 concurrent workers.
 	 * Per-stripe mutexes prevent concurrent writes to the SAME stripe.
-	 * Different stripes run in parallel, eliminating the single-worker bottleneck
-	 * while preserving the write-hole safety guarantee per-stripe.
+	 * Different stripes run in parallel across CPUs, eliminating the single-worker
+	 * bottleneck while preserving the write-hole safety guarantee per-stripe.
+	 * 32 workers allows the NVMe controller to pipeline ~8 concurrent I/Os,
+	 * essential for saturating modern devices with deep NCQ queues.
 	 */
-	arr->rmw_wq = alloc_workqueue("lhsr_rmw_%s", WQ_UNBOUND | WQ_MEM_RECLAIM, 8,
+	arr->rmw_wq = alloc_workqueue("lhsr_rmw_%s", WQ_UNBOUND | WQ_MEM_RECLAIM, 32,
 				       arr->disk[0] && arr->disk[0]->bd_disk ?
 				       arr->disk[0]->bd_disk->disk_name : "unknown");
 	if (!arr->rmw_wq) {
@@ -2510,6 +2515,25 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	r = lhsr_bitmap_recover(arr);
 	if (r)
 		DMWARN("ctr: Bitmap recovery failed (%d), continuing", r);
+
+	/* Create workqueue for background bitmap flush (2s interval).
+	 * The bitmap is write-behind: in-memory bits are always current;
+	 * disk copies may lag by up to ~2 seconds.  On crash, the WIB
+	 * protects in-flight writes, so stale bitmap bits only cause
+	 * extra consistency verification on next assembly — never data loss.
+	 */
+	arr->bitmap_wq = alloc_workqueue("lhsr_bmp_%s", WQ_MEM_RECLAIM | WQ_UNBOUND, 1,
+					 arr->disk[0] && arr->disk[0]->bd_disk ?
+					 arr->disk[0]->bd_disk->disk_name : "unknown");
+	if (!arr->bitmap_wq) {
+		DMERR("ctr: Failed to create bitmap flush workqueue");
+		ti->error = "Failed to create bitmap flush workqueue";
+		r = -ENOMEM;
+		goto bad;
+	}
+	INIT_DELAYED_WORK(&arr->bitmap_work, lhsr_bitmap_work);
+	queue_delayed_work(arr->bitmap_wq, &arr->bitmap_work, 2 * HZ);
+	DMINFO("ctr: Bitmap background flush workqueue created (2s interval)");
 
 	/* Initialize write-intent bitmap (WIB) for incremental rebuild.
 	 * This allocates memory and tries to load from disk.
@@ -2568,6 +2592,12 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	return 0;
 
 bad:
+	/* Cancel background bitmap flush before destroying pages */
+	if (arr->bitmap_wq) {
+		cancel_delayed_work_sync(&arr->bitmap_work);
+		destroy_workqueue(arr->bitmap_wq);
+		arr->bitmap_wq = NULL;
+	}
 	lhsr_bitmap_destroy(arr);
 	while (i > 0) {
 		i--;
@@ -2710,6 +2740,25 @@ static void lhsr_dtr(struct dm_target *ti)
 
 	/* Flush and free write-intent bitmap (WIB) */
 	lhsr_wib_destroy(arr);
+
+	/* Final flush of any dirty bitmap pages that the background
+	 * worker may not have written yet.  This must happen BEFORE
+	 * canceling the workqueue: after the cancel, no more writes
+	 * will occur, and the pages would be discarded.
+	 */
+	lhsr_bitmap_flush(arr);
+
+	/* Stop background bitmap flush worker */
+	DMINFO("dtr: Stopping bitmap flush workqueue (bitmap_wq=%p)", arr->bitmap_wq);
+	if (arr->bitmap_wq) {
+		if (!cancel_delayed_work_sync(&arr->bitmap_work)) {
+			DMWARN("dtr: bitmap_work did not complete, forcing");
+			flush_workqueue(arr->bitmap_wq);
+		}
+		destroy_workqueue(arr->bitmap_wq);
+		arr->bitmap_wq = NULL;
+		DMINFO("dtr: Bitmap workqueue destroyed");
+	}
 
 	/* Flush and free write-hole journal bitmap */
 	lhsr_bitmap_destroy(arr);
@@ -2972,8 +3021,10 @@ static int lhsr_bitmap_write_page(struct lhsr_array *arr,
 {
 	struct page *page = arr->bitmap_pages[page_idx];
 	struct lhsr_bitmap_page *bmp;
-	unsigned int d, ok_count = 0, fail_count = 0;
-	int ret = -EIO;
+	unsigned int d, nr_bios = 0, submitted = 0;
+	int ret = 0;
+	struct lhsr_parallel_io pio;
+	unsigned int failed = lhsr_failed_disks_get(arr);
 
 	if (!page) {
 		DMERR("bitmap: write_page %u: page is NULL", page_idx);
@@ -2991,47 +3042,117 @@ static int lhsr_bitmap_write_page(struct lhsr_array *arr,
 
 	kunmap_local(bmp);
 
-	/* Write to ALL available disks */
+	/* Count non-failed disks for parallel submit */
 	for (d = 0; d < arr->disks; d++) {
-		blk_status_t st;
+		if (!(failed & (1 << d)) && arr->disk[d])
+			nr_bios++;
+	}
 
-		/* Skip failed or missing disks */
-		if (lhsr_failed_disks_get(arr) & (1 << d))
+	if (nr_bios == 0) {
+		DMERR("bitmap: write_page %u: no valid disks", page_idx);
+		return -EIO;
+	}
+
+	/* Submit same page to all disks in parallel using the same
+	 * lhsr_submit_parallel helper that the data write phase uses.
+	 * This sends one bio per disk, all concurrently, and waits once.
+	 *
+	 * NOTE: lhsr_submit_parallel adds arr->disk_offset[d] to the sector,
+	 * so we pass the bitmap position RELATIVE to disk_offset (just the
+	 * data-area part + page offset), NOT the full absolute sector.
+	 * This differs from lhsr_submit_bio_sync which expects the full sector.
+	 */
+	init_completion(&pio.done);
+	pio.status = BLK_STS_OK;
+	atomic_set(&pio.pending, nr_bios);
+
+	for (d = 0; d < arr->disks; d++) {
+		sector_t bitmap_sector;
+
+		if (failed & (1 << d))
 			continue;
 		if (!arr->disk[d])
 			continue;
 
-		st = lhsr_submit_bio_sync(arr->disk[d], page, 4096,
-			lhsr_bitmap_page_sector(arr, page_idx, d),
-			REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
+		/* Sector relative to disk_offset[0]:
+		 * disk_sectors (data area) + page index * sectors-per-page
+		 * lhsr_submit_parallel will add disk_offset[d] internally.
+		 */
+		bitmap_sector = arr->disk_sectors
+			+ page_idx * LHSR_BITMAP_PAGE_SECTORS;
 
-		if (st == BLK_STS_OK) {
-			ok_count++;
-		} else {
-			DMERR("bitmap: write_page %u to disk %u failed: %d",
-			      page_idx, d, st);
-			fail_count++;
-		}
+		if (lhsr_submit_parallel(arr, d, page, 4096,
+				bitmap_sector,
+				REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio) == 0)
+			submitted++;
 	}
 
-	if (ok_count == 0) {
-		DMERR("bitmap: write_page %u FAILED on ALL %u disks",
-		      page_idx, arr->disks);
+	wait_for_completion_io(&pio.done);
+
+	if (submitted == 0) {
+		DMERR("bitmap: write_page %u: all %u bios failed to submit",
+		      page_idx, nr_bios);
+		return -EIO;
+	}
+
+	if (pio.status != BLK_STS_OK) {
+		DMERR("bitmap: write_page %u: disk write failed (status=%d)",
+		      page_idx, pio.status);
 		ret = -EIO;
-	} else {
-		if (fail_count > 0)
-			DMWARN("bitmap: write_page %u: %u/%u disks succeeded",
-			       page_idx, ok_count, arr->disks);
-		clear_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[page_idx]);
-		ret = 0;
 	}
 
+	clear_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[page_idx]);
 	return ret;
 }
 
 /* ---------------------------------------------------------------- */
-/* Set a dirty bit for a region and write the page to all disks     */
+/* Flush all dirty bitmap pages to disk.                            */
+/* Called by the background flush worker and on array destruction.  */
+/* ---------------------------------------------------------------- */
+static void lhsr_bitmap_flush(struct lhsr_array *arr)
+{
+	unsigned int i;
+
+	if (!arr)
+		return;
+
+	for (i = 0; i < LHSR_BITMAP_PAGES; i++) {
+		if (arr->bitmap_pages[i] &&
+		    test_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[i]))
+			lhsr_bitmap_write_page(arr, i);
+	}
+}
+
+/* ---------------------------------------------------------------- */
+/* Background bitmap flush worker — writes dirty pages to disk.     */
+/* Runs periodically (every 2 seconds) when the array is active.    */
+/* The bitmap is only used for crash recovery efficiency; the WIB    */
+/* protects in-flight writes.  A stale bitmap (missing recent         */
+/* clears) just means extra parity verification on next assembly,    */
+/* never data loss.  Hence the relaxed ~2s flush interval.           */
+/* ---------------------------------------------------------------- */
+static void lhsr_bitmap_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct lhsr_array *arr = container_of(dwork, struct lhsr_array, bitmap_work);
+
+	/* Bail if array is being destroyed */
+	if (atomic_read(&arr->destroying))
+		return;
+
+	DMDEBUG("bitmap_work: starting periodic flush");
+	lhsr_bitmap_flush(arr);
+	DMDEBUG("bitmap_work: periodic flush complete");
+
+	/* Re-schedule if workqueue still exists */
+	if (arr->bitmap_wq)
+		queue_delayed_work(arr->bitmap_wq, &arr->bitmap_work, 2 * HZ);
+}
+
+/* ---------------------------------------------------------------- */
+/* Set a dirty bit for a region in memory.                          */
 /* Called BEFORE writing data+parity to mark intent.                */
+/* The actual disk write is deferred to the background flush worker.*/
 /* ---------------------------------------------------------------- */
 static int lhsr_bitmap_set(struct lhsr_array *arr, sector_t chunk_start)
 {
@@ -3066,16 +3187,13 @@ static int lhsr_bitmap_set(struct lhsr_array *arr, sector_t chunk_start)
 	kunmap_local(bmp);
 
 	set_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[page_idx]);
-
-	DMINFO("bitmap: SET region=%llu page=%u bit=%u chunk_start=%llu",
-		(u64)region, page_idx, bit_idx, (u64)chunk_start);
-
-	return lhsr_bitmap_write_page(arr, page_idx);
+	return 0;
 }
 
 /* ---------------------------------------------------------------- */
-/* Clear a dirty bit for a region and write the page to all disks   */
+/* Clear a dirty bit for a region in memory.                        */
 /* Called AFTER data+parity are fully committed.                    */
+/* The actual disk write is deferred to the background flush worker.*/
 /* ---------------------------------------------------------------- */
 static int lhsr_bitmap_clear(struct lhsr_array *arr, sector_t chunk_start)
 {
@@ -3101,8 +3219,7 @@ static int lhsr_bitmap_clear(struct lhsr_array *arr, sector_t chunk_start)
 	kunmap_local(bmp);
 
 	set_bit(LHSR_BITMAP_FLAG_DIRTY, &arr->bitmap_flags[page_idx]);
-
-	return lhsr_bitmap_write_page(arr, page_idx);
+	return 0;
 }
 
 /* ---------------------------------------------------------------- */
@@ -3738,9 +3855,9 @@ static void lhsr_wib_work(struct work_struct *work)
 		return;
 	}
 
-	DMINFO("wib_work: starting periodic WIB flush");
+	DMDEBUG("wib_work: starting periodic WIB flush");
 	lhsr_wib_flush(arr);
-	DMINFO("wib_work: periodic WIB flush complete");
+	DMDEBUG("wib_work: periodic WIB flush complete");
 
 	/* Re-schedule if workqueue still exists */
 	if (arr->wib_wq)
@@ -3945,7 +4062,7 @@ out_free_meta:
 	arr->wib_nbits = 0;
 }
 
-/* Synchronous RMW worker — executes on ordered rmw_wq (one at a time) */
+/* RMW worker — runs on WQ_UNBOUND rmw_wq (max_active=8) */
 static void lhsr_rmw_worker(struct work_struct *work)
 {
 	struct lhsr_rmw_work *rmw = container_of(work, struct lhsr_rmw_work, work);
@@ -3957,6 +4074,9 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	struct page *parity_page = NULL;
 	struct page *new_data_page = NULL;
 	struct page *q_parity_page = NULL;
+
+	ktime_t tm0, tm1, tm2, tm3, tm_bs;
+	static DEFINE_RATELIMIT_STATE(rmw_rs, 1 * HZ, 10);
 
 	size_t chunk_bytes = rmw->chunk_bytes;
 	unsigned int data_disks = rmw->data_disks;
@@ -4009,6 +4129,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	lock_idx = (chunk_start >> 3) & (LHSR_STRIPE_LOCKS - 1);
 	mutex_lock(&arr->stripe_locks[lock_idx]);
 	locked = true;
+	tm0 = ktime_get();
 
 	/* Parallel read phase: count bios first, set pending, submit all, wait once.
 	 * Counting BEFORE submission prevents a race where a bio completes
@@ -4051,6 +4172,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		/* Wait for all submitted reads */
 		if (nr_reads > 0)
 			wait_for_completion_io(&pio.done);
+		tm1 = ktime_get();
 		if (pio.status != BLK_STS_OK) {
 			DMERR("RMW worker: parallel read phase failed "
 			      "(status=%d)", pio.status);
@@ -4111,6 +4233,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		kunmap_local(parity);
 		kunmap_local(old_data);
 	}
+	tm2 = ktime_get();  /* after compute */
 
 	/*
 	 * Mark intent in write-hole journal BEFORE modifying data/parity.
@@ -4119,6 +4242,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	 */
 	if (lhsr_bitmap_set(arr, chunk_start))
 		DMWARN("RMW: bitmap_set failed for chunk %llu", (u64)chunk_start);
+	tm_bs = ktime_get();
 
 	/* Parallel write phase: submit all writes at once, wait once.
 	 * REQ_FUA forces each write to stable storage.  Submitting all
@@ -4161,13 +4285,15 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		/* Wait for all submitted writes */
 		if (nr_writes > 0)
 			wait_for_completion_io(&pio.done);
+		tm3 = ktime_get();
+
 		if (pio.status != BLK_STS_OK) {
 			DMERR("RMW worker: parallel write phase failed "
 			      "(status=%d)", pio.status);
 			status = pio.status;
 			goto out;
 		}
-	}
+	} /* end of parallel write phase block */
 
 	/* All writes committed — clear the dirty bit */
 	if (lhsr_bitmap_clear(arr, chunk_start))
@@ -4181,6 +4307,18 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	 * same WIB bit — clearing once is correct.
 	 */
 	lhsr_wib_clear(arr, chunk_start);
+
+	if (__ratelimit(&rmw_rs)) {
+		long d_rd = ktime_us_delta(tm1, tm0);
+		long d_cpu = ktime_us_delta(tm2, tm1);
+		long d_bs = ktime_us_delta(tm_bs, tm2);
+		long d_wr = ktime_us_delta(tm3, tm_bs);
+		long d_bmp = ktime_us_delta(ktime_get(), tm3);
+		long dt = ktime_us_delta(ktime_get(), tm0);
+		DMDEBUG("RMW timing: chunk=%llu rd=%ld cpu=%ld "
+		        "bs=%ld wr=%ld bmp=%ld total=%ld",
+		        (u64)chunk_start, d_rd, d_cpu, d_bs, d_wr, d_bmp, dt);
+	}
 
 out:
 	if (locked)
@@ -4515,7 +4653,7 @@ passthrough_single:
 			struct lhsr_rmw_work *rmw;
 			size_t chunk_bytes = (size_t)chunk_sects << SECTOR_SHIFT;
 
-			DMINFO("RAID5/6 write: offset=%llu data_disk=%u chunk_start=%llu bio_bytes=%u",
+			DMDEBUG("RAID5/6 write: offset=%llu data_disk=%u chunk_start=%llu bio_bytes=%u",
 				(u64)offset, data_disk, (u64)chunk_start,
 				bio->bi_iter.bi_size);
 
@@ -4572,9 +4710,9 @@ passthrough_single:
 			unsigned int j;
 			sector_t stripe_sector;
 
-			DMINFO("RECON: target_disk=%u failed_mask=0x%lx data_disks=%u chunk_start=%llu offset_in_chunk=%llu",
-			       target_disk, lhsr_failed_disks_get(arr), data_disks,
-			       (u64)chunk_start, (u64)(offset % chunk_sects));
+			DMDEBUG("RECON: target_disk=%u failed_mask=0x%lx data_disks=%u chunk_start=%llu offset_in_chunk=%llu",
+			        target_disk, lhsr_failed_disks_get(arr), data_disks,
+			        (u64)chunk_start, (u64)(offset % chunk_sects));
 
 			/* Count working survivors (data + parity) */
 			for (i = 0; i < arr->disks; i++) {
@@ -4605,7 +4743,7 @@ passthrough_single:
 					total_slots++;
 			}
 
-			DMINFO("RECON: working=%u total_slots=%u", working, total_slots);
+			DMDEBUG("RECON: working=%u total_slots=%u", working, total_slots);
 
 			/* Allocate read context with flex array for disk_map */
 			ctx = kzalloc(sizeof(*ctx) + sizeof(unsigned int) * total_slots, GFP_NOIO);
@@ -4695,8 +4833,8 @@ passthrough_single:
 			unsigned int submitted = 0;
 			int alloc_failed = 0;
 
-			DMINFO("RECON clone setup: orig_bio_size=%zu ctx_bio_size=%zu chunk_bytes=%zu",
-			       (size_t)bio->bi_iter.bi_size, ctx->bio_size, (size_t)chunk_sects << SECTOR_SHIFT);
+			DMDEBUG("RECON clone setup: orig_bio_size=%zu ctx_bio_size=%zu chunk_bytes=%zu",
+			        (size_t)bio->bi_iter.bi_size, ctx->bio_size, (size_t)chunk_sects << SECTOR_SHIFT);
 
 			for (i = 0; i < ctx->num_slots; i++) {
 				struct bio *recon_bio;

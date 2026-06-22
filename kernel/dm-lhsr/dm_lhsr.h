@@ -141,6 +141,8 @@ struct lhsr_array {
 	unsigned long bitmap_flags[LHSR_BITMAP_PAGES];	/* Bit 0 = dirty */
 	u64 bitmap_seqs[LHSR_BITMAP_PAGES];		/* Current seq per page */
 	atomic_t bitmap_recovering;			/* 1 = recovery in progress */
+	struct workqueue_struct *bitmap_wq;		/* Background bitmap flush workqueue */
+	struct delayed_work bitmap_work;		/* Background bitmap flush work */
 
 	/* Write-intent bitmap (WIB) — persistent on-disk bitmap for
 	 * incremental rebuild.  Tracks which 1MB regions were written to
