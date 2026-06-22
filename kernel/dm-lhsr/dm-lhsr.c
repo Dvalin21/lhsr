@@ -5366,25 +5366,34 @@ static int __init lhsr_init(void)
 static void __exit lhsr_exit(void)
 {
 	int waited = 0;
-	const int max_wait = 30; /* Maximum 30 seconds */
 
 	DMINFO("Module unload: Setting exiting flag");
 	lhsr_module_exiting = 1;
 
-	/* Wait for active devices to drain */
-	DMINFO("Module unload: Waiting for active devices (current: %d)",
-	       atomic_read(&lhsr_active_devices));
-	while (atomic_read(&lhsr_active_devices) > 0 && waited < max_wait) {
-		DMWARN("Module unload: Waiting for %d active device(s)...",
-		       atomic_read(&lhsr_active_devices));
+	/* Wait for active devices to drain — no timeout.
+	 * Calling dm_unregister_target() with active devices causes a DM rwsem
+	 * deadlock: the stuck ioctl path holds _lock for READ, and
+	 * dm_unregister_target needs it for WRITE.  Never force unload while
+	 * devices are active — print periodic warnings instead.
+	 *
+	 * Remove all LHSR DM devices first:
+	 *   # dmsetup remove <device>
+	 *   # or: dmsetup remove_all
+	 */
+	while (atomic_read(&lhsr_active_devices) > 0) {
+		if (waited < 10) {
+			DMINFO("Module unload: Waiting for active devices (current: %d)",
+			       atomic_read(&lhsr_active_devices));
+		} else if (waited % 10 == 0) {
+			DMERR("Module unload: Still waiting for %d active device(s)! "
+			      "Remove all LHSR devices first (dmsetup remove_all).",
+			      atomic_read(&lhsr_active_devices));
+		}
 		msleep(1000);
 		waited++;
 	}
 
-	if (atomic_read(&lhsr_active_devices) > 0) {
-		DMERR("Module unload: Timed out waiting for %d active device(s)! Forcing unload.",
-		      atomic_read(&lhsr_active_devices));
-	}
+	DMINFO("Module unload: All devices drained after %ds", waited);
 
 	/* Now safe to unregister and cleanup */
 	/* rcu_barrier() required before dm_unregister_target() in 6.12+ kernels
