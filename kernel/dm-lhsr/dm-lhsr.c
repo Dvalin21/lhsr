@@ -2197,16 +2197,15 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	/*
-	 * CRITICAL CONSTRAINT: RMW write path (lhsr_rmw_submit_write)
-	 * allocates one bio with one page per chunk.  If chunk_bytes
-	 * exceeds PAGE_SIZE, bio_add_page() will fail silently.
-	 * This is a hard structural limit until the RMW path is
-	 * reworked for multi-page bios.
+	 * Chunk size limit: the RMW path uses compound pages
+	 * (alloc_pages with order) and bio_add_page, which supports
+	 * segments up to q->limits.max_segment_size (typically 64KB).
+	 * 128 sectors = 64KB chunk — the md/RAID5 default.
 	 */
-	if (arr->chunk_sectors * 512 > PAGE_SIZE) {
-		DMERR("chunk_sectors=%u too large: chunk_bytes=%u > PAGE_SIZE=%lu",
-		      arr->chunk_sectors, arr->chunk_sectors * 512, PAGE_SIZE);
-		ti->error = "chunk_sectors too large for PAGE_SIZE";
+	if (arr->chunk_sectors > 128) {
+		DMERR("chunk_sectors=%u too large: chunk_bytes=%u > 64KB limit",
+		      arr->chunk_sectors, arr->chunk_sectors * 512);
+		ti->error = "chunk_sectors too large (max 128 = 64KB)";
 		r = -EINVAL;
 		goto bad;
 	}
@@ -4088,20 +4087,28 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	unsigned int q_disk = data_disks + 1;	/* Q parity index (RAID6) */
 	unsigned int lock_idx;			/* Per-stripe mutex hash index */
 	bool locked = false;			/* Did we acquire the stripe lock? */
+	unsigned int chunk_order;		/* alloc_pages order for chunk */
 
-	/* Allocate page buffers (process context, can use GFP_NOIO) */
-	old_data_page = alloc_page(GFP_NOIO);
-	parity_page = alloc_page(GFP_NOIO);
-	new_data_page = alloc_page(GFP_NOIO);
+	/* Allocate compound page buffers for the full chunk size.
+	 * alloc_pages with order > 0 gives physically-contiguous
+	 * compound pages that bio_add_page can add as a single
+	 * segment (up to max_segment_size, typically 64 KB).
+	 * Uses GFP_NOIO because we're in a workqueue context
+	 * that may be called during block I/O (no reclaim recursion).
+	 */
+	chunk_order = get_order(chunk_bytes);
+	old_data_page = alloc_pages(GFP_NOIO, chunk_order);
+	parity_page = alloc_pages(GFP_NOIO, chunk_order);
+	new_data_page = alloc_pages(GFP_NOIO, chunk_order);
 	if (!old_data_page || !parity_page || !new_data_page) {
-		DMERR("RMW worker: page allocation failed");
+		DMERR("RMW worker: page allocation failed (order=%u)", chunk_order);
 		status = BLK_STS_RESOURCE;
 		goto out;
 	}
 	if (parity_disks > 1) {
-		q_parity_page = alloc_page(GFP_NOIO);
+		q_parity_page = alloc_pages(GFP_NOIO, chunk_order);
 		if (!q_parity_page) {
-			DMERR("RMW worker: Q parity page allocation failed");
+			DMERR("RMW worker: Q parity page allocation failed (order=%u)", chunk_order);
 			status = BLK_STS_RESOURCE;
 			goto out;
 		}
@@ -4323,14 +4330,15 @@ static void lhsr_rmw_worker(struct work_struct *work)
 out:
 	if (locked)
 		mutex_unlock(&arr->stripe_locks[lock_idx]);
+	/* Free compound pages — must pass the order from allocation */
 	if (old_data_page)
-		__free_page(old_data_page);
+		__free_pages(old_data_page, chunk_order);
 	if (parity_page)
-		__free_page(parity_page);
+		__free_pages(parity_page, chunk_order);
 	if (new_data_page)
-		__free_page(new_data_page);
+		__free_pages(new_data_page, chunk_order);
 	if (q_parity_page)
-		__free_page(q_parity_page);
+		__free_pages(q_parity_page, chunk_order);
 
 	orig->bi_status = status;
 	bio_endio(orig);
