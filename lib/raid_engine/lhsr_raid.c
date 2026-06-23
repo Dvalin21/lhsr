@@ -1360,8 +1360,9 @@ int lhsr_bitrotd_log_corruption(struct lhsr_bitrotd *det,
 
 	pthread_mutex_unlock(&det->log.lock);
 
-	printf("ALERT: Bit-rot detected at block %lu disk %u severity %u\n",
-	       entry->block_offset, entry->disk_index, entry->severity);
+	printf("ALERT: Bit-rot detected at block %llu disk %u severity %u\n",
+	       (unsigned long long)entry->block_offset,
+	       entry->disk_index, entry->severity);
 
 	return 0;
 }
@@ -1507,13 +1508,17 @@ void lhsr_bitrotd_print_log(struct lhsr_bitrotd *det)
 			uint64_t idx = i % det->log.max_entries;
 			entry = det->log.entries[idx];
 
-			tm = localtime((time_t *)&entry.detected_time);
+			{
+				time_t dt;
+				memcpy(&dt, &entry.detected_time, sizeof(dt));
+				tm = localtime(&dt);
+			}
 			strftime(time_buf, sizeof(time_buf),
 			       "%Y-%m-%d %H:%M", tm);
 
-			printf("/dev/sd%c  0x%06lx  %-10u  %s\n",
+			printf("/dev/sd%c  0x%06llx  %-10u  %s\n",
 			       'a' + entry.disk_index,
-			       entry.block_offset,
+			       (unsigned long long)entry.block_offset,
 			       entry.severity,
 			       entry.resolved ? "Resolved" : "UNRESOLVED");
 		}

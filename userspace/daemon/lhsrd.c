@@ -264,8 +264,9 @@ static void *monitor_thread(void *arg)
 					struct disk_health *dh;
 					dh = &st->disks[st->num_disks];
 					memset(dh, 0, sizeof(*dh));
-					strncpy(dh->device_path, devpath,
-						sizeof(dh->device_path) - 1);
+					snprintf(dh->device_path,
+						 sizeof(dh->device_path), "%s",
+						 devpath);
 					dh->disk_index = d;	/* index within this array */
 					dh->array_idx = i;	/* which array owns this disk */
 					dh->health = 100;

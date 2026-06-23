@@ -53,9 +53,25 @@ package:
 	bash scripts/build_rpm.sh
 
 # Test
-test: all
-	@echo "Running tests..."
-	@test -x tests/unit/lhsr-test && ./tests/unit/lhsr-test || echo "Build tests first"
+test-all: all
+	@echo "Running loopback test suite (self-contained)..."
+	@sudo tests/runner.sh
+
+test: test-all
+
+test-full: all
+	@echo "Running ALL tests (loopback + hardware-dependent)..."
+	@sudo tests/runner.sh --root-tests
+
+test-list:
+	@tests/runner.sh --list
+
+test-list-all:
+	@tests/runner.sh --root-tests --list
+
+test-red: all
+	@echo "Running RED-phase tests (expected failures)..."
+	@sudo tests/runner.sh --red
 
 # Help
 help:

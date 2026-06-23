@@ -148,7 +148,7 @@ static int lhsr_module_exiting;
  */
 /*
  * RAID5/6 RMW work item — executed on the WQ_UNBOUND rmw_wq
- * (max_active=8, per-array).  The per-stripe mutex hash
+ * (max_active=32, per-array).  The per-stripe mutex hash
  * (stripe_locks[], 128 buckets) serializes writes to the SAME
  * stripe for write-hole safety.  Different stripes run concurrently
  * across CPUs via the WQ_UNBOUND workqueue.
@@ -2477,12 +2477,13 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	arr->rebuild_wq = NULL;
 	arr->wib_wq = NULL;
 
-	/* Create workqueue for RAID5/6 RMW writes — up to 8 concurrent workers.
+	/* Create workqueue for RAID5/6 RMW writes — up to 32 concurrent workers.
 	 * Per-stripe mutexes prevent concurrent writes to the SAME stripe.
 	 * Different stripes run in parallel across CPUs, eliminating the single-worker
 	 * bottleneck while preserving the write-hole safety guarantee per-stripe.
-	 * 32 workers allows the NVMe controller to pipeline ~8 concurrent I/Os,
+	 * 32 workers allows strong pipelining of concurrent stripe I/Os,
 	 * essential for saturating modern devices with deep NCQ queues.
+	 * Tune via lhsr_rmw_max_active module parameter (see Phase 4 benchmarks).
 	 */
 	arr->rmw_wq = alloc_workqueue("lhsr_rmw_%s", WQ_UNBOUND | WQ_MEM_RECLAIM, 32,
 				       arr->disk[0] && arr->disk[0]->bd_disk ?
@@ -3080,7 +3081,7 @@ static int lhsr_bitmap_write_page(struct lhsr_array *arr,
 		bitmap_sector = arr->disk_sectors
 			+ page_idx * LHSR_BITMAP_PAGE_SECTORS;
 
-		if (lhsr_submit_parallel(arr, d, page, 4096,
+		if (lhsr_submit_parallel(arr, d, page, PAGE_SIZE,
 				bitmap_sector,
 				REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio) == 0)
 			submitted++;
@@ -4061,7 +4062,7 @@ out_free_meta:
 	arr->wib_nbits = 0;
 }
 
-/* RMW worker — runs on WQ_UNBOUND rmw_wq (max_active=8) */
+/* RMW worker — runs on WQ_UNBOUND rmw_wq (max_active=32) */
 static void lhsr_rmw_worker(struct work_struct *work)
 {
 	struct lhsr_rmw_work *rmw = container_of(work, struct lhsr_rmw_work, work);
@@ -4074,9 +4075,6 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	struct page *new_data_page = NULL;
 	struct page *q_parity_page = NULL;
 
-	ktime_t tm0, tm1, tm2, tm3, tm_bs;
-	static DEFINE_RATELIMIT_STATE(rmw_rs, 1 * HZ, 10);
-
 	size_t chunk_bytes = rmw->chunk_bytes;
 	unsigned int data_disks = rmw->data_disks;
 	unsigned int parity_disks = rmw->parity_disks;
@@ -4087,7 +4085,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	unsigned int q_disk = data_disks + 1;	/* Q parity index (RAID6) */
 	unsigned int lock_idx;			/* Per-stripe mutex hash index */
 	bool locked = false;			/* Did we acquire the stripe lock? */
-	unsigned int chunk_order;		/* alloc_pages order for chunk */
+	unsigned int chunk_order = 0;		/* alloc_pages order for chunk */
 
 	/* Allocate compound page buffers for the full chunk size.
 	 * alloc_pages with order > 0 gives physically-contiguous
@@ -4136,7 +4134,6 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	lock_idx = (chunk_start >> 3) & (LHSR_STRIPE_LOCKS - 1);
 	mutex_lock(&arr->stripe_locks[lock_idx]);
 	locked = true;
-	tm0 = ktime_get();
 
 	/* Parallel read phase: count bios first, set pending, submit all, wait once.
 	 * Counting BEFORE submission prevents a race where a bio completes
@@ -4179,7 +4176,6 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		/* Wait for all submitted reads */
 		if (nr_reads > 0)
 			wait_for_completion_io(&pio.done);
-		tm1 = ktime_get();
 		if (pio.status != BLK_STS_OK) {
 			DMERR("RMW worker: parallel read phase failed "
 			      "(status=%d)", pio.status);
@@ -4240,7 +4236,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		kunmap_local(parity);
 		kunmap_local(old_data);
 	}
-	tm2 = ktime_get();  /* after compute */
+
 
 	/*
 	 * Mark intent in write-hole journal BEFORE modifying data/parity.
@@ -4249,7 +4245,6 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	 */
 	if (lhsr_bitmap_set(arr, chunk_start))
 		DMWARN("RMW: bitmap_set failed for chunk %llu", (u64)chunk_start);
-	tm_bs = ktime_get();
 
 	/* Parallel write phase: submit all writes at once, wait once.
 	 * REQ_FUA forces each write to stable storage.  Submitting all
@@ -4292,7 +4287,6 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		/* Wait for all submitted writes */
 		if (nr_writes > 0)
 			wait_for_completion_io(&pio.done);
-		tm3 = ktime_get();
 
 		if (pio.status != BLK_STS_OK) {
 			DMERR("RMW worker: parallel write phase failed "
@@ -4314,18 +4308,6 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	 * same WIB bit — clearing once is correct.
 	 */
 	lhsr_wib_clear(arr, chunk_start);
-
-	if (__ratelimit(&rmw_rs)) {
-		long d_rd = ktime_us_delta(tm1, tm0);
-		long d_cpu = ktime_us_delta(tm2, tm1);
-		long d_bs = ktime_us_delta(tm_bs, tm2);
-		long d_wr = ktime_us_delta(tm3, tm_bs);
-		long d_bmp = ktime_us_delta(ktime_get(), tm3);
-		long dt = ktime_us_delta(ktime_get(), tm0);
-		DMDEBUG("RMW timing: chunk=%llu rd=%ld cpu=%ld "
-		        "bs=%ld wr=%ld bmp=%ld total=%ld",
-		        (u64)chunk_start, d_rd, d_cpu, d_bs, d_wr, d_bmp, dt);
-	}
 
 out:
 	if (locked)
