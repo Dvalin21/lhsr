@@ -4062,7 +4062,58 @@ out_free_meta:
 	arr->wib_nbits = 0;
 }
 
-/* RMW worker — runs on WQ_UNBOUND rmw_wq (max_active=32) */
+/* ====================================================================
+ * WRITE-ORDERING AUDIT (Phase 1.1)
+ *
+ * This worker performs RAID5/6 Read-Modify-Write for a single chunk.
+ * The full write ordering (from submission to completion) is:
+ *
+ *   Step  Location         Action                          Crash-safe?
+ *   ───── ──────────────── ─────────────────────────────── ───────────
+ *   1     lhsr_map()       WIB set (memory-only)           WIB tracks
+ *                          [queue_work]                    region was
+ *                                                          touched
+ *   2     rmw_worker()     Per-stripe mutex lock           Serializes
+ *                                                          same-stripe
+ *   3     rmw_worker()     Read old data + parity disks    N/A (reads)
+ *   4     rmw_worker()     Compute new data + parity       N/A (memory)
+ *   5     rmw_worker()     bitmap_set (memory-only)        YES — marks
+ *                                                          stripe dirty
+ *   6     rmw_worker()     Data write REQ_OP_WRITE+FUA     YES — on
+ *                                                          stable media
+ *   7     rmw_worker()     P parity write REQ_OP_WRITE+FUA YES
+ *   8     rmw_worker()     Q parity write REQ_OP_WRITE+FUA YES (RAID6)
+ *   9     rmw_worker()     Wait for ALL writes to complete Guards 6-8
+ *   10    rmw_worker()     bitmap_clear (memory-only)      Stripe now
+ *                                                          self-consistent
+ *   11    rmw_worker()     WIB clear (memory-only)         Region clean
+ *
+ * CRASH RECOVERY GUARANTEE:
+ *   Crash between 1-4: WIB set → recovery copies region (conservative)
+ *   Crash between 5-9: bitmap dirty → parity verification on next mount
+ *   Crash between 10-11: bitmap clean, WIB set → recovery copies
+ *   Crash after 11: everything consistent — no recovery action needed
+ *
+ *   In ALL cases: data is recoverable.  The bitmap is the authoritative
+ *   recovery signal; WIB is an optimization for rebuild speed.
+ *
+ * KNOWN LIMITATIONS (perf only, not data-corruption):
+ *   a) Mirror writes (RAID1) set WIB at submit time but NEVER clear it.
+ *      WIB stays dirty for all mirror-written regions.  On recovery,
+ *      rebuild copies these regions unnecessarily.  Fix: clear WIB in
+ *      mirror endio when all copies succeed.
+ *   b) RAID5/6 RMW: WIB set uses virtual address (offset in rhs_map),
+ *      WIB clear uses data-disk address (chunk_start).  These differ
+ *      by the stripe mapping.  Different WIB bits are set vs cleared,
+ *      causing leaked dirty bits.  Fix: store orig_offset in rmw work
+ *      item and use it for WIB clear.
+ *   c) Rebuild only checks WIB for RAID < 5.  RAID5/6 rebuild always
+ *      reconstructs from parity, so WIB state is irrelevant for the
+ *      RMW path.  WIB operations on RMW are harmless but redundant.
+ *
+ *   Issues (a) and (b) cause unnecessary rebuild work on recovery but
+ *   NEVER cause data loss.  Fix scheduled for Phase 1.3.
+ * ==================================================================== */
 static void lhsr_rmw_worker(struct work_struct *work)
 {
 	struct lhsr_rmw_work *rmw = container_of(work, struct lhsr_rmw_work, work);
