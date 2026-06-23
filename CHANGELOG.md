@@ -6,6 +6,97 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [7.0.0] — 2026-06-23 — Phase 5-7: Production Readiness + Deployment Scripts + Documentation
+
+### Added (Phase 5: Production Tooling)
+
+#### Initramfs hook (`deploy/initramfs-hook/lhsr`)
+- Copies `dm_lhsr.ko`, `dmsetup`, and `lhsr-assemble.sh` into initramfs
+- Forces module load via `force_load` for early availability
+- Sets `softdep dm_lhsr pre: dm_mod` to ensure correct load order
+- Creates `/etc/lhsr` config directory in initramfs
+
+#### Boot-time autodiscovery (`deploy/lhsr-assemble.sh`)
+- Scans `/dev/sd*`, `/dev/nvme*`, `/dev/vd*` for LHSR superblocks
+- Parses on-disk superblock (magic, version, raid_type, disk_count, UUID)
+- Groups disks by array_uuid and sorts by disk_index for correct ordering
+- Builds dmsetup table and assembles each array
+- Handles missing disks (degraded mode) and failed disk warnings
+- Pure dash/busybox compatible for initramfs use
+- Supports `--no-act` (dry run), `--status`, and device-specific scanning
+
+#### Module parameter: `rmw_max_active`
+- New `module_param_named(rmw_max_active, ..., uint, 0644)`
+- Default 32, tunable at `insmod`/`modprobe` time
+- Controls max concurrent RMW workers for RAID5/6 write throughput
+- Replaced hardcoded 32 in `alloc_workqueue()` call
+
+#### Observability: `wib_status` message
+- Reports page count, dirty pages, total bits, and WIB chunk size
+- Returns `"wib: disabled"` when no WIB configured
+- Config output now includes `max_active`
+
+#### WQ_CPU_INTENSIVE flag
+- Added to RMW workqueue flags (`WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_CPU_INTENSIVE`)
+- RMW workers perform CPU-bound XOR/GF(2^8) computation
+- Prevents workqueue scheduler from starving other work items
+
+### Added (Phase 6: Deployment Scripts)
+
+#### Array creation (`deploy/lhsr-create.sh`)
+- Validates block devices are writable
+- Computes metadata overhead (write-hole bitmap + superblock + WIB)
+- Builds correct DM table for single/mirror/raid5/raid6
+- Calls `dmsetup create` (kernel writes superblocks automatically)
+- Supports `--chunk-size`, `--name`, `--verbose`
+
+#### Offline RAID migration (`deploy/lhsr-migrate.sh`)
+- Validates source array health and DM table
+- Enforces supported migration paths: single→raid5, single→mirror, raid5→raid6
+- Optional backup creation before destructive migration
+- Destroys old array, creates new array via `lhsr-create.sh`
+- `--force` for unattended operation
+- Explicit acknowledgment that block-level copy is unsafe between RAID levels
+
+### Added (Phase 7: Documentation)
+
+- `INSTALL.md`: Full deployment guide covering prerequisites, building, installation,
+  initramfs integration, array creation, management, migration, monitoring,
+  recovery, troubleshooting, and upgrade procedures
+- `README.md`: Completely rewritten — reflects current feature set, updated
+  quick start with correct DM table syntax, WIB listed as implemented,
+  links to all deploy scripts and test suites
+
+### Changed
+- `kernel/dm-lhsr/dm-lhsr.c`: +36/−8 lines — `rmw_max_active` module param,
+  `wib_status` message handler, `WQ_CPU_INTENSIVE` flag
+- `kernel/dm-lhsr/dm-lhsr.c`: All message dispatch uses exact `strcmp` (was
+  `strncmp`, potential prefix-ambiguity security issue)
+- `README.md`: Complete rewrite (was 159 lines, now ~180)
+- `CHANGELOG.md`: Phase 5-7 entries added
+
+### New files
+| File | Description | Lines |
+|------|-------------|-------|
+| `INSTALL.md` | Full deployment and operations guide | ~550 |
+| `deploy/initramfs-hook/lhsr` | initramfs-tools hook for boot-time assembly | 55 |
+| `deploy/lhsr-assemble.sh` | Boot-time superblock scanner + dmsetup assembly | 425 |
+| `deploy/lhsr-create.sh` | Array creation with validation | 265 |
+| `deploy/lhsr-migrate.sh` | Offline RAID level migration | 285 |
+| `tests/test-benchmark.sh` | Performance benchmark (max_active + chunk size sweeps) | 175 |
+| `tests/test-error-paths.sh` | Message fuzzing + double disk failure + dtr race | 360 |
+
+### Build
+- Zero compiler warnings on kernel module (`-Wall -Wextra`)
+- Zero warnings across all userspace targets (daemon, CLI, recovery tool)
+- All phases build and commit clean
+
+### Test
+- Phase 2 test suite verified: message fuzzing (12 invalid variants),
+  double disk failure (RAID5 and RAID6), concurrent dtr+I/O with fio
+
+---
+
 ## [5.1.0] — 2026-06-13 — Phase 5: Recovery Tools + Kernel Degraded Mode + Recovery Docs (5.1-5.5)
 
 ### Added

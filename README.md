@@ -1,159 +1,160 @@
 # LHSR — Linux Hybrid Self-Healing RAID
 
-**Status:** Development — v1.3.0
-**License:** GPLv3
-**Kernel:** 5.15+ (tested on 6.12.x)
+**Version:** 1.3.0 | **License:** GPLv3 | **Kernel:** 5.15+ (tested on 6.12.x)
 
 ---
 
-## What LHSR Actually Is
+LHSR is a **Linux Device Mapper target** that provides RAID5/6 with CRC32c
+scrubbing and read-side self-healing.  It is implemented as a kernel module
+(`dm-lhsr.ko`) with userspace tools for administration and recovery.
 
-LHSR is a **Linux Device Mapper target** that provides RAID5/6 with
-CRC32c scrubbing and read-side self-healing. It is implemented as a kernel
-module (`dm-lhsr`) with userspace tools for administration and recovery.
+## What it does
 
-**What it does well today:**
-- RAID0, RAID1, RAID5, RAID6 with correct Reed-Solomon GF(2^8) parity
-- Background CRC32c scrubbing with rate limiting
-- Read-side reconstruction from parity when a disk fails
-- Write-hole protected superblock (backup-first + REQ_FUA)
-- Write verification modes (none/simple/full)
+- **RAID5 and RAID6** — XOR and Reed-Solomon GF(2^8) parity with correct RMW
+  state machine.  RAID0 (single) and RAID1 (mirror) also supported.
+- **CRC32c background scrub** — rate-limited, configurable block size,
+  corruption detection and logging.
+- **Read-side reconstruction** — transparent parity-read recovery when a disk
+  fails.  RAID5 single-failure and RAID6 dual-failure tolerant.
+- **Write-intent bitmap (WIB)** — tracks modified regions so rebuilds only copy
+  dirty data.  On-disk format with CRC32c protected pages.
+- **Write-hole protected metadata** — backup-first superblock writes with
+  REQ_FUA, so array metadata always lands on stable media before bitmap clears.
+- **dm-integrity stacking** — stack on dm-integrity devices for end-to-end
+  per-block CRC32c verification.
+- **Module parameter tuning** — `rmw_max_active` controls RMW concurrency
+  (default 32, tunable for high-queue-depth devices).
+- **Boot-time autodiscovery** — initramfs hook scans for LHSR superblocks and
+  assembles arrays before root mount.
 
-**What it does NOT do (yet):**
-- SHR flexible disk sizing (Synology SHR is mdraid + LVM — LHSR doesn't do this)
-- Persistent anti-bit-rot checksums (checksum cache is ephemeral — lost on module unload)
-- Incremental rebuild (full-disk rebuild only; no write-intent bitmap)
-- Predictive failure with risk scoring (SMART polling exists, but no model)
-- Live block migration (mdadm --grow already does this)
-- Firmware failure mitigation (the kernel driver layer already handles quirks)
-- Instant recovery with partial array mount (read-side reconstruction works, but no degraded mount)
-
-See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for the full gap analysis.
-
----
-
-## Quick Start
+## Quick start
 
 ```bash
-# Build
-make
+# Build and install
+make all
 sudo make install
 
-# Create a RAID5 array with 3 loopback devices (for testing)
-dd if=/dev/zero of=/tmp/disk1 bs=1M count=100
-dd if=/dev/zero of=/tmp/disk2 bs=1M count=100
-dd if=/dev/zero of=/tmp/disk3 bs=1M count=100
-losetup /dev/loop1 /tmp/disk1
-losetup /dev/loop2 /tmp/disk2
-losetup /dev/loop3 /tmp/disk3
+# Load the module
+sudo modprobe dm_lhsr
 
-# Load the module and create the target
-sudo insmod kernel/dm-lhsr/dm-lhsr.ko
-sudo dmsetup create lhsr-test --table "0 204800 lhsr 5 3 /dev/loop1 /dev/loop2 /dev/loop3"
+# Quick test with loopback devices
+dd if=/dev/zero of=/tmp/d1 bs=1M count=64
+dd if=/dev/zero of=/tmp/d2 bs=1M count=64
+dd if=/dev/zero of=/tmp/d3 bs=1M count=64
+sudo losetup /dev/loop0 /tmp/d1
+sudo losetup /dev/loop1 /tmp/d2
+sudo losetup /dev/loop2 /tmp/d3
 
-# Status
-sudo dmsetup message lhsr-test 0 status
+# Create a RAID5 array via the deploy script
+sudo deploy/lhsr-create.sh raid5 /dev/loop0 /dev/loop1 /dev/loop2
+
+# Or use dmsetup directly
+# sudo echo "0 130448 lhsr raid5 8 1 8 /dev/loop0 0 /dev/loop1 0 /dev/loop2 0" \
+#   | sudo dmsetup create lhsr-test
+
+# Write some data and verify
+sudo dd if=/dev/urandom of=/dev/mapper/lhsr-* bs=4k count=100
+
+# Check status
+sudo dmsetup status lhsr-*
 
 # Clean up
-sudo dmsetup remove lhsr-test
-sudo rmmod dm-lhsr
+sudo dmsetup remove lhsr-*
+sudo rmmod dm_lhsr
+sudo losetup -d /dev/loop0 /dev/loop1 /dev/loop2
+rm /tmp/d1 /tmp/d2 /tmp/d3
 ```
 
----
-
-## Feature Matrix
-
-| Feature | Status | Notes |
-|---------|--------|-------|
-| RAID0 | ✅ Working | Standard striping |
-| RAID1 | ✅ Working | Mirror with automatic source selection on rebuild |
-| RAID5 | ✅ Working | XOR parity, correct RMW state machine |
-| RAID6 | ✅ Working | Reed-Solomon GF(2^8) |
-| SHR/SHR2 | ❌ Not implemented | Segment data structures exist but never populated |
-| Background scrub | ✅ Working | CRC32c per block, rate-limited |
-| Read-side reconstruction | ✅ Working | Parity-read on failed disk I/O |
-| Write verification | ✅ Working | none/simple/full modes |
-| Superblock persistence | ✅ Working | Primary + backup, CRC32c, generation counter |
-| Persistent checksums | ❌ Not implemented | Ephemeral xarray cache only |
-| Incremental rebuild | ❌ Not implemented | Full-disk copy only |
-| Write-intent bitmap | ❌ Not implemented | Required for incremental rebuild |
-| Predictive failure model | ❌ Not implemented | SMART polling exists, no prediction |
-| Live block migration | ❌ Not implemented | Use mdadm --grow |
-| Firmware mitigation | ❌ Not implemented | Kernel driver quirks handle this |
-| Partial-array mount | ❌ Not implemented | Only full assembly supported |
-
----
+For complete installation instructions, see [INSTALL.md](INSTALL.md).
 
 ## Architecture
 
 ```
 Filesystem (ext4, xfs, btrfs, etc.)
     ↓
-dm-lhsr (kernel DM target)
+dm-lhsr (kernel DM target — RAID5/6, scrub, rebuild)
     ↓
 Block devices (sdX, nvmeXnY, or dm-integrity devices)
 ```
 
 The daemon (`lhsrd`) runs in userspace and handles:
-- Disk health monitoring (SMART via smartctl)
+- Disk health monitoring (SMART polling, composite health score 0-100)
+- Trend tracking (SQLite DB, linear regression for predictive failure)
 - Scrubbing orchestration (via dmsetup message)
-- Rebuild orchestration (via dmsetup message)
+- Rebuild orchestration
+- Prometheus metrics (compatible with node_exporter textfile collector)
 
----
+## What it does NOT do (yet)
+
+- **SHR flexible disk sizing** — Synology SHR is mdraid + LVM; LHSR doesn't do
+  this.  SHR partition data structures exist but are not populated.
+- **Live reshape** — `mdadm --grow` and RAID level migration are not yet
+  implemented in the kernel.  Offline migration is supported via
+  [`deploy/lhsr-migrate.sh`](deploy/lhsr-migrate.sh) (backup → recreate → restore).
+- **Persistent checksum cache** — the CRC32c checksum cache is ephemeral
+  (xarray, lost on module unload).  For persistent anti-bit-rot,
+  [stack LHSR on dm-integrity](INSTALL.md#dm-integrity-stacking).
+
+## Components
+
+| Component | Path | Purpose |
+|-----------|------|---------|
+| Kernel module | `kernel/dm-lhsr/dm-lhsr.ko` | DM target (~5600 lines C) |
+| Daemon | `userspace/daemon/lhsrd` | SMART, health, trends, Prometheus, HTTP API |
+| CLI | `userspace/cli/lhsrctl` | Status, predict, recover, reconstruct, disk-fail |
+| Scanner | `userspace/recovery/lhsr-scan` | Superblock discovery (`--deep`, `--json`) |
+| Service | `userspace/systemd/lhsrd.service` | systemd unit |
+| Initramfs hook | `deploy/initramfs-hook/lhsr` | Boot-time autodiscovery |
+| Assembly | `deploy/lhsr-assemble.sh` | Scan + dmsetup create for all LHSR arrays |
+| Create | `deploy/lhsr-create.sh` | Validate + initialize + create new arrays |
+| Migrate | `deploy/lhsr-migrate.sh` | Offline RAID level migration (safe path) |
+
+## Test suite
+
+| Test | Scope | Run time |
+|------|-------|----------|
+| `tests/crash-point-injection.sh` | 5 crash scenarios (rmmod, disk failure, WIB) | ~2 min |
+| `tests/test-degraded-dmintegrity.sh` | degraded I/O, dm-integrity stacking, bit-flip | ~3 min |
+| `tests/test-error-paths.sh` | message fuzzing, double disk failure, dtr+I/O race | ~3 min |
+| `tests/test-benchmark.sh` | max_active/chunk-size IOPS sweeps | 5-30 min |
+| `tests/smoke-test-raid5.sh` | Basic RAID5 write/read/verify | ~1 min |
+| `tests/stress-test-1-concurrent-rmw.sh` | Concurrent RMW stress | ~5 min |
+| `tests/*.sh` | 15+ test scripts covering RAID5, RAID6, bitmap, rebuild | varies |
+
+Run all tests:
+```bash
+sudo make test-all
+```
 
 ## Requirements
 
 - Linux 5.15+
-- Device Mapper (CONFIG_DM)
-- kernel headers for building
-
-## Building
-
-```bash
-make all              # Full build
-make modules          # Just the kernel module
-make userspace        # Just userspace tools
-make clean
-```
-
-## Installation
-
-```bash
-sudo make install
-# Or manually:
-sudo insmod kernel/dm-lhsr/dm-lhsr.ko
-sudo cp userspace/cli/lhsrctl /usr/local/bin/
-sudo cp userspace/daemon/lhsrd /usr/local/bin/
-```
-
----
+- Device Mapper (`CONFIG_DM`)
+- Kernel headers for building
+- `libdevmapper-dev`, `libsqlite3-dev`, `uuid-dev` for userspace tools
 
 ## Documentation
 
 | Document | Contents |
 |----------|----------|
-| [RECOVERY.md](RECOVERY.md) | Step-by-step disk failure recovery guide (5 scenarios + walkthrough) |
-| [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) | Honest gap analysis — what works, what doesn't |
+| [INSTALL.md](INSTALL.md) | Full installation and deployment guide |
+| [RECOVERY.md](RECOVERY.md) | Step-by-step disk failure recovery (5 scenarios) |
+| [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) | Honest gap analysis |
+| [CHANGELOG.md](CHANGELOG.md) | Version history |
 | [ROADMAP.md](ROADMAP.md) | Phased implementation plan |
-| [docs/technical-specification.md](docs/technical-specification.md) | Original spec (needs update to match reality) |
-| [KERNEL_NOTES.md](KERNEL_NOTES.md) | Kernel API notes from development |
+| [TEST_HARDWARE.md](TEST_HARDWARE.md) | VM test environment specs |
+| [KERNEL_NOTES.md](KERNEL_NOTES.md) | Kernel API notes |
 
----
+## Related projects
 
-## Related Projects / Upstream Alternatives
+LHSR integrates with or builds alongside:
 
-LHSR does not aim to replace these — it integrates with them or builds on top:
-
-- **mdadm**: Linux software RAID (RAID0/1/4/5/6/10, reshape, grow, replace, bitmap v6)
-- **dm-integrity**: Per-block checksum storage (Linux 4.12+, use under LHSR for anti-bit-rot)
-- **LVM**: Volume management, snapshots, RAID
-- **bcache / dm-cache**: Block caching
+- **mdadm**: Linux software RAID
+- **dm-integrity**: Per-block checksum storage (stack below LHSR for anti-bit-rot)
+- **LVM**: Volume management
 - **dm-crypt**: Block-level encryption
-- **argus-disk**: SMART failure prediction with linear regression
-- **Btrfs / ZFS**: Filesystem-level RAID with checksumming
-
----
+- **Prometheus + node_exporter**: Daemon metrics via textfile collector
 
 ## License
 
-GPLv3 — See [LICENSE](LICENSE) file.
+GPLv3 — See [LICENSE](LICENSE).
