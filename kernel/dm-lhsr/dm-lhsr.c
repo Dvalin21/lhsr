@@ -148,7 +148,7 @@ static int lhsr_module_exiting;
  */
 /*
  * RAID5/6 RMW work item — executed on the WQ_UNBOUND rmw_wq
- * (max_active=32, per-array).  The per-stripe mutex hash
+ * (max_active=lhsr_rmw_max_active, default 32, per-array).  The per-stripe mutex hash
  * (stripe_locks[], 128 buckets) serializes writes to the SAME
  * stripe for write-hole safety.  Different stripes run concurrently
  * across CPUs via the WQ_UNBOUND workqueue.
@@ -206,6 +206,11 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("LHSR Team");
 MODULE_DESCRIPTION("Linux Hybrid Self-Healing RAID");
 MODULE_VERSION(LHSR_VERSION);
+
+/* Module parameters (tunable at insmod/modprobe time) */
+static unsigned int lhsr_rmw_max_active = 32;
+module_param_named(rmw_max_active, lhsr_rmw_max_active, uint, 0644);
+MODULE_PARM_DESC(rmw_max_active, "Max concurrent RMW workers per array (default=32)");
 
 /*
  * CRC32c checksum using kernel API
@@ -2484,11 +2489,12 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 * Per-stripe mutexes prevent concurrent writes to the SAME stripe.
 	 * Different stripes run in parallel across CPUs, eliminating the single-worker
 	 * bottleneck while preserving the write-hole safety guarantee per-stripe.
-	 * 32 workers allows strong pipelining of concurrent stripe I/Os,
-	 * essential for saturating modern devices with deep NCQ queues.
-	 * Tune via lhsr_rmw_max_active module parameter (see Phase 4 benchmarks).
+	 * lhsr_rmw_max_active workers allows strong pipelining of concurrent
+	 * stripe I/Os, essential for saturating modern devices with deep NCQ
+	 * queues.  Module parameter: rmw_max_active (default 32).
 	 */
-	arr->rmw_wq = alloc_workqueue("lhsr_rmw_%s", WQ_UNBOUND | WQ_MEM_RECLAIM, 32,
+	arr->rmw_wq = alloc_workqueue("lhsr_rmw_%s", WQ_UNBOUND | WQ_MEM_RECLAIM,
+				     lhsr_rmw_max_active,
 				       arr->disk[0] && arr->disk[0]->bd_disk ?
 				       arr->disk[0]->bd_disk->disk_name : "unknown");
 	if (!arr->rmw_wq) {
@@ -5449,12 +5455,34 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return -EINVAL;
 	}
 
-	if (strncmp(argv[0], "config", 6) == 0) {
+	if (strcmp(argv[0], "config") == 0) {
 		scnprintf(result, maxlen,
-			  "uuid=%llx raid=%u disks=%u state=%u failed=0x%lx gen=%llu verify=%u integrity=%d",
+			  "uuid=%llx raid=%u disks=%u state=%u failed=0x%lx gen=%llu verify=%u integrity=%d max_active=%u",
 			  arr->array_uuid, arr->raid_type, arr->disks,
 			  arr->state, lhsr_failed_disks_get(arr), arr->generation,
-			  arr->write_verify_enabled, arr->integrity_below);
+			  arr->write_verify_enabled, arr->integrity_below,
+			  lhsr_rmw_max_active);
+		return 1;
+	}
+
+	if (strcmp(argv[0], "wib_status") == 0) {
+		unsigned int dirty_pages = 0;
+		unsigned int p;
+		sector_t total_bits;
+
+		if (!arr->wib_pages) {
+			scnprintf(result, maxlen, "wib: disabled");
+			return 1;
+		}
+		for (p = 0; p < arr->wib_npages; p++) {
+			if (test_bit(0, &arr->wib_flags[p]))
+				dirty_pages++;
+		}
+		total_bits = (sector_t)arr->wib_nbits;
+		scnprintf(result, maxlen,
+			  "wib: pages=%u dirty_pages=%u total_bits=%llu chunk_sects=%u",
+			  arr->wib_npages, dirty_pages,
+			  (u64)total_bits, LHSR_WIB_CHUNK_SECTORS);
 		return 1;
 	}
 
