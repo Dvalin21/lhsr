@@ -169,6 +169,7 @@ struct lhsr_rmw_work {
 	unsigned int data_disks;	/* Number of data disks */
 	unsigned int parity_disks;	/* Number of parity disks (1 or 2) */
 	sector_t chunk_start;		/* Stripe-aligned chunk start (sectors) */
+	sector_t orig_offset;		/* Original virtual offset (for bitmap/WIB) */
 	size_t chunk_bytes;		/* Chunk size in bytes */
 	unsigned int offset_in_chunk;	/* Sector offset within chunk for bio data */
 };
@@ -194,9 +195,11 @@ struct lhsr_raid_5_read_ctx {
 
 /* Mirror write context - tracks completions across all mirror members */
 struct lhsr_mirror_ctx {
-	struct bio *orig_bio;	/* Original bio to complete */
-	atomic_t pending;	/* Count of pending writes */
-	int status;		/* Final status */
+	struct bio *orig_bio;		/* Original bio to complete */
+	atomic_t pending;		/* Count of pending writes */
+	int status;			/* Final status */
+	struct lhsr_array *arr;		/* Array context (for WIB clear) */
+	sector_t offset;		/* Sector offset (for WIB clear) */
 };
 
 MODULE_LICENSE("GPL");
@@ -4097,22 +4100,17 @@ out_free_meta:
  *   In ALL cases: data is recoverable.  The bitmap is the authoritative
  *   recovery signal; WIB is an optimization for rebuild speed.
  *
- * KNOWN LIMITATIONS (perf only, not data-corruption):
- *   a) Mirror writes (RAID1) set WIB at submit time but NEVER clear it.
- *      WIB stays dirty for all mirror-written regions.  On recovery,
- *      rebuild copies these regions unnecessarily.  Fix: clear WIB in
- *      mirror endio when all copies succeed.
- *   b) RAID5/6 RMW: WIB set uses virtual address (offset in rhs_map),
- *      WIB clear uses data-disk address (chunk_start).  These differ
- *      by the stripe mapping.  Different WIB bits are set vs cleared,
- *      causing leaked dirty bits.  Fix: store orig_offset in rmw work
- *      item and use it for WIB clear.
- *   c) Rebuild only checks WIB for RAID < 5.  RAID5/6 rebuild always
+ * KNOWN LIMITATION (perf only, not data-corruption):
+ *   a) Rebuild only checks WIB for RAID < 5.  RAID5/6 rebuild always
  *      reconstructs from parity, so WIB state is irrelevant for the
  *      RMW path.  WIB operations on RMW are harmless but redundant.
  *
- *   Issues (a) and (b) cause unnecessary rebuild work on recovery but
- *   NEVER cause data loss.  Fix scheduled for Phase 1.3.
+ *   FIXED in Phase 1.3:
+ *   - Mirror WIB clear: lhsr_mirror_endio now clears WIB when all
+ *     copies complete successfully.  WIB set/clear is symmetric.
+ *   - RMW WIB address: lhsr_rmw_work stores orig_offset (virtual addr)
+ *     and all bitmap/WIB operations use it instead of chunk_start.
+ *     bitmap_set, bitmap_clear, and WIB_clear are consistent.
  * ==================================================================== */
 static void lhsr_rmw_worker(struct work_struct *work)
 {
@@ -4294,8 +4292,8 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	 * If we crash now, recovery sees the dirty bit and reconstructs
 	 * parity from the (unchanged) data disks — always consistent.
 	 */
-	if (lhsr_bitmap_set(arr, chunk_start))
-		DMWARN("RMW: bitmap_set failed for chunk %llu", (u64)chunk_start);
+	if (lhsr_bitmap_set(arr, rmw->orig_offset))
+		DMWARN("RMW: bitmap_set failed at virtual offset %llu", (u64)rmw->orig_offset);
 
 	/* Parallel write phase: submit all writes at once, wait once.
 	 * REQ_FUA forces each write to stable storage.  Submitting all
@@ -4348,8 +4346,8 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	} /* end of parallel write phase block */
 
 	/* All writes committed — clear the dirty bit */
-	if (lhsr_bitmap_clear(arr, chunk_start))
-		DMWARN("RMW: bitmap_clear failed for chunk %llu", (u64)chunk_start);
+	if (lhsr_bitmap_clear(arr, rmw->orig_offset))
+		DMWARN("RMW: bitmap_clear failed at virtual offset %llu", (u64)rmw->orig_offset);
 
 	/*
 	 * Clear WIB bit: the entire stripe is now self-consistent because
@@ -4357,8 +4355,9 @@ static void lhsr_rmw_worker(struct work_struct *work)
 	 * WIB granularity is 1MB (LHSR_WIB_CHUNK_SECTORS), which is much
 	 * larger than any stripe, so all chunks in the stripe share the
 	 * same WIB bit — clearing once is correct.
+	 * Uses the original virtual offset (same address as lhsr_wib_set).
 	 */
-	lhsr_wib_clear(arr, chunk_start);
+	lhsr_wib_clear(arr, rmw->orig_offset);
 
 out:
 	if (locked)
@@ -4394,6 +4393,15 @@ static void lhsr_mirror_endio(struct bio *bio)
 		mctx->status = bio->bi_status;
 
 	if (atomic_dec_and_test(&mctx->pending)) {
+		/*
+		 * Clear WIB on successful completion: all mirror copies
+		 * have been written with REQ_FUA, so the region is
+		 * fully consistent.  If any write failed, leave WIB set
+		 * so rebuild knows to re-replicate this region.
+		 */
+		if (mctx->status == 0 && mctx->arr && mctx->arr->wib_pages)
+			lhsr_wib_clear(mctx->arr, mctx->offset);
+
 		mctx->orig_bio->bi_status = mctx->status;
 		bio_endio(mctx->orig_bio);
 		kfree(mctx);
@@ -4612,6 +4620,8 @@ passthrough_single:
 
 			mctx->orig_bio = bio;
 			mctx->status = 0;
+			mctx->arr = arr;
+			mctx->offset = offset;
 			atomic_set(&mctx->pending, working);
 
 			{
@@ -4722,6 +4732,7 @@ passthrough_single:
 			rmw->data_disks = data_disks;
 			rmw->parity_disks = parity_disks;
 			rmw->chunk_start = chunk_start;
+			rmw->orig_offset = offset;
 			rmw->chunk_bytes = chunk_bytes;
 			rmw->offset_in_chunk = (unsigned int)(offset % chunk_sects);
 
