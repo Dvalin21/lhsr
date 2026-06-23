@@ -1,0 +1,9 @@
+lhsr (1.3.0-1) unstable; urgency=medium
+
+  * Initial Debian package release.
+  * Kernel module (dm-lhsr.ko) via DKMS.
+  * Userspace daemon (lhsrd), CLI (lhsrctl), recovery tool (lhsr-scan).
+  * systemd service for monitoring daemon.
+  * initramfs-tools hook for boot-time array autodiscovery.
+
+ -- LHSR Team <team@lhsr.dev>  Tue, 23 Jun 2026 22:00:00 +0000

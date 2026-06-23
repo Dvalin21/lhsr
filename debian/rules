@@ -1,0 +1,80 @@
+#!/usr/bin/make -f
+# debian/rules for lhsr
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Build userspace (lhsrd, lhsrctl, lhsr-scan)
+	$(MAKE) -C lib
+	$(MAKE) -C userspace/cli
+	$(MAKE) -C userspace/daemon
+	$(MAKE) -C userspace/recovery
+
+override_dh_auto_install:
+	# Install daemon binary
+	install -d $(CURDIR)/debian/lhsrd/usr/sbin
+	install -m 755 userspace/daemon/lhsrd $(CURDIR)/debian/lhsrd/usr/sbin/lhsrd
+
+	# Install CLI
+	install -d $(CURDIR)/debian/lhsrd/usr/bin
+	install -m 755 userspace/cli/lhsrctl $(CURDIR)/debian/lhsrd/usr/bin/lhsrctl
+
+	# Install recovery tool
+	install -m 755 userspace/recovery/lhsr-scan $(CURDIR)/debian/lhsrd/usr/bin/lhsr-scan
+
+	# Install systemd service
+	install -d $(CURDIR)/debian/lhsrd/usr/lib/systemd/system
+	install -m 644 userspace/systemd/lhsrd.service \
+		$(CURDIR)/debian/lhsrd/usr/lib/systemd/system/lhsrd.service
+
+	# Install initramfs hook
+	install -d $(CURDIR)/debian/lhsrd/usr/share/initramfs-tools/hooks
+	install -m 755 deploy/initramfs-hook/lhsr \
+		$(CURDIR)/debian/lhsrd/usr/share/initramfs-tools/hooks/lhsr
+
+	# Install deployment scripts
+	install -d $(CURDIR)/debian/lhsrd/usr/lib/lhsr
+	install -m 755 deploy/lhsr-assemble.sh $(CURDIR)/debian/lhsrd/usr/lib/lhsr/lhsr-assemble.sh
+	install -m 755 deploy/lhsr-create.sh $(CURDIR)/debian/lhsrd/usr/lib/lhsr/lhsr-create.sh
+	install -m 755 deploy/lhsr-migrate.sh $(CURDIR)/debian/lhsrd/usr/lib/lhsr/lhsr-migrate.sh
+
+	# Install config example
+	install -d $(CURDIR)/debian/lhsrd/etc/lhsr
+	install -m 644 userspace/config/lhsrd.conf.example \
+		$(CURDIR)/debian/lhsrd/etc/lhsr/lhsrd.conf
+
+	# Install default config for daemon
+	install -d $(CURDIR)/debian/lhsrd/etc/default
+	echo '# LHSR daemon defaults' > $(CURDIR)/debian/lhsrd/etc/default/lhsrd
+	echo 'LHSRD_OPTS=""' >> $(CURDIR)/debian/lhsrd/etc/default/lhsrd
+
+	# Install docs
+	install -d $(CURDIR)/debian/lhsrd/usr/share/doc/lhsrd
+	install -m 644 README.md $(CURDIR)/debian/lhsrd/usr/share/doc/lhsrd/README.md
+	install -m 644 INSTALL.md $(CURDIR)/debian/lhsrd/usr/share/doc/lhsrd/INSTALL.md
+	install -m 644 RECOVERY.md $(CURDIR)/debian/lhsrd/usr/share/doc/lhsrd/RECOVERY.md
+	install -m 644 CHANGELOG.md $(CURDIR)/debian/lhsrd/usr/share/doc/lhsrd/CHANGELOG.md
+
+	# DKMS: copy kernel module source into lhsr-dkms package
+	install -d $(CURDIR)/debian/lhsr-dkms/usr/src/lhsr-$(shell dpkg-parsechangelog -S Version | cut -d- -f1)
+	cp -a kernel/dm-lhsr $(CURDIR)/debian/lhsr-dkms/usr/src/lhsr-$(shell dpkg-parsechangelog -S Version | cut -d- -f1)/
+	cp -a include $(CURDIR)/debian/lhsr-dkms/usr/src/lhsr-$(shell dpkg-parsechangelog -S Version | cut -d- -f1)/
+	install -m 644 dkms.conf \
+		$(CURDIR)/debian/lhsr-dkms/usr/src/lhsr-$(shell dpkg-parsechangelog -S Version | cut -d- -f1)/dkms.conf
+
+override_dh_auto_clean:
+	$(MAKE) -C kernel/dm-lhsr clean || true
+	$(MAKE) -C userspace/cli clean || true
+	$(MAKE) -C userspace/daemon clean || true
+	$(MAKE) -C userspace/recovery clean || true
+	$(MAKE) -C lib clean || true
+
+override_dh_dkms:
+	dh_dkms -p lhsr-dkms
+
+# No stripping needed for DKMS source
+override_dh_strip:
+	dh_strip -p lhsrd --dbg-package=lhsrd-dbgsym

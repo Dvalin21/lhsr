@@ -1,0 +1,48 @@
+Source: lhsr
+Section: admin
+Priority: optional
+Maintainer: LHSR Team <team@lhsr.dev>
+Build-Depends: debhelper-compat (= 13),
+               dkms,
+               libdevmapper-dev,
+               libsqlite3-dev,
+               uuid-dev,
+               linux-headers-generic | linux-headers-amd64
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+Homepage: https://github.com/Dvalin21/lhsr
+Vcs-Git: https://github.com/Dvalin21/lhsr.git
+Vcs-Browser: https://github.com/Dvalin21/lhsr
+
+Package: lhsr-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms, dm-mod | linux-image
+Description: LHSR RAID kernel module (DKMS)
+ Linux Hybrid Self-Healing RAID device-mapper target.
+ Provides RAID5/6 with CRC32c scrubbing and read-side self-healing.
+ .
+ This package contains the dm-lhsr kernel module source for DKMS.
+ DKMS will build the module for your running kernel.
+
+Package: lhsrd
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         lsb-base,
+         dmsetup,
+         smartmontools (>= 7.0)
+Recommends: lhsr-dkms
+Description: LHSR RAID monitoring daemon and management tools
+ Userspace components for LHSR RAID arrays:
+   - lhsrd:      Monitoring daemon (SMART, health scores, trend tracking)
+   - lhsrctl:    Command-line administration tool
+   - lhsr-scan:  Superblock discovery and recovery tool
+   - lhsr-*.sh:  Array creation, migration, and boot-time assembly
+
+Package: lhsr
+Architecture: all
+Depends: lhsr-dkms (= ${binary:Version}),
+         lhsrd (= ${binary:Version}),
+         ${misc:Depends}
+Description: Linux Hybrid Self-Healing RAID (metapackage)
+ Metapackage that installs both the DKMS kernel module and the
+ userspace daemon/CLI/recovery tools for LHSR.
