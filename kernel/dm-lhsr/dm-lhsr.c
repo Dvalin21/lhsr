@@ -5153,8 +5153,13 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 	if (argc < 1)
 		return -EINVAL;
 
-	/* Handle bare command (dmsetup message <device> <cmd>) */
-	if (strncmp(argv[0], "disk_fail", 8) == 0) {
+	/* ------------------------------------------------------------------
+	 * Each command uses exact strcmp match (not strncmp prefix match)
+	 * to prevent ambiguous dispatch with crafted message strings.
+	 * Example: "disk_failure" must NOT match the "disk_fail" handler.
+	 * ------------------------------------------------------------------ */
+
+	if (strcmp(argv[0], "disk_fail") == 0) {
 		if (argc < 2)
 			return -EINVAL;
 		err = kstrtouint(argv[1], 10, &disk_idx);
@@ -5177,7 +5182,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return 1;
 	}
 
-	if (strncmp(argv[0], "disk_online", 10) == 0) {
+	if (strcmp(argv[0], "disk_online") == 0) {
 		if (argc < 2)
 			return -EINVAL;
 		err = kstrtouint(argv[1], 10, &disk_idx);
@@ -5201,7 +5206,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return 1;
 	}
 
-	if (strncmp(argv[0], "member_status", 12) == 0) {
+	if (strcmp(argv[0], "member_status") == 0) {
 		if (argc < 2)
 			return -EINVAL;
 		err = kstrtouint(argv[1], 10, &disk_idx);
@@ -5218,7 +5223,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return 1;
 	}
 
-	if (strncmp(argv[0], "disk_health", 10) == 0) {
+	if (strcmp(argv[0], "disk_health") == 0) {
 		if (argc < 2)
 			return -EINVAL;
 		err = kstrtouint(argv[1], 10, &disk_idx);
@@ -5233,7 +5238,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return 1;
 	}
 
-	if (strncmp(argv[0], "device_path", 11) == 0) {
+	if (strcmp(argv[0], "device_path") == 0) {
 		if (argc < 2)
 			return -EINVAL;
 		err = kstrtouint(argv[1], 10, &disk_idx);
@@ -5271,7 +5276,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return 1;
 	}
 
-	if (strncmp(argv[0], "scrub", 4) == 0) {
+	if (strcmp(argv[0], "scrub") == 0) {
 		/*
 		 * dmsetup message format: dmsetup message <device> <sector> <message>
 		 * The <sector> argument is passed by userspace and becomes argv[1]
@@ -5322,7 +5327,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 	}
 
 	/* scan - trigger or report health scan status */
-	if (strncmp(argv[0], "scan", 4) == 0) {
+	if (strcmp(argv[0], "scan") == 0) {
 		/* If no scan running, start one */
 		if (arr->scrub_state == LHSR_SCRUB_IDLE ||
 		    arr->scrub_state == LHSR_SCRUB_COMPLETED) {
@@ -5343,7 +5348,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return 1;
 	}
 
-	if (strncmp(argv[0], "rebuild", 6) == 0) {
+	if (strcmp(argv[0], "rebuild") == 0) {
 		/* Query status (no second argument) */
 		if (argc == 1 || (argc >= 2 && strcmp(argv[1], "status") == 0)) {
 			const char *state_str = "NONE";
@@ -5400,7 +5405,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return -EINVAL;
 	}
 
-	if (strncmp(argv[0], "persist", 7) == 0) {
+	if (strcmp(argv[0], "persist") == 0) {
 		unsigned int i;
 		arr->generation++;
 		for (i = 0; i < arr->disks; i++) {
@@ -5411,7 +5416,7 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 		return 1;
 	}
 
-	if (strncmp(argv[0], "write_verify", 11) == 0) {
+	if (strcmp(argv[0], "write_verify") == 0) {
 		if (argc < 2) {
 			const char *mode_str = "none";
 			switch (arr->write_verify_enabled) {
