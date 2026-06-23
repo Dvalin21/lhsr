@@ -1,0 +1,53 @@
+#!/bin/sh
+# initramfs-tools hook for LHSR (Linux Hybrid Self-Healing RAID)
+#
+# Installs dm-lhsr.ko, dmsetup, and the assembly script into the
+# initramfs so LHSR arrays are available before the root filesystem
+# is mounted.
+#
+# Install: sudo cp deploy/initramfs-hook/lhsr /usr/share/initramfs-tools/hooks/
+#          sudo update-initramfs -u
+#
+# PREREQUISITES (build once):
+#   sudo cp kernel/dm-lhsr/dm-lhsr.ko /lib/modules/$(uname -r)/kernel/drivers/md/
+
+set -e
+
+PREREQ=""
+prereqs()
+{
+    echo "$PREREQ"
+}
+
+case "$1" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# Copy kernel module — depends on dm_lhsr.ko being installed in
+# /lib/modules/$(uname -r)/kernel/drivers/md/ via manual copy or DKMS
+manual_add_modules dm_lhsr
+force_load dm_lhsr
+
+# Copy dmsetup (needed for dmsetup create table)
+copy_exec /sbin/dmsetup /sbin/dmsetup
+
+# Copy assembly script and superblock scanner
+copy_exec /usr/lib/lhsr/lhsr-assemble.sh /scripts/local-top/lhsr
+if [ -x /usr/sbin/lhsr-scan ]; then
+    copy_exec /usr/sbin/lhsr-scan /usr/sbin/lhsr-scan
+fi
+
+# Create modprobe.d entry: ensure dm_mod loads before dm_lhsr
+mkdir -p "${DESTDIR}/etc/modprobe.d"
+cat > "${DESTDIR}/etc/modprobe.d/lhsr.conf" <<'MODPROBEEOF'
+# dm_lhsr requires dm_mod
+softdep dm_lhsr pre: dm_mod
+MODPROBEEOF
+
+# Runtime config directory
+mkdir -p "${DESTDIR}/etc/lhsr"
