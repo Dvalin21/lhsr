@@ -2493,7 +2493,8 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 * stripe I/Os, essential for saturating modern devices with deep NCQ
 	 * queues.  Module parameter: rmw_max_active (default 32).
 	 */
-	arr->rmw_wq = alloc_workqueue("lhsr_rmw_%s", WQ_UNBOUND | WQ_MEM_RECLAIM,
+	arr->rmw_wq = alloc_workqueue("lhsr_rmw_%s",
+				     WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_CPU_INTENSIVE,
 				     lhsr_rmw_max_active,
 				       arr->disk[0] && arr->disk[0]->bd_disk ?
 				       arr->disk[0]->bd_disk->disk_name : "unknown");
