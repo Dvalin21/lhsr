@@ -1,7 +1,7 @@
 # LHSR Production Readiness Registry
 
-**Last Updated:** 2026-06-20 (Phase 16+ — doc refresh: WIB flush, RAID6 decode, SHR test confirmed)
-**Version:** 5.1.0
+**Last Updated:** 2026-06-24 (Phase 9c — test scripts, doc refresh, WIB status confirmed)
+**Version:** 1.4.0
 **Status:** Honest assessment of every claimed feature vs. reality.
 
 ---
@@ -10,7 +10,8 @@
 
 This document is the authoritative gap analysis for LHSR. Every claimed capability
 is compared against actual code, verified by reading every line of the kernel module
-(3366 LOC), userspace tools (2655 LOC), and all supporting documentation.
+(6194 LOC in dm-lhsr.c + headers), userspace tools (2655 LOC), and all supporting
+documentation.
 
 No hype. No marketing. Just what works, what doesn't, and what's needed.
 
@@ -24,7 +25,7 @@ No hype. No marketing. Just what works, what doesn't, and what's needed.
 | 2 | Self-healing with auto repair | Phase 1 | ⚠️ Scrub/read-repair work, checksums persistent via dm-integrity stacking | High | Phase 1 |
 | 3 | Anti-bit-rot protection | Phase 1 | ✅ Functional via dm-integrity stacking (persistent CRC32c per-block) | Medium | Phase 1 |
 | 4 | Predictive failure detection | Phase 3 | ✅ SMART polling + SQLite trends + control socket + `predict` CLI wired (daemon discovers real arrays) | Low | Phase 3 |
-| 5 | Live block migration | Phase 16 | ❌ NOT POSSIBLE — mdadm purged, LHSR has no kernel reshape. Use `shr expand` for new tiers | Low | Very Large (would need kernel reshape) |
+| 5 | Live block migration | Phase 16 | ⚠️ Kernel RAID5→RAID6 reshape exists (Phase 9, in-place, crash-safe, read-only during migration). Live data migration from failing disks still not possible — use `shr expand` for new tiers | Low | Large |
 | 6 | Instant RAID recovery | Phase 5 | ⚠️ Read-side reconstruction works, `lhsrctl recover/reconstruct` exist, no partial mount | Medium | Phase 5 |
 | 7 | Incremental rebuild | Phase 2 | ✅ Write-Intent Bitmap (WIB) — persistent, 1MB granularity, rebuild skips clean regions | High | Phase 2 |
 | 8 | Firmware failure mitigation | Phase 0 | ❌ Vaporware (kernel quirks exist, not LHSR's problem) | Low | Small |
@@ -108,6 +109,9 @@ No hype. No marketing. Just what works, what doesn't, and what's needed.
   -EIO through the regular read path; reconstruction path needs verification.
 - **No corruption injection test** — dm-integrity's journal mode makes raw-device
   corruption harder to test (journal replay provides clean data).
+  ✅ Test script added: `tests/test-corruption-injection.sh` (393 lines, stacks
+  dm-integrity below LHSR, injects bit flip via dd, verifies parity reconstruction
+  path). Works with integritysetup; falls back gracefully if missing.
 
 **Required for production:**
 - ✅ ~~Persist checksum data~~: Stack on dm-integrity (Phase 1 implemented).
@@ -152,7 +156,7 @@ background scrubbing, automatic repair.
 **Required for production:**
 - ✅ ~~Decision: adopt dm-integrity~~ Done.
 - ✅ ~~Stack on dm-integrity~~ Done.
-- ⏳ Add corruption-injection test to test suite.
+- ✅ ~~Add corruption-injection test to test suite~~ Done: `tests/test-corruption-injection.sh`.
 
 ---
 
@@ -258,39 +262,44 @@ Linux APIs:
 **Claimed:** Proactive data migration from failing disks before failure, without
 downtime.
 
-**Reality: NOT POSSIBLE (mdadm purged in Phase 16, LHSR has no reshape)**
+**Reality: PARTIAL (Phase 9 — kernel RAID5→RAID6 reshape implemented)**
 
 **What exists:**
+- **Phase 9 (2026-06-23) — Kernel RAID5→RAID6 reshape**: In-place kernel reshape
+  via a dedicated workqueue. Reads Q stripe chunks from each data disk, computes
+  GF(2^8) Q parity, writes with REQ_FUA for crash safety. Progress tracking with
+  mid-batch abort on destroy. Controlled via `dmsetup message` or the
+  `deploy/lhsr-reshape.sh` script.
+  - ✅ In-place — preserves all data, no backup/restore needed
+  - ✅ Crash-safe — mid-reshape failure leaves data consistent; restart resumes
+  - ✅ Progress tracking — percentage, processed/total sectors, current state
+  - ✅ Deploy script — `lhsr-reshape <dev> status|add <new-device>`
+  - ❌ **Writes rejected during reshape** — filesystem must be read-only
+  - ❌ RAID level locked to RAID5→RAID6 only — no general capacity-add reshape
 - `lhsrctl shr expand <device>...` — adds a device as a new SHR tier (new
   RAID array + lvextend). This is a capacity-add operation, not data migration.
 - `lhsrctl shr disk replace <tier> <idx> <device>` — staged disk replacement
   within a tier. Rebuilds data to new disk, then removes old one.
 
-**What changed (Phase 16 — mdadm purge):**
-- All mdadm code paths were removed from the SHR userspace CLI. `shr grow` is
-  now a stub redirecting to `shr expand`.
-- LHSR is a pure DM target with no kernel reshape infrastructure.
-- The previous recommendation to "stack on mdadm" is no longer viable.
-
-**What's missing (permanent limitation):**
-- A DM target has no reshape infrastructure. There is no mechanism in the
-  current code to:
-  - Add a new disk to an existing LHSR RAID array
-  - Recalculate parity across a different set of disks
-  - Atomically switch from old layout to new layout
-  - Track reshape progress for crash recovery
-- Building kernel reshape is a multi-month engineering effort comparable to
-  md's reshape implementation. Not planned.
+**What's missing:**
+- **Live data migration from failing disks**: The reshape only handles RAID level
+  migration (add Q parity disk). There is no mechanism to proactively migrate data
+  off a failing disk onto a hot spare within the same array.
+- **Write-accepting reshape**: Reads work during reshape but writes are rejected.
+  Full online reshape requires bio deferral (deferred — see ROADMAP).
+- **General capacity growth**: Adding disks to grow an existing RAID5/6 array is
+  not supported. Capacity expansion is via new SHR tiers.
 
 **Workaround:**
 - Grow capacity by adding whole new SHR tiers via `shr expand`, not by
   growing existing arrays.
 - Replace failing disks within a tier via `shr disk replace`.
+- For RAID5→RAID6 migration: use `lhsr-reshape.sh` (in-place, read-only mount).
 - The resulting LVM VG spans multiple tiers; data lives on all of them.
 
 **Required for production:**
-- This is a fundamental architecture limitation. Document that online reshape
-  is not supported and is not planned. Capacity expansion is via new tiers.
+- ⏳ Write-accepting reshape (bio deferral during stripe migration).
+- ⏳ General reshape for disk addition (not just RAID5→RAID6).
 
 ---
 
@@ -314,13 +323,12 @@ utilities.
   disks than required for data integrity.
 - **No reconstruction from partial data**: No ability to recover a consistent
   filesystem from N-1 disks by sacrificing some data.
-- **`lhsrctl recover` is a no-op**: The CLI accepts the command but does nothing.
+- ~~`lhsrctl recover` is a no-op~~ ✅ Implemented (Phase 5): scans devices, groups
+  by UUID, generates assembly commands with dm-zero placeholders.
 
 **Required for production:**
-- Implement `lhsrctl recover` — assemble array in degraded mode with available
-  disks.
-- Implement metadata reconstruction — rebuild superblock from remaining disks
-  if one superblock is corrupt.
+- ~~Implement `lhsrctl recover`~~ ✅ Done (Phase 5 — scans, groups, generates assembly commands).
+- ⏳ Metadata reconstruction — rebuild superblock from remaining disks if one is corrupt.
 - ~~Test the read-side reconstruction path~~ ✅ Tested on VM (2026-06-17):
   RAID5 single-data-disk failure: read reconstruction via XOR of survivors,
   SHA256 verify PASS.  RAID6 single-data-disk failure: XOR from data+P parity
@@ -386,9 +394,11 @@ utilities.
 **Required for production:**
 - ✅ ~~Implement write-intent bitmap~~ Done (Phase 2).
 - ✅ ~~Add periodic WIB flush~~ (Done: 30-second timer via `wib_wq` + `delayed_work` in ctr path)
-- ⏳ Add `dmsetup message` interface to query WIB status (dirty page count, etc.)
-- ⏳ Consider RAID5/6 WIB support: clear WIB bits on RAID5/6 writes only if the
-  write covers a full stripe (no read-modify-write needed for recovery)
+- ✅ `dmsetup message` interface to query WIB status exists at `dm-lhsr.c:6005`
+  (`wib_status` handler). Returns dirty page count, total pages, chunk size,
+  per-page state. Missing from docs but present in code.
+- ⏳ WIB clear on RAID5/6 full-stripe writes (minor optimization: skip parity
+  re-read during rebuild if full stripe was cleanly written)
 
 ---
 
@@ -498,8 +508,13 @@ failover.
 **Required for production:**
 - ✅ ~~Hot spare disk replacement per tier~~ Done.
 - ✅ ~~Daemon auto-failover thread~~ Done.
-- ⏳ Auto-failover tested end-to-end (manual testing only).
-- ⏳ Multiple concurrent replacements (e.g., RAID6 dual-disk failure).
+- ✅ Auto-failover end-to-end test: `tests/test-auto-failover.sh` (439 lines,
+  validates daemon array discovery, health monitor polling, consecutive-failure
+  threshold trigger, kernel disk_fail message path).
+- ✅ Concurrent replacements test: `tests/test-concurrent-replacements.sh`
+  (367 lines, RAID6 dual-disk failure + replacement + dual rebuild + integrity
+  verification).
+- ⏳ Real hardware auto-failover test (SMART poll needs real drives).
 
 ---
 
@@ -864,8 +879,12 @@ handles concurrent I/O correctly. The primary remaining issue is performance
 - ✅ ~~Parallel I/O waves~~ (Done: concurrent bio submission, Phase 13)
 - ✅ ~~RMW state machine stress-tested~~ (Done: 15/15 PASS, Phases 12-14)
 - ✅ ~~Periodic WIB flush~~ (Done: 30-second timer via `wib_wq` + `delayed_work`)
-- ⏳ RAID5/6 WIB support (clear bits on full-stripe writes)
+- ✅ ~~WIB status query~~ (Done: `wib_status` dmsetup message handler at line 6005)
+- ✅ ~~RAID5/6 WIB set on write~~ (Done: `lhsr_wib_set()` in RMW path)
+- ⏳ RAID5/6 WIB clear on full-stripe writes (minor optimization)
 - ✅ ~~RAID6 dual-disk failure Reed-Solomon decode~~ (Done: Vandermonde 2x2 in `lhsr_rs_decode_2()`, Phase 11)
+- ✅ ~~Kernel RAID5→RAID6 reshape~~ (Done: in-place, crash-safe, GF(2^8) Q compute, Phase 9)
+- ⏳ Write-accepting reshape (bio deferral during stripe migration)
 
 ---
 
@@ -882,7 +901,8 @@ expand/replace).
 "LHSR is a Linux DM target providing RAID5/6/1 with hardware-accelerated CRC32c
 scrubbing, write-intent bitmap incremental rebuild, read-side self-healing, and
 dm-integrity stacking for persistent anti-bit-rot. The SHR userspace tool adds
-mixed-disk-size tiered RAID with LVM. Online RAID growth/reshape is not
+mixed-disk-size tiered RAID with LVM. In-place kernel RAID5→RAID6 reshape is
+supported (Phase 9, read-only during migration). Online disk-add reshape is not
 supported — add capacity via new SHR tiers. Write performance is ~5-11x slower
 than mdadm (known issue, Phase 15)."
 
