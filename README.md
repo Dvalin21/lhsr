@@ -88,8 +88,11 @@ The daemon (`lhsrd`) runs in userspace and handles:
 
 - **SHR flexible disk sizing** — Synology SHR is mdraid + LVM; LHSR doesn't do
   this.  SHR partition data structures exist but are not populated.
-- **Live reshape** — `mdadm --grow` and RAID level migration are not yet
-  implemented in the kernel.  Offline migration is supported via
+- **Online reshape (writes accepted)** — Reshape currently rejects writes
+  during migration (read-only filesystem required).  An online reshape with
+  bio deferral is planned.  RAID5→RAID6 in-place reshape is implemented via
+  [`deploy/lhsr-reshape.sh`](deploy/lhsr-reshape.sh) (adds Q parity disk,
+  crash-safe, preserves data).  Offline migration is also supported via
   [`deploy/lhsr-migrate.sh`](deploy/lhsr-migrate.sh) (backup → recreate → restore).
 - **Persistent checksum cache** — the CRC32c checksum cache is ephemeral
   (xarray, lost on module unload).  For persistent anti-bit-rot,
@@ -107,7 +110,8 @@ The daemon (`lhsrd`) runs in userspace and handles:
 | Initramfs hook | `deploy/initramfs-hook/lhsr` | Boot-time autodiscovery |
 | Assembly | `deploy/lhsr-assemble.sh` | Scan + dmsetup create for all LHSR arrays |
 | Create | `deploy/lhsr-create.sh` | Validate + initialize + create new arrays |
-| Migrate | `deploy/lhsr-migrate.sh` | Offline RAID level migration (safe path) |
+| Migrate | `deploy/lhsr-migrate.sh` | Offline RAID level migration (safe path, any type) |
+| Reshape | `deploy/lhsr-reshape.sh` | In-place RAID5→RAID6 (add Q disk, preserves data) |
 
 ## Test suite
 

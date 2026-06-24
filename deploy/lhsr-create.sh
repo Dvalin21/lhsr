@@ -48,7 +48,7 @@ Create a new LHSR RAID array.
 RAID types:
   single           1 disk, no redundancy
   mirror           2 disks, mirrored
-  raid5            3+ disks, single distributed parity
+  raid5            3+ disks, single distributed parity (reshapeable to raid6)
   raid6            4+ disks, double distributed parity
 
 Options:

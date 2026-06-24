@@ -126,6 +126,7 @@ sudo cp userspace/config/lhsrd.conf.example /etc/lhsr/lhsrd.conf
 sudo cp deploy/lhsr-create.sh /usr/lib/lhsr/
 sudo cp deploy/lhsr-assemble.sh /usr/lib/lhsr/
 sudo cp deploy/lhsr-migrate.sh /usr/lib/lhsr/
+sudo cp deploy/lhsr-reshape.sh /usr/lib/lhsr/
 ```
 
 ### Loading the module

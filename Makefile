@@ -33,19 +33,31 @@ clean:
 # Install
 install: lib modules userspace
 	$(MAKE) -C kernel/dm-lhsr install
-	cp userspace/cli/lhsrctl /usr/local/bin/lhsrctl
-	cp userspace/cli/lhsrctl /usr/local/sbin/lhsrctl
-	cp userspace/daemon/lhsrd /usr/local/bin/lhsrd
-	cp userspace/daemon/lhsrd /usr/local/sbin/lhsrd
-	cp userspace/recovery/lhsr-scan /usr/local/bin/lhsr-scan
-	cp userspace/recovery/lhsr-scan /usr/local/sbin/lhsr-scan
+	install -d $(DESTDIR)/usr/local/bin $(DESTDIR)/usr/local/sbin
+	cp userspace/cli/lhsrctl $(DESTDIR)/usr/local/bin/lhsrctl
+	cp userspace/cli/lhsrctl $(DESTDIR)/usr/local/sbin/lhsrctl
+	cp userspace/daemon/lhsrd $(DESTDIR)/usr/local/bin/lhsrd
+	cp userspace/daemon/lhsrd $(DESTDIR)/usr/local/sbin/lhsrd
+	cp userspace/recovery/lhsr-scan $(DESTDIR)/usr/local/bin/lhsr-scan
+	cp userspace/recovery/lhsr-scan $(DESTDIR)/usr/local/sbin/lhsr-scan
+	install -d $(DESTDIR)/usr/lib/lhsr
+	cp deploy/lhsr-create.sh $(DESTDIR)/usr/lib/lhsr/lhsr-create.sh
+	cp deploy/lhsr-migrate.sh $(DESTDIR)/usr/lib/lhsr/lhsr-migrate.sh
+	cp deploy/lhsr-reshape.sh $(DESTDIR)/usr/lib/lhsr/lhsr-reshape.sh
+	chmod 755 $(DESTDIR)/usr/lib/lhsr/*.sh
+	ln -sf /usr/lib/lhsr/lhsr-create.sh $(DESTDIR)/usr/local/sbin/lhsr-create 2>/dev/null || true
+	ln -sf /usr/lib/lhsr/lhsr-migrate.sh $(DESTDIR)/usr/local/sbin/lhsr-migrate 2>/dev/null || true
+	ln -sf /usr/lib/lhsr/lhsr-reshape.sh $(DESTDIR)/usr/local/sbin/lhsr-reshape 2>/dev/null || true
 
 # Uninstall
 uninstall:
 	rmmod dm-lhsr 2>/dev/null || true
-	rm -f /usr/local/bin/lhsrctl /usr/local/sbin/lhsrctl
-	rm -f /usr/local/bin/lhsrd /usr/local/sbin/lhsrd
-	rm -f /usr/local/bin/lhsr-scan /usr/local/sbin/lhsr-scan
+	rm -f $(DESTDIR)/usr/local/bin/lhsrctl $(DESTDIR)/usr/local/sbin/lhsrctl
+	rm -f $(DESTDIR)/usr/local/bin/lhsrd $(DESTDIR)/usr/local/sbin/lhsrd
+	rm -f $(DESTDIR)/usr/local/bin/lhsr-scan $(DESTDIR)/usr/local/sbin/lhsr-scan
+	rm -f $(DESTDIR)/usr/local/sbin/lhsr-create $(DESTDIR)/usr/local/sbin/lhsr-migrate
+	rm -f $(DESTDIR)/usr/local/sbin/lhsr-reshape
+	rm -rf $(DESTDIR)/usr/lib/lhsr
 
 # Package
 package:

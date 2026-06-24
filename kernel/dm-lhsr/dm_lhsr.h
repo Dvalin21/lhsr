@@ -106,6 +106,30 @@ struct lhsr_array {
 	struct workqueue_struct *rebuild_wq;
 	struct delayed_work rebuild_work;
 
+	/* Reshape tracking (RAID level migration, e.g. RAID5→RAID6):
+	 *
+	 * Reshape adds a Q parity disk to a RAID5 array.  Because LHSR uses
+	 * right-static parity (P and Q are fixed at the end of the disk
+	 * array), data does NOT move — existing data disks keep their data
+	 * and P parity stays in place.  Reshape is a sequential scan that:
+	 *   1. Reads all data disks at the current stripe
+	 *   2. Computes Q = Σ gf_mul(data[d], g^d) for that stripe
+	 *   3. Writes Q to the new disk at the same stripe offset
+	 *
+	 * During reshape, all non-read I/O is rejected.  Userspace should
+	 * remount the filesystem read-only before starting.
+	 */
+	u32 reshape_state;
+	u32 reshape_target_raid_type;	/* Target RAID type (e.g. LHSR_RAID6) */
+	u64 reshape_offset;		/* Current stripe offset (sectors) */
+	u64 reshape_total;		/* Total sectors to process */
+	u64 reshape_processed;		/* Sectors processed so far */
+	struct block_device *reshape_new_disk;
+	sector_t reshape_new_disk_offset;
+	struct dm_dev *reshape_new_dm_dev;
+	struct workqueue_struct *reshape_wq;
+	struct delayed_work reshape_work;
+
 	/* RAID5/6 RMW write concurrency:
 	 * - Regular (non-ordered) workqueue allows multiple concurrent RMW workers
 	 * - Per-stripe mutex hash prevents concurrent writes to the SAME stripe

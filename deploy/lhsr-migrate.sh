@@ -12,6 +12,13 @@
 #   single → mirror (change to 2-disk mirror, not stripe)
 #   raid5  → raid6 (add 1+ disks, gain double parity)
 #
+# NOTE: For RAID5→RAID6, consider lhsr-reshape(8) instead.
+#   lhsr-reshape adds a Q parity disk IN-PLACE without destroying the
+#   array — no backup, no downtime beyond the reshape window.
+#   Only use lhsr-migrate for raid5→raid6 when the array needs to
+#   change size or the chunk layout.
+#   See: lhsr-reshape --help
+#
 # Usage:
 #   lhsr-migrate <old-dev> <new-raid-type> <new-disks...> [--backup <path>]
 #
@@ -68,6 +75,9 @@ RAID requirements:
   ✓ raid5 → raid6: need at least 4 disks (existing + 1+ new)
   ✓ raid5 → raid5: nop (no change)
   ✓ raid6 → raid6: nop (no change)
+
+NOTE: For RAID5→RAID6, consider lhsr-reshape(8) instead.
+  It migrates IN-PLACE — no backup/restore needed.
 EOF
     exit 0
 }

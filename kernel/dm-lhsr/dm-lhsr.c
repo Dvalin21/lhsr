@@ -121,6 +121,21 @@ static void lhsr_wib_clear_all(struct lhsr_array *arr);
 /* RAID5/6 RMW synchronous worker */
 static void lhsr_rmw_worker(struct work_struct *work);
 
+/* Synchronous single-page bio submit */
+static blk_status_t lhsr_submit_bio_sync(struct block_device *bdev,
+					 struct page *page, size_t len,
+					 sector_t sector, blk_opf_t opf);
+
+/* Superblock write (called from reshape completion) */
+static int lhsr_write_superblock(struct block_device *bdev,
+				 struct lhsr_superblock *sb,
+				 sector_t array_size, sector_t disk_offset);
+
+/* Reshape (RAID5→RAID6 migration) */
+static int lhsr_reshape_start_raid5_to_raid6(struct dm_target *ti,
+					     struct lhsr_array *arr,
+					     char *new_device_path);
+
 static struct bio_set lhsr_bioset;
 
 /* Precomputed 2^i in GF(2^8) for RAID6 Reed-Solomon */
@@ -1997,6 +2012,366 @@ static int lhsr_rebuild_start(struct lhsr_array *arr, unsigned int disk_idx)
 	return 0;
 }
 
+/*
+ * =====================================================================
+ * Reshape: RAID5→RAID6 migration
+ *
+ * Because LHSR uses right-static parity (P and Q are fixed at the end
+ * of the disk array), RAID5→RAID6 reshape requires NO data movement:
+ * existing data disks keep their data at the same positions, and P
+ * parity stays in place.  The only work is computing Q parity for
+ * every stripe and writing it to the new disk.
+ *
+ * During reshape, all non-read I/O is rejected.  Userspace should
+ * remount the filesystem read-only before starting.
+ *
+ * Reshape requires chunk_sectors * SECTOR_SHIFT <= PAGE_SIZE
+ * (default 8 sectors = 4 KB = 1 page).  Arrays with larger chunks
+ * must use mdadm --grow.
+ * =====================================================================
+ */
+
+/* Compute Q parity for one stripe position and write to the new disk.
+ *
+ * Reads chunk_bytes from each data disk at position 'offset', computes
+ * Q = Σ_{d=0}^{data_disks-1} gf_mul(data[d], g^d), and writes Q to the
+ * new disk at the same offset with REQ_FUA.
+ *
+ * Requires arr->chunk_sectors * SECTOR_SHIFT <= PAGE_SIZE (enforced
+ * by the reshape start function).
+ *
+ * Returns 0 on success, -ENOMEM on allocation failure, -EIO on I/O
+ * error.
+ */
+static int lhsr_reshape_compute_q_stripe(struct lhsr_array *arr,
+					 sector_t offset)
+{
+	unsigned int data_disks = arr->disks - 1; /* RAID5: total disks - P */
+	size_t chunk_bytes = (size_t)arr->chunk_sectors << SECTOR_SHIFT;
+	struct page *q_page;
+	struct page *read_page;
+	unsigned int d;
+	int ret = 0;
+
+	q_page = alloc_page(GFP_KERNEL);
+	read_page = alloc_page(GFP_KERNEL);
+	if (!q_page || !read_page) {
+		if (q_page)
+			__free_page(q_page);
+		if (read_page)
+			__free_page(read_page);
+		return -ENOMEM;
+	}
+
+	/*
+	 * Compute Q = Σ gf_mul(data[d], g^d) into q_buf.
+	 * Map q_page once and accumulate per data disk.
+	 */
+	{
+		u8 *q_buf = kmap_local_page(q_page);
+		size_t i;
+
+		memset(q_buf, 0, chunk_bytes);
+
+		for (d = 0; d < data_disks; d++) {
+			u8 coeff = rs_power_table[d];
+			blk_status_t st;
+			u8 *src;
+
+			st = lhsr_submit_bio_sync(arr->disk[d], read_page,
+						  chunk_bytes,
+						  offset + arr->disk_offset[d],
+						  REQ_OP_READ | REQ_SYNC);
+			if (st != BLK_STS_OK) {
+				DMERR("reshape: read disk %u at %llu failed: %d",
+				      d, (u64)(offset + arr->disk_offset[d]),
+				      st);
+				ret = -EIO;
+				kunmap_local(q_buf);
+				goto out;
+			}
+
+			src = kmap_local_page(read_page);
+			for (i = 0; i < chunk_bytes; i++)
+				q_buf[i] ^= lhsr_gf_mul(src[i], coeff);
+			kunmap_local(src);
+		}
+		kunmap_local(q_buf);
+	}
+
+	/* Write Q to new disk with FUA */
+	{
+		blk_status_t st;
+
+		st = lhsr_submit_bio_sync(arr->reshape_new_disk, q_page,
+					  chunk_bytes,
+					  offset + arr->reshape_new_disk_offset,
+					  REQ_OP_WRITE | REQ_SYNC | REQ_FUA);
+		if (st != BLK_STS_OK) {
+			DMERR("reshape: write Q at %llu failed: %d",
+			      (u64)(offset + arr->reshape_new_disk_offset),
+			      st);
+			ret = -EIO;
+		}
+	}
+
+out:
+	__free_page(q_page);
+	__free_page(read_page);
+	return ret;
+}
+
+/* Reshape work function — processes stripes sequentially.
+ *
+ * Each invocation processes a batch of
+ * LHSR_RESHAPE_STRIPES_PER_WORKITEM stripes to amortize workqueue
+ * scheduling overhead, then re-queues itself with a 1-jiffy delay
+ * to yield the CPU.
+ *
+ * When all stripes are processed, switches the array to RAID6,
+ * populates the new disk slot, and persists updated superblocks
+ * on all members.
+ */
+#define LHSR_RESHAPE_STRIPES_PER_WORKITEM 256
+
+static void reshape_work(struct work_struct *work)
+{
+	struct delayed_work *dwork = to_delayed_work(work);
+	struct lhsr_array *arr = container_of(dwork, struct lhsr_array,
+					      reshape_work);
+	unsigned int chunk_sects = arr->chunk_sectors;
+	unsigned int processed = 0;
+	int ret;
+
+	if (!arr || arr->reshape_state != LHSR_RESHAPE_RUNNING)
+		return;
+
+	if (atomic_read(&arr->destroying)) {
+		DMDEBUG("reshape: array being destroyed, aborting");
+		return;
+	}
+
+	/* Check if done */
+	if (arr->reshape_offset >= arr->disk_sectors) {
+		unsigned int new_idx;
+		unsigned int i;
+
+		DMINFO("Reshape complete: %llu sectors processed (Q parity disk added)",
+		       arr->reshape_processed);
+
+		/* Critical section: update array metadata under sb_sem */
+		down_write(&arr->sb_sem);
+
+		/* Populate new disk slot BEFORE incrementing disks */
+		new_idx = arr->disks; /* old count = Q disk index */
+		arr->disk[new_idx] = arr->reshape_new_disk;
+		arr->dm_devs[new_idx] = arr->reshape_new_dm_dev;
+		arr->disk_offset[new_idx] = 0;
+
+		/* Switch array to RAID6 and bump disk count */
+		arr->raid_type = LHSR_RAID6;
+		arr->disks = new_idx + 1;
+		arr->generation++;
+
+		/* Initialize superblock for new disk */
+		memset(&arr->sbs[new_idx], 0, sizeof(arr->sbs[new_idx]));
+		memcpy(arr->sbs[new_idx].magic, LHSR_MAGIC, 8);
+		arr->sbs[new_idx].version = LHSR_SB_VERSION;
+		arr->sbs[new_idx].array_uuid = arr->array_uuid;
+		arr->sbs[new_idx].disk_state = LHSR_DISK_HEALTHY;
+		arr->sbs[new_idx].disk_count = arr->disks;
+		arr->sbs[new_idx].raid_type = LHSR_RAID6;
+		arr->sbs[new_idx].generation = arr->generation;
+		arr->sbs[new_idx].last_update = ktime_get_real_seconds();
+
+		/* Persist updated superblocks on ALL disks (including new) */
+		for (i = 0; i < arr->disks; i++) {
+			if (!arr->disk[i])
+				continue;
+			arr->sbs[i].raid_type = LHSR_RAID6;
+			arr->sbs[i].disk_count = arr->disks;
+			arr->sbs[i].generation = arr->generation;
+			arr->sbs[i].last_update = ktime_get_real_seconds();
+			lhsr_write_superblock(arr->disk[i],
+					      &arr->sbs[i],
+					      arr->disk_sectors,
+					      arr->disk_offset[i]);
+		}
+
+		/* Clean up reshape tracking */
+		arr->reshape_new_disk = NULL;
+		arr->reshape_new_dm_dev = NULL;
+		arr->reshape_state = LHSR_RESHAPE_COMPLETE;
+
+		up_write(&arr->sb_sem);
+
+		DMINFO("Reshape: array switched to RAID6 (%u disks)",
+		       arr->disks);
+		return;
+	}
+
+	/* Process a batch of stripes */
+	while (processed < LHSR_RESHAPE_STRIPES_PER_WORKITEM &&
+	       arr->reshape_offset < arr->disk_sectors) {
+
+		if (atomic_read(&arr->destroying)) {
+			DMDEBUG("reshape: aborting mid-batch (destroying)");
+			return;
+		}
+
+		ret = lhsr_reshape_compute_q_stripe(arr, arr->reshape_offset);
+		if (ret) {
+			DMERR("reshape: failed at offset %llu: %d",
+			      (u64)arr->reshape_offset, ret);
+			arr->reshape_state = LHSR_RESHAPE_FAILED;
+			return;
+		}
+
+		arr->reshape_offset += chunk_sects;
+		arr->reshape_processed += chunk_sects;
+		processed++;
+	}
+
+	if (processed > 0)
+		DMDEBUG("reshape: processed %u stripes, offset=%llu/%llu",
+			processed, (u64)arr->reshape_offset,
+			(u64)arr->disk_sectors);
+
+	/* Re-queue with 1-jiffy delay to yield CPU */
+	queue_delayed_work(arr->reshape_wq, &arr->reshape_work, 1);
+}
+
+/* Start RAID5→RAID6 reshape, adding a new disk for Q parity.
+ *
+ * Validates preconditions:
+ *   - Array is RAID5 (LHSR_RAID5)
+ *   - No reshape currently in progress
+ *   - New device is openable and at least as large as existing disks
+ *   - chunk_sectors * SECTOR_SHIFT <= PAGE_SIZE
+ *   - All disks healthy (failed_disks == 0)
+ *   - Array fits within LHSR_MAX_DISKS with one more disk
+ *
+ * On success: opens the new device, writes a superblock to it,
+ * sets reshape_state to RUNNING, and schedules the reshape workqueue.
+ * The new dm_dev is stored in reshape_new_dm_dev for later cleanup.
+ */
+static int lhsr_reshape_start_raid5_to_raid6(struct dm_target *ti,
+					     struct lhsr_array *arr,
+					     char *new_device_path)
+{
+	struct dm_dev *new_dm_dev;
+	int r;
+
+	/* Preconditions */
+	if (arr->raid_type != LHSR_RAID5) {
+		DMERR("reshape: array is not RAID5 (type=%u)", arr->raid_type);
+		return -EINVAL;
+	}
+
+	if (arr->reshape_state != LHSR_RESHAPE_NONE &&
+	    arr->reshape_state != LHSR_RESHAPE_COMPLETE) {
+		DMDEBUG("reshape: already in progress (state=%u)",
+			arr->reshape_state);
+		return -EBUSY;
+	}
+
+	if (arr->disks >= LHSR_MAX_DISKS) {
+		DMERR("reshape: array already at max disks (%u)", arr->disks);
+		return -ENOSPC;
+	}
+
+	if (lhsr_failed_disks_get(arr) != 0) {
+		DMERR("reshape: cannot reshape degraded array (failed=0x%lx)",
+		      lhsr_failed_disks_get(arr));
+		return -EINVAL;
+	}
+
+	if ((size_t)arr->chunk_sectors << SECTOR_SHIFT > PAGE_SIZE) {
+		DMERR("reshape: chunk size %u sectors > PAGE_SIZE (%lu) "
+		      "not supported for reshape",
+		      arr->chunk_sectors, (unsigned long)PAGE_SIZE);
+		return -EOPNOTSUPP;
+	}
+
+	/* Get the new device from DM */
+	r = dm_get_device(ti, new_device_path,
+			  dm_table_get_mode(ti->table), &new_dm_dev);
+	if (r) {
+		DMERR("reshape: cannot open new device '%s': %d",
+		      new_device_path, r);
+		return r;
+	}
+
+	/* Validate new disk size */
+	{
+		sector_t ns = bdev_nr_sectors(new_dm_dev->bdev);
+
+		if (ns < arr->disk_sectors) {
+			DMERR("reshape: new device too small: %llu sectors "
+			      "(need at least %llu)",
+			      (u64)ns, (u64)arr->disk_sectors);
+			dm_put_device(ti, new_dm_dev);
+			return -EINVAL;
+		}
+	}
+
+	/* Write initial superblock to new device */
+	{
+		struct lhsr_superblock sb;
+		int sb_ret;
+
+		memset(&sb, 0, sizeof(sb));
+		memcpy(sb.magic, LHSR_MAGIC, 8);
+		sb.version = LHSR_SB_VERSION;
+		sb.array_uuid = arr->array_uuid;
+		sb.raid_type = LHSR_RAID6; /* Target type after completion */
+		sb.disk_state = LHSR_DISK_HEALTHY;
+		sb.disk_count = arr->disks + 1;
+		sb.generation = arr->generation + 1;
+		sb.last_update = ktime_get_real_seconds();
+
+		sb_ret = lhsr_write_superblock(new_dm_dev->bdev, &sb,
+					       arr->disk_sectors, 0);
+		if (sb_ret) {
+			DMERR("reshape: failed to write superblock: %d", sb_ret);
+			dm_put_device(ti, new_dm_dev);
+			return sb_ret;
+		}
+	}
+
+	/* Store new device info for reshape tracking */
+	arr->reshape_new_disk = new_dm_dev->bdev;
+	arr->reshape_new_disk_offset = 0;
+	arr->reshape_new_dm_dev = new_dm_dev;
+
+	/* Allocate reshape workqueue if needed */
+	if (!arr->reshape_wq) {
+		arr->reshape_wq = alloc_workqueue("lhsr_reshape",
+						  WQ_MEM_RECLAIM | WQ_UNBOUND,
+						  1);
+		if (!arr->reshape_wq) {
+			dm_put_device(ti, new_dm_dev);
+			arr->reshape_new_disk = NULL;
+			arr->reshape_new_dm_dev = NULL;
+			return -ENOMEM;
+		}
+	}
+
+	/* Set running state and start */
+	arr->reshape_state = LHSR_RESHAPE_RUNNING;
+	arr->reshape_offset = 0;
+	arr->reshape_total = arr->disk_sectors;
+	arr->reshape_processed = 0;
+
+	INIT_DELAYED_WORK(&arr->reshape_work, reshape_work);
+	queue_delayed_work(arr->reshape_wq, &arr->reshape_work, 0);
+
+	DMINFO("Reshape started: RAID5→RAID6 on '%s', %llu sectors (%llu stripes)",
+	       new_device_path, (u64)arr->reshape_total,
+	       (u64)(arr->reshape_total / arr->chunk_sectors));
+	return 0;
+}
+
 /* Target constructor */
 static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
@@ -2223,6 +2598,15 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	arr->last_check = jiffies;
 	arr->write_verify_enabled = 0;
 	atomic_set(&arr->destroying, 0);
+	arr->reshape_state = LHSR_RESHAPE_NONE;
+	arr->reshape_target_raid_type = LHSR_RAID6;
+	arr->reshape_offset = 0;
+	arr->reshape_total = 0;
+	arr->reshape_processed = 0;
+	arr->reshape_new_disk = NULL;
+	arr->reshape_new_disk_offset = 0;
+	arr->reshape_new_dm_dev = NULL;
+	arr->reshape_wq = NULL;
 
 	/* Initialize concurrency primitives */
 	init_rwsem(&arr->sb_sem);
@@ -2733,6 +3117,36 @@ static void lhsr_dtr(struct dm_target *ti)
 		destroy_workqueue(arr->rebuild_wq);
 		arr->rebuild_wq = NULL;
 		DMINFO("dtr: Rebuild stopped");
+	}
+
+	DMINFO("dtr: Stopping reshape (reshape_wq=%p)", arr->reshape_wq);
+
+	/* Stop reshape and release the new disk device if reshape
+	 * was in progress or completed without being fully absorbed
+	 * into the array slots.
+	 */
+	if (arr->reshape_wq) {
+		DMINFO("dtr: Canceling reshape workqueue...");
+		arr->reshape_state = LHSR_RESHAPE_NONE;
+		if (!cancel_delayed_work_sync(&arr->reshape_work)) {
+			DMWARN("dtr: reshape_work did not complete, forcing");
+			flush_workqueue(arr->reshape_wq);
+		}
+		destroy_workqueue(arr->reshape_wq);
+		arr->reshape_wq = NULL;
+		DMINFO("dtr: Reshape workqueue destroyed");
+	}
+
+	/*
+	 * If reshape had a new dm_dev that was never absorbed into
+	 * arr->dm_devs[] (reshape was started but not completed),
+	 * release it here to prevent a leak.
+	 */
+	if (arr->reshape_new_dm_dev) {
+		dm_put_device(ti, arr->reshape_new_dm_dev);
+		arr->reshape_new_dm_dev = NULL;
+		arr->reshape_new_disk = NULL;
+		DMINFO("dtr: Released reshape new device");
 	}
 
 	/* Stop periodic WIB flush before flushing dirty pages */
@@ -4454,6 +4868,21 @@ static int lhsr_map(struct dm_target *ti, struct bio *bio)
 		return DM_MAPIO_SUBMITTED;
 	}
 
+	/* Reshape in progress: reject non-read I/O.
+	 * Data hasn't moved (right-static parity), so reads are safe.
+	 * Writes would change data/P parity without Q parity present,
+	 * leaving the array inconsistent after reshape completes Q.
+	 */
+	if (arr->reshape_state == LHSR_RESHAPE_RUNNING &&
+	    bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_FLUSH) {
+		DMDEBUG("Reshape: rejecting %s I/O at sector %llu",
+			bio_op(bio) == REQ_OP_WRITE ? "WRITE" : "DISCARD",
+			(u64)(bio->bi_iter.bi_sector - ti->begin));
+		bio->bi_status = BLK_STS_IOERR;
+		bio_endio(bio);
+		return DM_MAPIO_SUBMITTED;
+	}
+
 	if (bio_op(bio) == REQ_OP_FLUSH) {
 		struct lhsr_mirror_ctx *mctx;
 		unsigned int i, working = 0;
@@ -5409,6 +5838,113 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			return 1;
 		}
 
+		return -EINVAL;
+	}
+
+	/* reshape command — RAID level migration */
+	if (strcmp(argv[0], "reshape") == 0) {
+		/* Query status */
+		if (argc == 1 || (argc >= 2 && strcmp(argv[1], "status") == 0)) {
+			const char *state_str = "NONE";
+			u32 pct = 0;
+
+			switch (arr->reshape_state) {
+			case LHSR_RESHAPE_RUNNING:
+				state_str = "RUNNING";
+				if (arr->reshape_total)
+					pct = (u32)((arr->reshape_processed * 100) /
+						    arr->reshape_total);
+				break;
+			case LHSR_RESHAPE_COMPLETE:
+				state_str = "COMPLETE";
+				pct = 100;
+				break;
+			case LHSR_RESHAPE_FAILED:
+				state_str = "FAILED";
+				break;
+			case LHSR_RESHAPE_PENDING:
+				state_str = "PENDING";
+				break;
+			}
+
+			scnprintf(result, maxlen,
+				  "reshape: state=%s progress=%u%%"
+				  " (%llu/%llu sectors) target=%s",
+				  state_str, pct,
+				  (u64)arr->reshape_processed,
+				  (u64)arr->reshape_total,
+				  arr->reshape_target_raid_type == LHSR_RAID6 ?
+					"raid6" : "unknown");
+			return 1;
+		}
+
+		if (argc < 3)
+			return -EINVAL;
+
+		/*
+		 * Format: dmsetup message <device> 0 reshape raid6 add /dev/sdX
+		 *   argv[1] = target RAID type ("raid6")
+		 *   argv[2] = action ("add")
+		 *   argv[3] = new device path
+		 */
+		if (strcmp(argv[1], "raid6") == 0 &&
+		    strcmp(argv[2], "add") == 0) {
+			int err;
+
+			if (argc < 4) {
+				DMERR("reshape: missing device path");
+				return -EINVAL;
+			}
+
+			err = lhsr_reshape_start_raid5_to_raid6(ti, arr,
+								argv[3]);
+			if (err) {
+				/*
+				 * -EBUSY: reshape already in progress
+				 * (dmsetup retries the ioctl on
+				 * DM_BUFFER_FULL_FLAG — kernel started the
+				 * reshape on the first call).
+				 *
+				 * Return 0 (not 1) on retry so dmsetup stops
+				 * asking. Returning 1 sets DM_DATA_OUT_FLAG
+				 * which causes dmsetup to retry with ever-
+				 * larger buffers. The result buffer overlaps
+				 * tmsg->message in kernel memory; repeated
+				 * retries corrupt the argv pointers and
+				 * eventually crash in string_nocheck.
+				 */
+				if (err == -EBUSY &&
+				    arr->reshape_state ==
+					LHSR_RESHAPE_RUNNING) {
+					DMINFO("reshape: already running, "
+					       "accepting retry");
+					scnprintf(result, maxlen,
+						  "Reshape already running");
+					return 0;
+				} else {
+					scnprintf(result, maxlen,
+						  "Reshape failed: %d", err);
+					return err;
+				}
+			}
+
+			/*
+			 * Use reply buffer on stack then copy to result.
+			 * result overlaps tmsg->message in kernel memory;
+			 * writing to result before reading argv[3] for %s
+			 * would read already-overwritten data.
+			 */
+			{
+				char reply[256];
+				scnprintf(reply, sizeof(reply),
+					  "Reshape RAID5→RAID6 started, "
+					  "adding %s", argv[3]);
+				strscpy(result, reply, maxlen);
+			}
+			return 1;
+		}
+
+		DMERR("reshape: unknown subcommand '%s'", argv[1]);
 		return -EINVAL;
 	}
 

@@ -6,6 +6,91 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [8.0.0] — 2026-06-23 — Phase 9: Kernel RAID5→RAID6 Reshape
+
+### Added (Phase 9a: Data Layout Analysis)
+
+- Right-static parity confirmed: P at `data_disks`, Q at `data_disks+1`.
+  No rotation across stripes.  RAID5→RAID6 reshape only needs to compute
+  Q parity for all stripes (existing data and P stay in place).
+- GF(2^8) coefficients use same `rs_power_table[d]` as RMW path.
+
+### Added (Phase 9b-9c: Reshape Implementation)
+
+#### Reshape state constants (`include/lhsr.h`)
+- `LHSR_RESHAPE_NONE`, `LHSR_RESHAPE_PENDING`, `LHSR_RESHAPE_RUNNING`,
+  `LHSR_RESHAPE_COMPLETE`, `LHSR_RESHAPE_FAILED`
+
+#### Reshape tracking fields (`dm_lhsr.h` — `struct lhsr_array`)
+- `reshape_state`, `reshape_target_raid_type`
+- `reshape_offset`, `reshape_total`, `reshape_processed`
+- `reshape_new_disk`, `reshape_new_disk_offset`, `reshape_new_dm_dev`
+- `reshape_wq` (single-threaded workqueue), `reshape_work` (delayed work)
+
+#### `lhsr_reshape_compute_q_stripe()` (kernel)
+- Reads one chunk from each data disk at stripe offset
+- GF(2^8) multiply-accumulate: `Q = Σ gf_mul(data[d], g^d)`
+- Writes Q chunk to new disk with `REQ_FUA` for crash safety
+- Single-page I/O via `lhsr_submit_bio_sync()`
+
+#### `reshape_work()` (kernel)
+- Processes 256 stripes per batch (yields CPU with 1-jiffy delay)
+- Completion: populates new disk slot, bumps disk count, switches to RAID6,
+  persists superblocks on ALL disks under `sb_sem` write lock
+- Mid-batch abort on `destroying` flag
+
+#### `lhsr_reshape_start_raid5_to_raid6()` (kernel)
+- Validates: RAID5 type, no active reshape, healthy disks, chunk ≤ PAGE_SIZE
+- Opens new device via `dm_get_device`, writes initial superblock with generation+1
+- Allocates reshape workqueue, sets `LHSR_RESHAPE_RUNNING`, queues work
+
+#### `reshape` message command (kernel)
+- `dmsetup message <dev> 0 reshape` — query state/progress (NONE/PENDING/RUNNING/
+  COMPLETE/FAILED, percentage, processed/total sectors, target RAID type)
+- `dmsetup message <dev> 0 reshape raid6 add /dev/sdX` — start reshape
+- Write rejection in `lhsr_map()` during reshape (same pattern as degraded mode)
+- Cleanup in `lhsr_dtr()`: cancel work, destroy workqueue, `dm_put_device` for
+  reshape_new_dm_dev if not absorbed
+
+#### Deploy script (`deploy/lhsr-reshape.sh`)
+- `lhsr-reshape <dev> status` — query reshape state/progress
+- `lhsr-reshape <dev> add <new-device>` — start RAID5→RAID6 reshape
+- Validates: source is RAID5, not already reshaping, new device unused,
+  source not mounted rw
+- Monitors progress with live `%` display (2-second polling)
+- Detects stall (>40 seconds without progress) and warns user
+
+#### Deploy script updates
+- `deploy/lhsr-migrate.sh` — references `lhsr-reshape` as preferred alternative
+  for RAID5→RAID6
+- `deploy/lhsr-create.sh` — notes raid5 is reshapeable to raid6 in help text
+- `Makefile install/uninstall` — deploys all three scripts to `/usr/lib/lhsr/`
+  with symlinks in `/usr/local/sbin/`
+
+### Changed
+- `include/lhsr.h`: Reshape state constants added
+- `kernel/dm-lhsr/dm_lhsr.h`: Reshape fields added to `struct lhsr_array`
+- `kernel/dm-lhsr/dm-lhsr.c`: +~200 lines reshape implementation, +15 lines
+  forward declarations + I/O rejection in `lhsr_map()` + workqueue cleanup in
+  `lhsr_dtr()` + reshape fields zeroed in `lhsr_ctr()`
+- `README.md`: "What it does NOT do (yet)" updated — live reshape documented
+  as planned, in-place reshape listed as implemented; component table includes
+  `lhsr-reshape.sh`
+- `INSTALL.md`: `lhsr-reshape.sh` added to deployment script install step
+- `Makefile`: install/uninstall targets updated for deploy scripts
+- `CHANGELOG.md`: Phase 9 entries added
+
+### New files
+| File | Description | Lines |
+|------|-------------|-------|
+| `deploy/lhsr-reshape.sh` | In-place RAID5→RAID6 migration via kernel reshape | ~270 |
+
+### Build
+- Zero compiler warnings on kernel module (all targets)
+- No checkpatch issues (stated expected warning for macro)
+
+---
+
 ## [7.0.0] — 2026-06-23 — Phase 5-7: Production Readiness + Deployment Scripts + Documentation
 
 ### Added (Phase 5: Production Tooling)

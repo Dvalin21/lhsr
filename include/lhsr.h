@@ -204,6 +204,16 @@ typedef uint64_t __u64;
 #define LHSR_REBUILD_COMPLETE  3
 
 /* ===================================================================
+ * Reshape states (RAID level migration)
+ * =================================================================== */
+
+#define LHSR_RESHAPE_NONE      0
+#define LHSR_RESHAPE_PENDING   1
+#define LHSR_RESHAPE_RUNNING   2
+#define LHSR_RESHAPE_COMPLETE  3
+#define LHSR_RESHAPE_FAILED    4
+
+/* ===================================================================
  * ON-DISK SUPERBLOCK — SINGLE SOURCE OF TRUTH
  *
  * All 128 bytes.  Packed.  If you change this struct you MUST:
