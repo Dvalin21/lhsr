@@ -6053,7 +6053,7 @@ static int lhsr_iterate_devices(struct dm_target *ti,
 
 static struct target_type lhsr_target = {
 	.name = "lhsr",
-	.version = {1, 3, 0},
+	.version = {1, 4, 0},
 	.ctr = lhsr_ctr,
 	.dtr = lhsr_dtr,
 	.map = lhsr_map,

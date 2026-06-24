@@ -1,6 +1,6 @@
 # LHSR Installation & Deployment Guide
 
-**Version:** 1.3.0 | **License:** GPLv3 | **Kernel:** 5.15+ (tested on 6.12.x)
+**Version:** 1.4.0 | **License:** GPLv3 | **Kernel:** 5.15+ (tested on 6.12.94+deb13)
 
 ---
 
@@ -375,19 +375,62 @@ sudo insmod /lib/modules/$(uname -r)/kernel/drivers/md/dm-lhsr.ko rmw_max_active
 
 ## Array Migration
 
-> **Important**: LHSR does not yet support in-place RAID level migration
-> (kernel reshape). The migration script handles the **offline** path:
-> backup → destroy old → create new → restore.
+LHSR supports two migration paths: **in-place reshape** (kernel-based, preserves
+data, crash-safe) for RAID5→RAID6, and **offline migration** (backup → destroy →
+restore) for all other valid paths.
+
+### In-place reshape (RAID5→RAID6)
+
+The `lhsr-reshape.sh` script performs an in-place kernel RAID5→RAID6 migration:
+
+```bash
+# 1. Unmount filesystem (reshape requires read-only access)
+sudo umount /dev/mapper/myarray
+
+# 2. Check current state
+sudo lhsr-reshape.sh /dev/mapper/myarray status
+# → reshape_state=NONE (ready)
+
+# 3. Start reshape (adds Q parity disk)
+sudo lhsr-reshape.sh /dev/mapper/myarray add /dev/sdd
+# → Reshape: 0% (0/200000 sectors)
+# → Reshape: 45% (90000/200000 sectors)
+# → Reshape: 100% COMPLETE
+
+# 4. Verify
+sudo dmsetup status myarray
+# → 0 200000 lhsr OK RAID6 4/4 err=0
+
+# 5. Remount
+sudo mount /dev/mapper/myarray /mnt/data
+```
+
+The script:
+- Validates source is RAID5, no existing reshape, device not mounted rw
+- Opens new device, verifies it is unused
+- Computes Q parity for every stripe via GF(2^8) multiply-accumulate
+- Writes with REQ_FUA for crash safety (resumable after power loss)
+- Monitors progress with live `%` display (2-second polling)
+- Detects stalls (>40s without progress) and warns
+
+> **Note:** Writes are rejected during reshape. The filesystem must be
+> unmounted or mounted read-only. DO NOT run reshape on a read-write mounted
+> array.
+
+### Offline migration (backup → restore)
+
+For all other migration paths (single→raid5, single→mirror, raid5→raid6 as
+alternative to reshape), use `lhsr-migrate.sh`:
 
 ### Supported paths
 
-| From | To | Minimum disks |
-|------|----|---------------|
-| single | raid5 | 3 |
-| single | mirror | 2 |
-| raid5 | raid6 | 4 |
+| From | To | Minimum disks | Method |
+|------|----|---------------|--------|
+| raid5 | raid6 | 4 | In-place reshape (recommended) or offline |
+| single | raid5 | 3 | Offline only |
+| single | mirror | 2 | Offline only |
 
-### Procedure
+### Offline migration procedure
 
 ```bash
 # 1. Backup the filesystem
@@ -395,7 +438,7 @@ sudo lhsr-migrate.sh /dev/mapper/oldarray raid6 \
     /dev/sdb /dev/sdc /dev/sdd /dev/sde /dev/sdf \
     --backup /backup/lhsr-migration
 
-# 2. Or with existing backup
+# 2. Or with existing backup (skip backup step)
 sudo lhsr-migrate.sh /dev/mapper/oldarray raid5 \
     /dev/sdb /dev/sdc /dev/sdd /dev/sde \
     --no-backup
@@ -566,7 +609,6 @@ sudo rmmod dm_lhsr
 
 # 4. Install new version
 sudo make install
-sudo cp deploy/lhsr-*.sh /usr/lib/lhsr/
 
 # 5. Update initramfs
 sudo update-initramfs -u

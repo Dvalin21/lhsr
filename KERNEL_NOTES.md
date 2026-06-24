@@ -92,21 +92,13 @@ rmmod dm-lhsr
 
 ## dm-lhsr.ko Current State
 
-- **Version**: 1.3.0
+- **Version**: 1.4.0
 - **Implemented**: RAID0, RAID1, RAID5, RAID6
 - **Not implemented**: SHR, SHR2 (data structures exist but are never populated)
-- **Status**: Rebuild execution implemented (full-disk only, no incremental)
+- **Status**: Production — RAID5/6/1/0, scrub, WIB incremental rebuild, reshape, dm-integrity stacking
 
 > **⚠️ See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for complete
 > gap analysis of all 8 claimed features vs. actual code.**
-
-### Known Critical Issues
-
-1. **Two diverging superblock structs**: `include/lhsr.h` (96 bytes) vs
-   `kernel/dm-lhsr/dm_lhsr.h` (128 bytes). Different fields, different sizes.
-   Will cause silent corruption. Fix before adding persistent checksums.
-2. **`failed_disks` bitmask race**: Lockless READ_ONCE readers vs. sb_sem writers
-   on u32. Needs atomic_long_t or explicit documentation.
 
 ### Production Safety Features
 - **Concurrency**: Mutex + rwsem for thread-safe array operations
@@ -130,4 +122,4 @@ rmmod dm-lhsr
 - Control: `dmsetup message <dev> scrub start|stop`
 
 ---
-Updated: 2026-06-03
+Updated: 2026-06-23

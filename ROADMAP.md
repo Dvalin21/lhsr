@@ -1,6 +1,6 @@
 # LHSR Roadmap
 
-**Last Updated:** 2026-06-20 (Phase 5 ✅ COMPLETE, Phase 3.7 HTTP metrics ✅, Phase 5.3 RS decode ✅)
+**Last Updated:** 2026-06-23 (Phase 9 ✅ kernel reshape, full doc refresh)
 
 ---
 
@@ -650,27 +650,44 @@ lhsrctl shr disk replace <tier_name> <disk_idx> <new_dev>
 
 ---
 
-## Phase 9: Live Migration — `shr grow` (REMOVED — replaced by Phase 16 purge)
+## Phase 9: Kernel RAID5→RAID6 Reshape ✅ COMPLETE (2026-06-23)
 
-**Status:** `shr grow` was originally implemented for mdadm-mode SHR tiers.
-With the mdadm purge (Phase 16), `shr grow` is now a stub that redirects
-users to `shr expand`. LHSR has no kernel reshape infrastructure — add
-capacity via new tiers, not by growing existing ones.
+**Status:** Kernel-based in-place RAID5→RAID6 reshape. Adds a Q parity disk
+to an existing RAID5 array, computing GF(2^8) Q parity for every stripe.
+Crash-safe, preserves all data, no backup/restore needed.
 
-### Why removed
-- mdadm is no longer a supported SHR backend
-- LHSR kernel module has no online reshape (would require multi-month
-  kernel engineering comparable to md's reshape infrastructure)
-- `shr expand` already provides the tier-addition workflow
+### Implementation
+- **Kernel module** (`dm-lhsr.c`): +536 lines
+  - `lhsr_reshape_compute_q_stripe()` — reads one chunk from each data disk,
+    GF(2^8) multiply-accumulate, writes Q with REQ_FUA
+  - `reshape_work()` — processes 256 stripes per batch (yields CPU at 1 jiffy),
+    mid-batch abort on destroy, completion persists superblocks on ALL disks
+  - `lhsr_reshape_start_raid5_to_raid6()` — validates RAID5 type, no active
+    reshape, healthy disks, chunk ≤ PAGE_SIZE; opens new device, writes initial
+    superblock with generation+1
+  - `reshape` dmsetup message — query state/progress (`NONE/PENDING/RUNNING/
+    COMPLETE/FAILED`, percentage, processed/total, target RAID type)
+  - Write rejection in `lhsr_map()` during reshape (filesystem must be read-only)
+- **Deploy script** (`deploy/lhsr-reshape.sh`): ~270 lines
+  - `lhsr-reshape <dev> status` — query progress
+  - `lhsr-reshape <dev> add <new-device>` — start reshape
+  - Live progress display (2s polling), stall detection (>40s)
 
-### Alternative
-```
-lhsrctl shr expand <device>...   # add as new tier + lvextend
+### Limitations
+- **Writes rejected during reshape** — filesystem must be read-only
+- **RAID5→RAID6 only** — no general disk-add or level-change reshape
+- Write-accepting reshape with bio deferral is deferred (see future)
+- New disk must be at least as large as existing array members
+
+### Usage
+```bash
+lhsr-reshape /dev/mapper/lhsr-abc add /dev/sdf    # start reshape
+lhsr-reshape /dev/mapper/lhsr-abc status           # check progress
 ```
 
 ---
 
-## Phase 10: Production Hardening & Kernel Reshape (COMPLETE)
+## Phase 10: Production Hardening & Parallel RMW Dispatch (COMPLETE)
 
 Sub-phases: C (Monitoring) → D (Benchmarks) → A (Kernel Reshape).
 
@@ -719,7 +736,9 @@ with no pipelining. This baseline quantifies the gap before Phase A targets
 parallel I/O dispatch. See `docs/plans/2026-06-17-phase10-benchmarks-results.md`
 for full results.
 
-### Phase 10-A: Kernel Reshape — Concurrent RMW Write Dispatch (✅ COMPLETE 2026-06-17)
+### Phase 10-A: Parallel RMW Write Dispatch (✅ COMPLETE 2026-06-17)
+*(Title "Kernel Reshape" was misleading — this was about workqueue parallelism,
+not RAID level reshape. Actual RAID5→RAID6 reshape is Phase 9.)*
 
 Replaced `alloc_ordered_workqueue()` (1 worker, serialized ALL writes) with
 `alloc_workqueue(WQ_UNBOUND | WQ_MEM_RECLAIM, 8)` backed by 128 per-stripe mutexes.
@@ -966,7 +985,8 @@ lines of dead mdadm code and simplifies future maintenance.
   lines is a confession of failure")
 
 ### Impact on other phases
-- **Phase 9 (`shr grow`)**: Replaced with stub — no mdadm, no reshape
+- **Phase 9 (old `shr grow`)**: Replaced with stub — no mdadm, no reshape
+- **Phase 9 (new kernel reshape)**: Independent of mdadm — dm-lhsr only
 - **Phase 15 (Write Perf)**: Unchanged — kernel module, not SHR
 - **Phase 6-7 (SHR core)**: Unchanged logic, mdadm paths only removed
 
@@ -988,9 +1008,10 @@ lines of dead mdadm code and simplifies future maintenance.
 | 7 | SHR operational commands (destroy/disk/rebuild/scrub/expand) | **1 session** | Phase 6 |
 | 8 | shr disk replace | **1 session** | Phase 7 |
 | 9 | Live migration / shr grow | **1 session** | Phase 6 |
+| 9 | **Kernel RAID5→RAID6 reshape** *(replaced old Phase 9)* | **2 sessions** | Phase 0 |
 | 10-C | Monitoring & observability | **1 session** | Phase 4 |
 | 10-D | Performance baseline benchmarks | **1 session** | Phase 0 |
-| 10-A | Kernel reshape (parallel I/O dispatch) | **1 session** | Phase 10-D
+| 10-A | Parallel RMW write dispatch | **1 session** | Phase 10-D
 | 10-E | Stability fixes & error path validation (failed_disks race, RAID6 Q XOR bug, RAID5/6 reconstruction test) | **1 session** | Phase 10-A
 | 11 | RAID6 RS(255,N) double-failure decode (Vandermonde 2x2 + data+P recovery) | **1 session** | Phase 10-E
 | 12 | RAID6 bitmap Q parity reconstruction (bitmap_recover GF weighted-sum) | **1 session** | Phase 11

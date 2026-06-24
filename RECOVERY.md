@@ -1,7 +1,7 @@
 # LHSR Disk Failure Recovery Guide
 
-**Last Updated:** 2026-06-13
-**Applies to:** LHSR v5.x (dm-lhsr kernel module + userspace tools)
+**Last Updated:** 2026-06-23
+**Applies to:** LHSR v1.4.x (dm-lhsr kernel module + userspace tools)
 **License:** GPLv3
 
 ---

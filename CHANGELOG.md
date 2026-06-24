@@ -70,7 +70,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 ### Changed
 - `include/lhsr.h`: Reshape state constants added
 - `kernel/dm-lhsr/dm_lhsr.h`: Reshape fields added to `struct lhsr_array`
-- `kernel/dm-lhsr/dm-lhsr.c`: +~200 lines reshape implementation, +15 lines
+- `kernel/dm-lhsr/dm-lhsr.c`: +536 lines reshape implementation, +15 lines
   forward declarations + I/O rejection in `lhsr_map()` + workqueue cleanup in
   `lhsr_dtr()` + reshape fields zeroed in `lhsr_ctr()`
 - `README.md`: "What it does NOT do (yet)" updated — live reshape documented
@@ -730,21 +730,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 - Single, Mirror
 - RAID5, RAID6
 - SHR, SHR-2
-
----
-
-## Roadmap
-
-| Phase | Feature | Status |
-|-------|---------|--------|
-| 0 | Honest foundation | ✅ Complete |
-| 1 | Persistent checksums | ✅ Complete |
-| 2 | Incremental rebuild | ✅ Complete |
-| 3 | Daemon refactor | ✅ Complete |
-| 4 | Predictive failure | Planned |
-| 5 | Recovery tools | Planned |
-| 6 | SHR userspace | Not yet scoped |
-| 7 | Live migration | Not yet scoped |
 
 ---
 

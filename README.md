@@ -1,6 +1,6 @@
 # LHSR — Linux Hybrid Self-Healing RAID
 
-**Version:** 1.3.0 | **License:** GPLv3 | **Kernel:** 5.15+ (tested on 6.12.x)
+**Version:** 1.4.0 | **License:** GPLv3 | **Kernel:** 5.15+ (tested on 6.12.94+deb13)
 
 ---
 
@@ -88,12 +88,12 @@ The daemon (`lhsrd`) runs in userspace and handles:
 
 - **SHR flexible disk sizing** — Synology SHR is mdraid + LVM; LHSR doesn't do
   this.  SHR partition data structures exist but are not populated.
-- **Online reshape (writes accepted)** — Reshape currently rejects writes
-  during migration (read-only filesystem required).  An online reshape with
-  bio deferral is planned.  RAID5→RAID6 in-place reshape is implemented via
-  [`deploy/lhsr-reshape.sh`](deploy/lhsr-reshape.sh) (adds Q parity disk,
-  crash-safe, preserves data).  Offline migration is also supported via
-  [`deploy/lhsr-migrate.sh`](deploy/lhsr-migrate.sh) (backup → recreate → restore).
+- **Online reshape with writes accepted** — RAID5→RAID6 in-place reshape is
+  implemented (kernel-based, crash-safe, preserves data) via
+  [`deploy/lhsr-reshape.sh`](deploy/lhsr-reshape.sh), but **writes are rejected**
+  during migration — the filesystem must be mounted read-only.  A fully online
+  reshape with bio deferral is deferred.  Offline migration (backup → recreate →
+  restore) is also supported via [`deploy/lhsr-migrate.sh`](deploy/lhsr-migrate.sh).
 - **Persistent checksum cache** — the CRC32c checksum cache is ephemeral
   (xarray, lost on module unload).  For persistent anti-bit-rot,
   [stack LHSR on dm-integrity](INSTALL.md#dm-integrity-stacking).
@@ -102,7 +102,7 @@ The daemon (`lhsrd`) runs in userspace and handles:
 
 | Component | Path | Purpose |
 |-----------|------|---------|
-| Kernel module | `kernel/dm-lhsr/dm-lhsr.ko` | DM target (~5600 lines C) |
+| Kernel module | `kernel/dm-lhsr/dm-lhsr.ko` | DM target (~6200 lines C) |
 | Daemon | `userspace/daemon/lhsrd` | SMART, health, trends, Prometheus, HTTP API |
 | CLI | `userspace/cli/lhsrctl` | Status, predict, recover, reconstruct, disk-fail |
 | Scanner | `userspace/recovery/lhsr-scan` | Superblock discovery (`--deep`, `--json`) |
