@@ -62,6 +62,10 @@
  */
 
 #include <linux/module.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,5,0)
+#define bdev_partno(b)	((b)->bd_partno)
+#endif
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/bio.h>
@@ -174,19 +178,23 @@ static int lhsr_module_exiting;
  *   write new data → write P → (RAID6) write Q →
  *   complete orig_bio
  */
+struct lhsr_rmw_batch {
+	struct bio *bio;	/* original bio, completed by the last worker */
+	atomic_t pending;	/* stripe works remaining */
+	blk_status_t status;	/* first error wins */
+};
+
 struct lhsr_rmw_work {
 	struct work_struct work;
 
-	struct bio *orig_bio;		/* Original bio to complete */
-	struct lhsr_array *arr;		/* Array context */
+	struct bio *orig_bio;		/* original bio (segment source) */
+	struct lhsr_array *arr;		/* array context */
+	struct lhsr_rmw_batch *batch;	/* completion batch */
 
-	unsigned int data_disk;		/* Target data disk index */
-	unsigned int data_disks;	/* Number of data disks */
-	unsigned int parity_disks;	/* Number of parity disks (1 or 2) */
-	sector_t chunk_start;		/* Stripe-aligned chunk start (sectors) */
-	sector_t orig_offset;		/* Original virtual offset (for bitmap/WIB) */
-	size_t chunk_bytes;		/* Chunk size in bytes */
-	unsigned int offset_in_chunk;	/* Sector offset within chunk for bio data */
+	unsigned int parity_disks;	/* number of parity disks (1 or 2) */
+	sector_t orig_sector;		/* virtual start of this range (sectors) */
+	unsigned int num_sectors;	/* virtual length of this range (sectors) */
+	sector_t bio_sector;		/* virtual start of the whole bio (sectors) */
 };
 
 /* RAID5/6 read reconstruction context */
@@ -2969,9 +2977,12 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 */
 	ti->needs_bio_set_dev = true;
 
-	/* Set max_io_len to chunk_sectors for RAID5/6 — ensures each bio fits in one chunk */
+	/* Phase 15: the multi-chunk RMW worker handles arbitrary bio sizes
+	 * and alignments (incl. the full-stripe fast path), so DM must not
+	 * split writes at chunk granularity.  The old 4K cap forced every
+	 * large write through hundreds of single-chunk RMW cycles. */
 	if (arr->raid_type >= LHSR_RAID5)
-		ti->max_io_len = arr->chunk_sectors;
+		ti->max_io_len = 0;
 
 	DMINFO("Created LHSR: type=%u size=%llu", raid_type, size);
 
@@ -4533,268 +4544,406 @@ out_free_meta:
  *     and all bitmap/WIB operations use it instead of chunk_start.
  *     bitmap_set, bitmap_clear, and WIB_clear are consistent.
  * ==================================================================== */
+static int lhsr_bio_copy_to(struct bio *bio, u64 off, void *dst, size_t len)
+{
+	struct bio_vec bv;
+	struct bvec_iter iter;
+	size_t skip = off;
+	size_t copied = 0;
+
+	bio_for_each_segment(bv, bio, iter) {
+		void *p;
+		size_t n;
+
+		if (skip >= bv.bv_len) {
+			skip -= bv.bv_len;
+			continue;
+		}
+		n = min_t(size_t, len - copied, bv.bv_len - skip);
+		p = kmap_local_page(bv.bv_page) + bv.bv_offset + skip;
+		memcpy(dst + copied, p, n);
+		kunmap_local(p);
+		copied += n;
+		skip = 0;
+		if (copied == len)
+			break;
+	}
+	return copied == len ? 0 : -EIO;
+}
+
+/* Snapshot-consistent member check: disk present AND not failed. */
+static bool lhsr_disk_present(struct lhsr_array *arr, unsigned int d,
+			      unsigned long failed)
+{
+	return d < arr->disks && arr->disk[d] && !(failed & (1UL << d));
+}
+
+/*
+ * Multi-chunk RAID5/6 write worker (Phase 15).
+ * Geometry (right-static parity, same formulas as the old worker):
+ *   chunk_index = virtual_offset / chunk_bytes
+ *   data_disk   = chunk_index %% data_disks
+ *   stripe      = chunk_index / data_disks
+ *   on-disk sector position (per member) = stripe * chunk_sectors
+ * A stripe-local chunk index maps 1:1 to its owning data disk.
+ *
+ * Per stripe, under that stripe's mutex:
+ *   full stripe  -> no old reads; P = XOR(new), Q = sum(gf_mul(new, coeff))
+ *   partial      -> one parallel read wave (covered old chunks + old P/Q),
+ *                   then P_new = P_old ^ old ^ new (same for Q)
+ *   then one parallel write wave (new data + P + Q).
+ * Only one stripe lock is held at a time; waves complete on the block
+ * layer (never on rmw_wq), so workers cannot deadlock each other.
+ */
 static void lhsr_rmw_worker(struct work_struct *work)
 {
 	struct lhsr_rmw_work *rmw = container_of(work, struct lhsr_rmw_work, work);
 	struct bio *orig = rmw->orig_bio;
 	struct lhsr_array *arr = rmw->arr;
 	blk_status_t status = BLK_STS_OK;
+	const unsigned int parity_disks = rmw->parity_disks;
+	const unsigned int data_disks = arr->disks - parity_disks;
+	const unsigned int chunk_sects = arr->chunk_sectors;
+	const size_t chunk_bytes = (size_t)chunk_sects << SECTOR_SHIFT;
+	const sector_t stripe_sects = (sector_t)data_disks * chunk_sects;
+	const size_t stripe_bytes = (size_t)stripe_sects << SECTOR_SHIFT;
+	const u64 vstart = (u64)rmw->orig_sector << SECTOR_SHIFT;
+	const u64 vsize = (u64)rmw->num_sectors << SECTOR_SHIFT;
+	const unsigned int p_disk = data_disks;
+	const unsigned int q_disk = data_disks + 1;
+	const unsigned int chunk_order = get_order(chunk_bytes);
+	u64 pos;
 
-	struct page *old_data_page = NULL;
-	struct page *parity_page = NULL;
-	struct page *new_data_page = NULL;
-	struct page *q_parity_page = NULL;
+	atomic64_inc(&arr->rmw_works);
 
-	size_t chunk_bytes = rmw->chunk_bytes;
-	unsigned int data_disks = rmw->data_disks;
-	unsigned int parity_disks = rmw->parity_disks;
-	unsigned int data_disk = rmw->data_disk;
-	sector_t chunk_start = rmw->chunk_start;
-
-	unsigned int p_disk = data_disks;	/* P parity index */
-	unsigned int q_disk = data_disks + 1;	/* Q parity index (RAID6) */
-	unsigned int lock_idx;			/* Per-stripe mutex hash index */
-	bool locked = false;			/* Did we acquire the stripe lock? */
-	unsigned int chunk_order = 0;		/* alloc_pages order for chunk */
-
-	/* Allocate compound page buffers for the full chunk size.
-	 * alloc_pages with order > 0 gives physically-contiguous
-	 * compound pages that bio_add_page can add as a single
-	 * segment (up to max_segment_size, typically 64 KB).
-	 * Uses GFP_NOIO because we're in a workqueue context
-	 * that may be called during block I/O (no reclaim recursion).
-	 */
-	chunk_order = get_order(chunk_bytes);
-	old_data_page = alloc_pages(GFP_NOIO, chunk_order);
-	parity_page = alloc_pages(GFP_NOIO, chunk_order);
-	new_data_page = alloc_pages(GFP_NOIO, chunk_order);
-	if (!old_data_page || !parity_page || !new_data_page) {
-		DMERR("RMW worker: page allocation failed (order=%u)", chunk_order);
-		status = BLK_STS_RESOURCE;
-		goto out;
-	}
-	if (parity_disks > 1) {
-		q_parity_page = alloc_pages(GFP_NOIO, chunk_order);
-		if (!q_parity_page) {
-			DMERR("RMW worker: Q parity page allocation failed (order=%u)", chunk_order);
-			status = BLK_STS_RESOURCE;
-			goto out;
-		}
-	}
-
-	/*
-	 * Check array is not being destroyed.
-	 * We hold the only reference to this work item while running,
-	 * so arr is valid as long as rmw_wq hasn't been destroyed.
-	 */
 	if (atomic_read(&arr->destroying)) {
-		DMERR("RMW worker: array being destroyed, aborting write");
 		status = BLK_STS_IOERR;
-		goto out;
+		goto out_complete;
 	}
 
-	/*
-	 * Acquire per-stripe mutex.  Ensures that two RMW workers on the
-	 * SAME stripe (same chunk_start) do not interleave their read-modify-
-	 * write cycles.  Different stripes run concurrently on different CPUs
-	 * via the WQ_UNBOUND workqueue.  The hash may collide two different
-	 * stripes to the same lock — this is a harmless false serialization
-	 * that has no correctness impact.
-	 */
-	lock_idx = (chunk_start >> 3) & (LHSR_STRIPE_LOCKS - 1);
-	mutex_lock(&arr->stripe_locks[lock_idx]);
-	locked = true;
+	/* Write intent over the whole range before touching data. */
+	for (pos = vstart; pos < vstart + vsize; pos += chunk_bytes) {
+		if (arr->wib_pages)
+			lhsr_wib_set(arr, (sector_t)(pos >> SECTOR_SHIFT));
+		if (lhsr_bitmap_set(arr, (sector_t)(pos >> SECTOR_SHIFT)))
+			DMWARN("RMW: bitmap_set failed at %llu", pos >> SECTOR_SHIFT);
+	}
 
-	/* Parallel read phase: count bios first, set pending, submit all, wait once.
-	 * Counting BEFORE submission prevents a race where a bio completes
-	 * synchronously (loopback/tmpfs) inside submit_bio(), which would fire
-	 * complete() before the other bios are even allocated.
-	 */
-	{
+	for (pos = vstart; pos < vstart + vsize; ) {
+		u64 stripe_start = (pos / stripe_bytes) * stripe_bytes;
+		u64 stripe_idx = stripe_start / stripe_bytes;
+		u64 write_end = min_t(u64, vstart + vsize, stripe_start + stripe_bytes);
+		sector_t disk_pos = (sector_t)stripe_idx * chunk_sects;
+		int lock_idx = (int)(stripe_idx & (LHSR_STRIPE_LOCKS - 1));
+		struct page *nd[LHSR_MAX_DISKS];
+		struct page *od[LHSR_MAX_DISKS];
+		struct page *ppage = NULL;
+		struct page *qpage = NULL;
 		struct lhsr_parallel_io pio;
-		unsigned int failed = lhsr_failed_disks_get(arr);
-		int nr_reads = 1;  /* data disk read always needed */
+		unsigned long failed;
+		unsigned int l;
+		unsigned int n = 0;
+		bool full;
+		bool locked = false;
+		bool chunk_full[LHSR_MAX_DISKS];
+		int nr;
+		u64 t0, t1 = 0, t2, t3;
 
-		init_completion(&pio.done);
-		pio.status = BLK_STS_OK;
+		memset(nd, 0, sizeof(nd));
+		memset(od, 0, sizeof(od));
+		memset(chunk_full, 0, sizeof(chunk_full));
 
-		/* Count P parity read (skipped if disk failed) */
-		if (!(failed & (1 << p_disk)))
-			nr_reads++;
-		/* Count Q parity read for RAID6 (skipped if disk failed) */
-		if (parity_disks > 1 && !(failed & (1 << q_disk)))
-			nr_reads++;
+		for (l = 0; l < data_disks; l++) {
+			u64 v = stripe_start + (u64)l * chunk_bytes;
 
-		atomic_set(&pio.pending, nr_reads);
-
-		/* Read old data */
-		lhsr_submit_parallel(arr, data_disk, old_data_page,
-				     chunk_bytes, chunk_start,
-				     REQ_OP_READ, &pio);
-
-		/* Read P parity (lhsr_submit_parallel zeroes page if disk failed) */
-		lhsr_submit_parallel(arr, p_disk, parity_page,
-				     chunk_bytes, chunk_start,
-				     REQ_OP_READ, &pio);
-
-		/* Read Q parity for RAID6 (skipped/zeroed if Q disk failed) */
-		if (parity_disks > 1)
-			lhsr_submit_parallel(arr, q_disk, q_parity_page,
-					     chunk_bytes, chunk_start,
-					     REQ_OP_READ, &pio);
-
-		/* Wait for all submitted reads */
-		if (nr_reads > 0)
-			wait_for_completion_io(&pio.done);
-		if (pio.status != BLK_STS_OK) {
-			DMERR("RMW worker: parallel read phase failed "
-			      "(status=%d)", pio.status);
-			status = pio.status;
-			goto out;
+			if (v >= vstart + vsize || v + chunk_bytes <= vstart)
+				continue;
+			chunk_full[l] = (vstart <= v && v + chunk_bytes <= vstart + vsize);
+			n++;
 		}
-	}
+		full = (n == data_disks);
 
-	/* Phase 4: Compute new data, P parity, and (RAID6) Q parity */
-	{
-		void *old_data = kmap_local_page(old_data_page);
-		void *parity = kmap_local_page(parity_page);
-		void *new_data = kmap_local_page(new_data_page);
-		unsigned int i;
+		for (l = 0; l < data_disks; l++) {
+			u64 v = stripe_start + (u64)l * chunk_bytes;
 
-		/* Start with old data */
-		memcpy(new_data, old_data, chunk_bytes);
-
-		/* Merge bio data into new_data */
-		{
-			struct bio_vec bv;
-			struct bvec_iter iter;
-			size_t dst_off = (size_t)rmw->offset_in_chunk << SECTOR_SHIFT;
-
-			bio_for_each_segment(bv, orig, iter) {
-				void *src = kmap_local_page(bv.bv_page) + bv.bv_offset;
-				size_t copy_len = min_t(size_t, bv.bv_len,
-							chunk_bytes - dst_off);
-				memcpy(new_data + dst_off, src, copy_len);
-				kunmap_local(src);
-				dst_off += copy_len;
-				if (dst_off >= chunk_bytes)
-					break;
+			if (v >= vstart + vsize || v + chunk_bytes <= vstart)
+				continue;
+			nd[l] = alloc_pages(GFP_NOIO, chunk_order);
+			if (!nd[l]) {
+				status = BLK_STS_RESOURCE;
+				goto out_stripe;
+			}
+			if (!full) {
+				od[l] = alloc_pages(GFP_NOIO, chunk_order);
+				if (!od[l]) {
+					status = BLK_STS_RESOURCE;
+					goto out_stripe;
+				}
 			}
 		}
 
-		/* Compute new P parity = old_P XOR old_data XOR new_data */
-		{
-			u8 *p = parity;
-			u8 *od = old_data;
-			u8 *nd = new_data;
-			for (i = 0; i < chunk_bytes; i++)
-				p[i] ^= od[i] ^ nd[i];
+		ppage = alloc_pages(GFP_NOIO, chunk_order);
+		if (parity_disks > 1)
+			qpage = alloc_pages(GFP_NOIO, chunk_order);
+		if (!ppage || (parity_disks > 1 && !qpage)) {
+			status = BLK_STS_RESOURCE;
+			goto out_stripe;
 		}
 
-		/* (RAID6) Compute new Q parity */
-		if (parity_disks > 1) {
-			u8 *q = kmap_local_page(q_parity_page);
-			u8 *od = old_data;
-			u8 *nd = new_data;
-			u8 coeff = rs_power_table[data_disk];
-			for (i = 0; i < chunk_bytes; i++)
-				q[i] ^= lhsr_gf_mul(od[i] ^ nd[i], coeff);
-			kunmap_local(q);
+		mutex_lock(&arr->stripe_locks[lock_idx]);
+		locked = true;
+		failed = lhsr_failed_disks_get(arr);
+
+		/* Any covered member missing -> fail, never write partial. */
+		for (l = 0; l < data_disks; l++) {
+			u64 v = stripe_start + (u64)l * chunk_bytes;
+
+			if (v >= vstart + vsize || v + chunk_bytes <= vstart)
+				continue;
+			if (!lhsr_disk_present(arr, l, failed)) {
+				status = BLK_STS_IOERR;
+				goto out_stripe;
+			}
+		}
+		if (!lhsr_disk_present(arr, p_disk, failed) ||
+		    (parity_disks > 1 && !lhsr_disk_present(arr, q_disk, failed))) {
+			status = BLK_STS_IOERR;
+			goto out_stripe;
 		}
 
-		kunmap_local(new_data);
-		kunmap_local(parity);
-		kunmap_local(old_data);
-	}
-
-
-	/*
-	 * Mark intent in write-hole journal BEFORE modifying data/parity.
-	 * If we crash now, recovery sees the dirty bit and reconstructs
-	 * parity from the (unchanged) data disks — always consistent.
-	 */
-	if (lhsr_bitmap_set(arr, rmw->orig_offset))
-		DMWARN("RMW: bitmap_set failed at virtual offset %llu", (u64)rmw->orig_offset);
-
-	/* Parallel write phase: submit all writes at once, wait once.
-	 * REQ_FUA forces each write to stable storage.  Submitting all
-	 * three concurrently allows the block layer/device to pipeline
-	 * cache flushes instead of doing three sequential FUA waits.
-	 * The write-hole bitmap (set above) guarantees crash recovery
-	 * can reconstruct parity if any write fails mid-batch.
-	 * Count bios first to prevent synchronous-completion race (see
-	 * read phase comment).
-	 */
-	{
-		struct lhsr_parallel_io pio;
-		unsigned int failed = lhsr_failed_disks_get(arr);
-		int nr_writes = 0;
-
+		t0 = ktime_get_ns();
 		init_completion(&pio.done);
 		pio.status = BLK_STS_OK;
+		nr = 0;
+		if (!full) {
+			for (l = 0; l < data_disks; l++) {
+				u64 v = stripe_start + (u64)l * chunk_bytes;
 
-		/* Count non-failed disks for write */
-		if (!(failed & (1 << data_disk)))
-			nr_writes++;
-		if (!(failed & (1 << p_disk)))
-			nr_writes++;
-		if (parity_disks > 1 && !(failed & (1 << q_disk)))
-			nr_writes++;
-
-		atomic_set(&pio.pending, nr_writes);
-
-		lhsr_submit_parallel(arr, data_disk, new_data_page,
-				     chunk_bytes, chunk_start,
-				     REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio);
-		lhsr_submit_parallel(arr, p_disk, parity_page,
-				     chunk_bytes, chunk_start,
-				     REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio);
-		if (parity_disks > 1)
-			lhsr_submit_parallel(arr, q_disk, q_parity_page,
-					     chunk_bytes, chunk_start,
-					     REQ_OP_WRITE | REQ_SYNC | REQ_FUA, &pio);
-
-		/* Wait for all submitted writes */
-		if (nr_writes > 0)
-			wait_for_completion_io(&pio.done);
-
-		if (pio.status != BLK_STS_OK) {
-			DMERR("RMW worker: parallel write phase failed "
-			      "(status=%d)", pio.status);
-			status = pio.status;
-			goto out;
+				if (v >= vstart + vsize || v + chunk_bytes <= vstart)
+					continue;
+				nr++;
+			}
+			nr += 1 + (parity_disks > 1 ? 1 : 0);
 		}
-	} /* end of parallel write phase block */
+		atomic_set(&pio.pending, nr);
 
-	/* All writes committed — clear the dirty bit */
-	if (lhsr_bitmap_clear(arr, rmw->orig_offset))
-		DMWARN("RMW: bitmap_clear failed at virtual offset %llu", (u64)rmw->orig_offset);
+		if (!full) {
+			for (l = 0; l < data_disks; l++) {
+				u64 v = stripe_start + (u64)l * chunk_bytes;
 
-	/*
-	 * Clear WIB bit: the entire stripe is now self-consistent because
-	 * every data chunk and parity chunk was written with REQ_FUA.
-	 * WIB granularity is 1MB (LHSR_WIB_CHUNK_SECTORS), which is much
-	 * larger than any stripe, so all chunks in the stripe share the
-	 * same WIB bit — clearing once is correct.
-	 * Uses the original virtual offset (same address as lhsr_wib_set).
-	 */
-	lhsr_wib_clear(arr, rmw->orig_offset);
+				if (v >= vstart + vsize || v + chunk_bytes <= vstart)
+					continue;
+				lhsr_submit_parallel(arr, l, od[l], chunk_bytes,
+						     disk_pos, REQ_OP_READ, &pio);
+			}
+			lhsr_submit_parallel(arr, p_disk, ppage, chunk_bytes,
+					     disk_pos, REQ_OP_READ, &pio);
+			if (parity_disks > 1)
+				lhsr_submit_parallel(arr, q_disk, qpage, chunk_bytes,
+						     disk_pos, REQ_OP_READ, &pio);
+			if (nr > 0)
+				wait_for_completion_io(&pio.done);
+			if (pio.status != BLK_STS_OK) {
+				status = pio.status;
+				atomic64_inc(&arr->rmw_errors);
+				goto out_stripe;
+			}
+		}
+		t1 = ktime_get_ns();
 
-out:
-	if (locked)
-		mutex_unlock(&arr->stripe_locks[lock_idx]);
-	/* Free compound pages — must pass the order from allocation */
-	if (old_data_page)
-		__free_pages(old_data_page, chunk_order);
-	if (parity_page)
-		__free_pages(parity_page, chunk_order);
-	if (new_data_page)
-		__free_pages(new_data_page, chunk_order);
-	if (q_parity_page)
-		__free_pages(q_parity_page, chunk_order);
+		/* Build new data per covered chunk. */
+		for (l = 0; l < data_disks; l++) {
+			u64 chunk_virt = stripe_start + (u64)l * chunk_bytes;
+			u64 o_start = max(vstart, chunk_virt);
+			u64 o_end = min(vstart + vsize, chunk_virt + chunk_bytes);
+			u64 bio_off = o_start - ((u64)rmw->bio_sector << SECTOR_SHIFT);
+			size_t in_off = (size_t)(o_start - chunk_virt);
 
-	orig->bi_status = status;
-	bio_endio(orig);
+			if (chunk_virt >= vstart + vsize ||
+			    chunk_virt + chunk_bytes <= vstart)
+				continue;
+			if (chunk_full[l]) {
+				void *p = kmap_local_page(nd[l]);
+
+				if (lhsr_bio_copy_to(orig, bio_off, p, chunk_bytes))
+					status = BLK_STS_IOERR;
+				kunmap_local(p);
+				if (status != BLK_STS_OK)
+					goto out_stripe;
+			} else {
+				void *p, *o;
+
+				p = kmap_local_page(nd[l]);
+				o = kmap_local_page(od[l]);
+				memcpy(p, o, chunk_bytes);
+				if (lhsr_bio_copy_to(orig, bio_off, p + in_off,
+						     o_end - o_start))
+					status = BLK_STS_IOERR;
+				kunmap_local(o);
+				kunmap_local(p);
+				if (status != BLK_STS_OK)
+					goto out_stripe;
+			}
+		}
+		t2 = ktime_get_ns();
+
+		/* Compute P and Q. */
+		if (full) {
+			void *p = kmap_local_page(ppage);
+			void *src = kmap_local_page(nd[0]);
+
+			memcpy(p, src, chunk_bytes);
+			kunmap_local(src);
+			for (l = 1; l < data_disks; l++) {
+				u8 *pp = p;
+				unsigned int b;
+
+				if (!nd[l])
+					continue;
+				src = kmap_local_page(nd[l]);
+				{
+					u8 *ss = src;
+
+					for (b = 0; b < chunk_bytes; b++)
+						pp[b] ^= ss[b];
+				}
+				kunmap_local(src);
+			}
+			if (parity_disks > 1) {
+				void *q = kmap_local_page(qpage);
+
+				memset(q, 0, chunk_bytes);
+				for (l = 0; l < data_disks; l++) {
+					u8 coeff;
+					unsigned int b;
+
+					if (!nd[l])
+						continue;
+					coeff = rs_power_table[l];
+					src = kmap_local_page(nd[l]);
+					{
+						u8 *qq = q;
+						u8 *ss = src;
+
+						for (b = 0; b < chunk_bytes; b++)
+							qq[b] ^= lhsr_gf_mul(ss[b], coeff);
+					}
+					kunmap_local(src);
+				}
+				kunmap_local(q);
+			}
+			kunmap_local(p);
+		} else {
+			void *p = kmap_local_page(ppage);
+			void *q = parity_disks > 1 ? kmap_local_page(qpage) : NULL;
+
+			for (l = 0; l < data_disks; l++) {
+				u8 *pp = p;
+				unsigned int b;
+
+				if (!od[l])
+					continue;
+				{
+					void *pn = kmap_local_page(nd[l]);
+					void *po = kmap_local_page(od[l]);
+					u8 *nn = pn;
+					u8 *ss = po;
+
+					for (b = 0; b < chunk_bytes; b++)
+						pp[b] ^= ss[b] ^ nn[b];
+					if (parity_disks > 1) {
+						u8 coeff = rs_power_table[l];
+						u8 *qq = q;
+
+						for (b = 0; b < chunk_bytes; b++)
+							qq[b] ^= lhsr_gf_mul(ss[b] ^ nn[b], coeff);
+					}
+					kunmap_local(pn);
+					kunmap_local(po);
+				}
+			}
+			if (q)
+				kunmap_local(q);
+			kunmap_local(p);
+		}
+
+		/* Write data chunks + P + Q in one wave. */
+		init_completion(&pio.done);
+		pio.status = BLK_STS_OK;
+		nr = 0;
+		for (l = 0; l < data_disks; l++)
+			if (nd[l])
+				nr++;
+		nr += 1 + (parity_disks > 1 ? 1 : 0);
+		atomic_set(&pio.pending, nr);
+
+		/* No REQ_FUA: durability comes from REQ_OP_FLUSH propagation
+		 * (see lhsr_map flush path) plus the write-hole bitmap.
+		 * Per-write FUA costs a cache flush per stripe on every wave. */
+		for (l = 0; l < data_disks; l++) {
+			if (!nd[l])
+				continue;
+			lhsr_submit_parallel(arr, l, nd[l], chunk_bytes,
+					     disk_pos, REQ_OP_WRITE | REQ_SYNC,
+					     &pio);
+		}
+		lhsr_submit_parallel(arr, p_disk, ppage, chunk_bytes,
+				     disk_pos, REQ_OP_WRITE | REQ_SYNC, &pio);
+		if (parity_disks > 1)
+			lhsr_submit_parallel(arr, q_disk, qpage, chunk_bytes,
+					     disk_pos, REQ_OP_WRITE | REQ_SYNC,
+					     &pio);
+		if (nr > 0)
+			wait_for_completion_io(&pio.done);
+		t3 = ktime_get_ns();
+		if (pio.status != BLK_STS_OK) {
+			status = pio.status;
+			atomic64_inc(&arr->rmw_errors);
+			goto out_stripe;
+		}
+		if (!full)
+			atomic64_add(t1 - t0, &arr->rmw_read_ns);
+		atomic64_add(t3 - t2, &arr->rmw_write_ns);
+		if (full)
+			atomic64_inc(&arr->rmw_full);
+		else
+			atomic64_inc(&arr->rmw_partial);
+
+		/* Stripe consistent — clear its dirty bits. */
+		for (pos = stripe_start; pos < write_end; pos += chunk_bytes)
+			lhsr_bitmap_clear(arr, (sector_t)(pos >> SECTOR_SHIFT));
+
+	out_stripe:
+		if (locked)
+			mutex_unlock(&arr->stripe_locks[lock_idx]);
+		for (l = 0; l < data_disks; l++) {
+			if (nd[l])
+				__free_pages(nd[l], chunk_order);
+			if (od[l])
+				__free_pages(od[l], chunk_order);
+		}
+		if (ppage)
+			__free_pages(ppage, chunk_order);
+		if (qpage)
+			__free_pages(qpage, chunk_order);
+
+		if (status != BLK_STS_OK)
+			goto out_complete;
+		pos = write_end;
+	}
+
+	for (pos = vstart; pos < vstart + vsize; pos += chunk_bytes)
+		lhsr_wib_clear(arr, (sector_t)(pos >> SECTOR_SHIFT));
+
+out_complete:
+	atomic64_inc(&arr->rmw_done);
+	if (status != BLK_STS_OK && rmw->batch->status == BLK_STS_OK)
+		rmw->batch->status = status;
+	if (atomic_dec_and_test(&rmw->batch->pending)) {
+		rmw->batch->bio->bi_status = rmw->batch->status;
+		bio_endio(rmw->batch->bio);
+		kfree(rmw->batch);
+	}
 	kfree(rmw);
 }
 
@@ -5137,47 +5286,108 @@ passthrough_single:
 		data_disk = ((unsigned int)(offset / chunk_sects)) % data_disks;
 
 		if (is_write) {
-			struct lhsr_rmw_work *rmw;
-			size_t chunk_bytes = (size_t)chunk_sects << SECTOR_SHIFT;
+			const u64 stripe_sects = (u64)data_disks * chunk_sects;
+			struct lhsr_rmw_batch *batch;
+			u64 wend = (u64)offset + (bio->bi_iter.bi_size >> SECTOR_SHIFT);
+			unsigned int total = 0;
+			unsigned int done_pieces = 0;
+			u64 p;
 
-			DMDEBUG("RAID5/6 write: offset=%llu data_disk=%u chunk_start=%llu bio_bytes=%u",
-				(u64)offset, data_disk, (u64)chunk_start,
-				bio->bi_iter.bi_size);
+			/* REQ_PREFLUSH (including blkdev_issue_flush, which is a
+			 * zero-length REQ_OP_WRITE|REQ_PREFLUSH, not REQ_OP_FLUSH):
+			 * flush all member disks first.  Without this the bio
+			 * either hangs (zero-length: no stripe work is queued)
+			 * or completes without anything reaching stable media.
+			 * The member flushes complete before any data write is
+			 * submitted below, giving correct barrier ordering. */
+			if (bio->bi_opf & REQ_PREFLUSH) {
+				struct lhsr_parallel_io fio;
+				unsigned long ffailed = lhsr_failed_disks_get(arr);
+				unsigned int d;
+				int fnr = 0;
 
-			/* Fail if target data disk is failed or missing */
-			if (lhsr_failed_disks_get(arr) & (1 << data_disk) || !arr->disk[data_disk]) {
-				DMERR("RAID5/6 write: target data disk %u unavailable",
-				      data_disk);
-				bio->bi_status = BLK_STS_IOERR;
-				bio_endio(bio);
-				return DM_MAPIO_SUBMITTED;
+				init_completion(&fio.done);
+				fio.status = BLK_STS_OK;
+				for (d = 0; d < arr->disks; d++)
+					if (lhsr_disk_present(arr, d, ffailed))
+						fnr++;
+				atomic_set(&fio.pending, fnr);
+				for (d = 0; d < arr->disks; d++) {
+					struct bio *fbio;
+
+					if (!lhsr_disk_present(arr, d, ffailed))
+						continue;
+					fbio = bio_alloc_bioset(arr->disk[d], 0, REQ_OP_FLUSH,
+								GFP_NOIO, &lhsr_bioset);
+					if (!fbio) {
+						fio.status = BLK_STS_RESOURCE;
+						atomic_dec(&fio.pending);
+						continue;
+					}
+					fbio->bi_end_io = lhsr_parallel_endio;
+					fbio->bi_private = &fio;
+					submit_bio(fbio);
+				}
+				if (fnr > 0)
+					wait_for_completion_io(&fio.done);
+				if (fio.status != BLK_STS_OK) {
+					bio->bi_status = fio.status;
+					bio_endio(bio);
+					return DM_MAPIO_SUBMITTED;
+				}
+				if (bio->bi_iter.bi_size == 0) {
+					bio->bi_status = BLK_STS_OK;
+					bio_endio(bio);
+					return DM_MAPIO_SUBMITTED;
+				}
 			}
 
-			/* Allocate RMW work item — pages are allocated inside the worker */
-			rmw = kzalloc(sizeof(*rmw), GFP_NOIO);
-			if (!rmw) {
-				DMERR("RAID5/6 write: work item allocation failed");
+			for (p = offset; p < wend; ) {
+				u64 sb = (p / stripe_sects) * stripe_sects;
+
+				p = min_t(u64, wend, sb + stripe_sects);
+				total++;
+			}
+
+			batch = kzalloc(sizeof(*batch), GFP_NOIO);
+			if (!batch) {
 				bio->bi_status = BLK_STS_RESOURCE;
 				bio_endio(bio);
 				return DM_MAPIO_SUBMITTED;
 			}
+			batch->bio = bio;
+			batch->status = BLK_STS_OK;
+			atomic_set(&batch->pending, total);
 
-			rmw->orig_bio = bio;
-			rmw->arr = arr;
-			rmw->data_disk = data_disk;
-			rmw->data_disks = data_disks;
-			rmw->parity_disks = parity_disks;
-			rmw->chunk_start = chunk_start;
-			rmw->orig_offset = offset;
-			rmw->chunk_bytes = chunk_bytes;
-			rmw->offset_in_chunk = (unsigned int)(offset % chunk_sects);
+			/* One work item per stripe: waves for different stripes
+			 * run concurrently on rmw_wq (Phase 15 batching). */
+			for (p = offset; p < wend; ) {
+				u64 sb = (p / stripe_sects) * stripe_sects;
+				u64 we = min_t(u64, wend, sb + stripe_sects);
+				struct lhsr_rmw_work *rmw = kzalloc(sizeof(*rmw), GFP_NOIO);
 
-			/* Mark this region in WIB so rebuild knows it was touched */
-			if (arr->wib_pages)
-				lhsr_wib_set(arr, offset);
-
-			INIT_WORK(&rmw->work, lhsr_rmw_worker);
-			queue_work(arr->rmw_wq, &rmw->work);
+				if (!rmw) {
+					batch->status = BLK_STS_RESOURCE;
+					if (atomic_sub_and_test(total - done_pieces,
+								&batch->pending)) {
+						batch->bio->bi_status = batch->status;
+						bio_endio(batch->bio);
+						kfree(batch);
+					}
+					return DM_MAPIO_SUBMITTED;
+				}
+				rmw->orig_bio = bio;
+				rmw->arr = arr;
+				rmw->batch = batch;
+				rmw->parity_disks = parity_disks;
+				rmw->orig_sector = (sector_t)p;
+				rmw->num_sectors = (unsigned int)(we - p);
+				rmw->bio_sector = offset;
+				INIT_WORK(&rmw->work, lhsr_rmw_worker);
+				queue_work(arr->rmw_wq, &rmw->work);
+				done_pieces++;
+				p = we;
+			}
 			return DM_MAPIO_SUBMITTED;
 		}
 
@@ -5999,6 +6209,19 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			  arr->state, lhsr_failed_disks_get(arr), arr->generation,
 			  arr->write_verify_enabled, arr->integrity_below,
 			  lhsr_rmw_max_active);
+		return 1;
+	}
+
+	if (strcmp(argv[0], "rmw_stats") == 0) {
+		scnprintf(result, maxlen,
+			  "works=%lld done=%lld full=%lld partial=%lld errors=%lld read_us=%lld write_us=%lld",
+			  (long long)atomic64_read(&arr->rmw_works),
+			  (long long)atomic64_read(&arr->rmw_done),
+			  (long long)atomic64_read(&arr->rmw_full),
+			  (long long)atomic64_read(&arr->rmw_partial),
+			  (long long)atomic64_read(&arr->rmw_errors),
+			  (long long)(atomic64_read(&arr->rmw_read_ns) / 1000),
+			  (long long)(atomic64_read(&arr->rmw_write_ns) / 1000));
 		return 1;
 	}
 

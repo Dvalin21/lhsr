@@ -139,6 +139,17 @@ struct lhsr_array {
 	struct workqueue_struct *rmw_wq;
 	struct mutex stripe_locks[LHSR_STRIPE_LOCKS];
 
+	/* RMW write-path statistics (Phase 15, lock-free).
+	 * rmw_works counts started stripe batches, rmw_done completions;
+	 * a persistent (works - done) > 0 means a wave never completed. */
+	atomic64_t rmw_works;
+	atomic64_t rmw_done;
+	atomic64_t rmw_full;
+	atomic64_t rmw_partial;
+	atomic64_t rmw_read_ns;
+	atomic64_t rmw_write_ns;
+	atomic64_t rmw_errors;
+
 	/* Write verification */
 	u32 write_verify_enabled;
 
