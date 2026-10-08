@@ -4692,6 +4692,8 @@ static void lhsr_rmw_worker(struct work_struct *work)
 
 		mutex_lock(&arr->stripe_locks[lock_idx]);
 		locked = true;
+		arr->stripe_lock_holder[lock_idx] = current->pid;
+		arr->stripe_lock_since[lock_idx] = jiffies;
 		failed = lhsr_failed_disks_get(arr);
 
 		/* Any covered member missing -> fail, never write partial. */
@@ -4914,8 +4916,10 @@ static void lhsr_rmw_worker(struct work_struct *work)
 			lhsr_bitmap_clear(arr, (sector_t)(pos >> SECTOR_SHIFT));
 
 	out_stripe:
-		if (locked)
+		if (locked) {
+			arr->stripe_lock_holder[lock_idx] = 0;
 			mutex_unlock(&arr->stripe_locks[lock_idx]);
+		}
 		for (l = 0; l < data_disks; l++) {
 			if (nd[l])
 				__free_pages(nd[l], chunk_order);
@@ -5340,6 +5344,14 @@ passthrough_single:
 					bio_endio(bio);
 					return DM_MAPIO_SUBMITTED;
 				}
+			}
+
+			if (bio->bi_iter.bi_size == 0) {
+				/* Zero-length non-flush bio (e.g. empty discard):
+				 * nothing to do, complete immediately. */
+				bio->bi_status = BLK_STS_OK;
+				bio_endio(bio);
+				return DM_MAPIO_SUBMITTED;
 			}
 
 			for (p = offset; p < wend; ) {
@@ -6222,6 +6234,24 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 			  (long long)atomic64_read(&arr->rmw_errors),
 			  (long long)(atomic64_read(&arr->rmw_read_ns) / 1000),
 			  (long long)(atomic64_read(&arr->rmw_write_ns) / 1000));
+		return 1;
+	}
+
+	if (strcmp(argv[0], "rmw_locks") == 0) {
+		int b;
+
+		scnprintf(result, maxlen, "held:");
+		for (b = 0; b < LHSR_STRIPE_LOCKS; b++) {
+			pid_t h = arr->stripe_lock_holder[b];
+
+			if (h) {
+				char tmp[48];
+				int n = scnprintf(tmp, sizeof(tmp), " %d:pid=%d,age=%lus", b, h,
+						  (jiffies - arr->stripe_lock_since[b]) / HZ);
+				strncat(result, tmp, maxlen - strlen(result) - 1);
+				(void)n;
+			}
+		}
 		return 1;
 	}
 
