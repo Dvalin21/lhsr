@@ -230,6 +230,10 @@ MODULE_AUTHOR("LHSR Team");
 MODULE_DESCRIPTION("Linux Hybrid Self-Healing RAID");
 MODULE_VERSION(LHSR_VERSION);
 
+/* Build ID stamp: update on every test build so dmesg proves which
+ * binary is actually loaded. Format: YYYYMMDD-NN */
+#define LHSR_BUILD_ID "20261009-01"
+
 /* Module parameters (tunable at insmod/modprobe time) */
 static unsigned int lhsr_rmw_max_active = 32;
 module_param_named(rmw_max_active, lhsr_rmw_max_active, uint, 0644);
@@ -6474,8 +6478,8 @@ static int __init lhsr_init(void)
 		return r;
 	}
 
-	DMINFO("Module loaded: %s (target registered) — SB size=%zu version=%u",
-	       LHSR_VERSION, sizeof(struct lhsr_superblock), LHSR_SB_VERSION);
+	DMINFO("Module loaded: %s build %s (target registered) — SB size=%zu version=%u",
+	       LHSR_VERSION, LHSR_BUILD_ID, sizeof(struct lhsr_superblock), LHSR_SB_VERSION);
 	return 0;
 }
 
