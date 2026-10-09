@@ -4986,6 +4986,7 @@ static void lhsr_mirror_endio(struct bio *bio)
 
 struct lhsr_read_batch {
 	struct bio *orig;
+	struct lhsr_array *arr;
 	atomic_t pending;
 	blk_status_t status;
 };
@@ -4994,10 +4995,12 @@ static void lhsr_read_piece_endio(struct bio *bio)
 {
 	struct lhsr_read_batch *rb = bio->bi_private;
 
+	atomic64_inc(&rb->arr->dbg_clone_done);
 	if (bio->bi_status != BLK_STS_OK && rb->status == BLK_STS_OK)
 		rb->status = bio->bi_status;
 	bio_put(bio);
 	if (atomic_dec_and_test(&rb->pending)) {
+		atomic64_inc(&rb->arr->dbg_rbatch_done);
 		rb->orig->bi_status = rb->status;
 		bio_endio(rb->orig);
 		kfree(rb);
@@ -5702,7 +5705,9 @@ passthrough_single:
 				return DM_MAPIO_SUBMITTED;
 			}
 			rb->orig = bio;
+			rb->arr = arr;
 			rb->status = BLK_STS_OK;
+			atomic64_inc(&arr->dbg_rbatch_alloc);
 			atomic_set(&rb->pending, total + 1);
 
 			for (p = offset; p < wend; ) {
@@ -5721,6 +5726,8 @@ passthrough_single:
 				}
 				clone = bio_alloc_clone(arr->disk[d], bio, GFP_NOIO,
 							&lhsr_bioset);
+				if (clone)
+					atomic64_inc(&arr->dbg_clone_alloc);
 				if (!clone) {
 					rb->status = BLK_STS_RESOURCE;
 					break;
@@ -6319,14 +6326,18 @@ static int lhsr_message(struct dm_target *ti, unsigned int argc, char **argv,
 
 	if (strcmp(argv[0], "rmw_stats") == 0) {
 		scnprintf(result, maxlen,
-			  "works=%lld done=%lld full=%lld partial=%lld errors=%lld read_us=%lld write_us=%lld",
+			  "works=%lld done=%lld full=%lld partial=%lld errors=%lld read_us=%lld write_us=%lld rbatch=%lld/%lld clones=%lld/%lld",
 			  (long long)atomic64_read(&arr->rmw_works),
 			  (long long)atomic64_read(&arr->rmw_done),
 			  (long long)atomic64_read(&arr->rmw_full),
 			  (long long)atomic64_read(&arr->rmw_partial),
 			  (long long)atomic64_read(&arr->rmw_errors),
 			  (long long)(atomic64_read(&arr->rmw_read_ns) / 1000),
-			  (long long)(atomic64_read(&arr->rmw_write_ns) / 1000));
+			  (long long)(atomic64_read(&arr->rmw_write_ns) / 1000),
+			  (long long)atomic64_read(&arr->dbg_rbatch_alloc),
+			  (long long)atomic64_read(&arr->dbg_rbatch_done),
+			  (long long)atomic64_read(&arr->dbg_clone_alloc),
+			  (long long)atomic64_read(&arr->dbg_clone_done));
 		return 1;
 	}
 

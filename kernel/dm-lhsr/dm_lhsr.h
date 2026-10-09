@@ -149,6 +149,10 @@ struct lhsr_array {
 	atomic64_t rmw_read_ns;
 	atomic64_t rmw_write_ns;
 	atomic64_t rmw_errors;
+	atomic64_t dbg_rbatch_alloc;
+	atomic64_t dbg_rbatch_done;
+	atomic64_t dbg_clone_alloc;
+	atomic64_t dbg_clone_done;
 	/* Stripe-lock holder tracking (wedge diagnosis, racy but harmless) */
 	pid_t stripe_lock_holder[LHSR_STRIPE_LOCKS];
 	unsigned long stripe_lock_since[LHSR_STRIPE_LOCKS];
