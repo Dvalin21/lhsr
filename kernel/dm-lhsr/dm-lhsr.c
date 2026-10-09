@@ -4984,6 +4984,283 @@ static void lhsr_mirror_endio(struct bio *bio)
 	bio_put(bio);
 }
 
+struct lhsr_read_batch {
+	struct bio *orig;
+	atomic_t pending;
+	blk_status_t status;
+};
+
+static void lhsr_read_piece_endio(struct bio *bio)
+{
+	struct lhsr_read_batch *rb = bio->bi_private;
+
+	if (bio->bi_status != BLK_STS_OK && rb->status == BLK_STS_OK)
+		rb->status = bio->bi_status;
+	bio_put(bio);
+	if (atomic_dec_and_test(&rb->pending)) {
+		rb->orig->bi_status = rb->status;
+		bio_endio(rb->orig);
+		kfree(rb);
+	}
+}
+
+/* Single-chunk RAID5/6 read: direct from the owning disk, or parity
+ * reconstruction if that disk is failed/missing.  The bio must fit
+ * within one chunk; callers split larger bios into chunk pieces. */
+static void lhsr_map_read_single(struct dm_target *ti, struct lhsr_array *arr,
+				 struct bio *bio, sector_t offset)
+{
+	unsigned int parity_disks = (arr->raid_type == LHSR_RAID5) ? 1 : 2;
+	unsigned int data_disks = arr->disks - parity_disks;
+	unsigned int chunk_sects = arr->chunk_sectors;
+	unsigned int stripe_sects = data_disks * chunk_sects;
+	unsigned int data_disk = ((unsigned int)(offset / chunk_sects)) % data_disks;
+	sector_t chunk_start = (offset / stripe_sects) * chunk_sects;
+	unsigned int i;
+		unsigned int target_disk = data_disk;
+
+		if (lhsr_failed_disks_get(arr) & (1 << target_disk) || !arr->disk[target_disk]) {
+			/*
+			 * Target data disk failed — reconstruct from survivors using parity.
+			 * Cannot failover to another data disk: each disk has DIFFERENT data.
+			 */
+			struct lhsr_raid_5_read_ctx *ctx;
+			unsigned int working = 0;
+			unsigned int total_slots = 0;
+			unsigned int j;
+			sector_t stripe_sector;
+
+			DMDEBUG("RECON: target_disk=%u failed_mask=0x%lx data_disks=%u chunk_start=%llu offset_in_chunk=%llu",
+			        target_disk, lhsr_failed_disks_get(arr), data_disks,
+			        (u64)chunk_start, (u64)(offset % chunk_sects));
+
+			/* Count working survivors (data + parity) */
+			for (i = 0; i < arr->disks; i++) {
+				if (!(lhsr_failed_disks_get(arr) & (1 << i)) && arr->disk[i])
+					working++;
+			}
+			if (working == 0) {
+				DMERR("RECON: no working survivors");
+				bio->bi_status = BLK_STS_IOERR;
+				bio_endio(bio);
+	return;
+			}
+
+			/* Count total survivor slots.
+			 * For RAID6: read ALL surviving parity disks (including Q).
+			 * Q is needed by RS(255,N) decode for double-failure recovery.
+			 * In the XOR path (single data failure, P alive), Q is simply
+			 * excluded from the XOR computation.
+			 */
+			total_slots = 0;
+			for (i = 0; i < data_disks; i++) {
+				if (!(lhsr_failed_disks_get(arr) & (1 << i)))
+					total_slots++;
+			}
+			unsigned int parity_to_use = parity_disks;
+			for (j = 0; j < parity_to_use; j++) {
+				if (!(lhsr_failed_disks_get(arr) & (1 << (data_disks + j))))
+					total_slots++;
+			}
+
+			DMDEBUG("RECON: working=%u total_slots=%u", working, total_slots);
+
+			/* Allocate read context with flex array for disk_map */
+			ctx = kzalloc(sizeof(*ctx) + sizeof(unsigned int) * total_slots, GFP_NOIO);
+			if (!ctx) {
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+	return;
+			}
+
+			ctx->orig_bio = bio;
+			ctx->arr = arr;
+			ctx->target_disk = data_disk;
+			ctx->data_disks = data_disks;
+			ctx->working = working;
+			ctx->num_slots = total_slots;
+			ctx->offset = offset;
+			ctx->bio_size = bio->bi_iter.bi_size;
+			atomic_set(&ctx->pending, total_slots);
+			ctx->status = 0;
+
+			ctx->recon_buf = kzalloc(bio->bi_iter.bi_size, GFP_NOIO);
+			if (!ctx->recon_buf) {
+				kfree(ctx);
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+	return;
+			}
+
+			ctx->data_bufs = kzalloc(sizeof(void *) * total_slots, GFP_NOIO);
+			if (!ctx->data_bufs) {
+				kfree(ctx->recon_buf);
+				kfree(ctx);
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+	return;
+			}
+
+			/* Build disk_map: survivors (data then parity)
+			 * For RAID6, BOTH P and Q are included in disk_map.
+			 * Q is a GF-weighted sum and CANNOT be combined with XOR,
+			 * but IS needed for RS(255,N) double-failure decode.
+			 */
+			j = 0;
+			for (i = 0; i < data_disks; i++) {
+				if (!(lhsr_failed_disks_get(arr) & (1 << i))) {
+					ctx->disk_map[j] = i;
+					j++;
+				}
+			}
+			ctx->data_survivors = j;	/* Number of surviving data in disk_map */
+			for (i = 0; i < parity_to_use; i++) {
+				unsigned int pd = data_disks + i;
+				if (!(lhsr_failed_disks_get(arr) & (1 << pd))) {
+					ctx->disk_map[j] = pd;
+					j++;
+				}
+			}
+
+			/*
+			 * All survivors read at the same stripe position:
+			 * each disk's chunk for this stripe is at chunk_start + sector_in_chunk
+			 */
+			stripe_sector = chunk_start + (offset % chunk_sects);
+
+			/* Allocate per-slot pages array */
+			ctx->pages = kzalloc(sizeof(struct page *) * ctx->num_slots, GFP_NOIO);
+			if (!ctx->pages) {
+				kfree(ctx->recon_buf);
+				kfree(ctx->data_bufs);
+				kfree(ctx);
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+	return;
+			}
+
+			/* Phase 1: Pre-allocate a page for each clone */
+			for (i = 0; i < ctx->num_slots; i++) {
+				ctx->pages[i] = alloc_page(GFP_NOIO);
+				if (!ctx->pages[i]) {
+					ctx->status = BLK_STS_RESOURCE;
+					break;
+				}
+			}
+
+			/* Phase 2: For each slot, create an independent bio with its own page */
+			{
+			unsigned int submitted = 0;
+			int alloc_failed = 0;
+
+			DMDEBUG("RECON clone setup: orig_bio_size=%zu ctx_bio_size=%zu chunk_bytes=%zu",
+			        (size_t)bio->bi_iter.bi_size, ctx->bio_size, (size_t)chunk_sects << SECTOR_SHIFT);
+
+			for (i = 0; i < ctx->num_slots; i++) {
+				struct bio *recon_bio;
+				unsigned int di = ctx->disk_map[i];
+
+				if (!arr->disk[di]) {
+					ctx->status = BLK_STS_IOERR;
+					atomic_dec(&ctx->pending);
+					DMINFO("RECON clone: disk %u (slot %u) unavailable", di, i);
+					continue;
+				}
+				if (!ctx->pages[i]) {
+					ctx->status = BLK_STS_RESOURCE;
+					atomic_dec(&ctx->pending);
+					alloc_failed = 1;
+					DMINFO("RECON clone: slot %u page allocation failed", i);
+					continue;
+				}
+				recon_bio = bio_alloc_bioset(arr->disk[di], 1,
+							    REQ_OP_READ, GFP_NOIO,
+							    &lhsr_bioset);
+				if (!recon_bio) {
+					ctx->status = BLK_STS_RESOURCE;
+					atomic_dec(&ctx->pending);
+					alloc_failed = 1;
+					DMINFO("RECON clone: bio_alloc_bioset failed for disk %u", di);
+					continue;
+				}
+				/* Use bio_add_page to properly set up the bvec.
+				 * Page ownership: we allocated the page and bio_add_page
+				 * does NOT take a reference (the caller retains ownership).
+				 * The endio handler will __free_page to release it.
+				 */
+				if (!bio_add_page(recon_bio, ctx->pages[i],
+						  bio->bi_iter.bi_size, 0)) {
+					bio_put(recon_bio);
+					ctx->status = BLK_STS_RESOURCE;
+					atomic_dec(&ctx->pending);
+					DMERR("RECON clone: bio_add_page failed for disk %u", di);
+					alloc_failed = 1;
+					continue;
+				}
+				ctx->data_bufs[i] = kzalloc(bio->bi_iter.bi_size, GFP_NOIO);
+				if (!ctx->data_bufs[i]) {
+					bio_put(recon_bio);
+					ctx->status = BLK_STS_RESOURCE;
+					atomic_dec(&ctx->pending);
+					alloc_failed = 1;
+					continue;
+				}
+				recon_bio->bi_iter.bi_sector = stripe_sector + arr->disk_offset[di];
+				recon_bio->bi_end_io = lhsr_raid_5_read_endio;
+				recon_bio->bi_private = ctx;
+				submit_bio(recon_bio);
+				submitted++;
+			}
+
+			/*
+			 * If none were submitted, no endio will fire.
+			 * Complete orig_bio and free ctx here.
+			 * If at least one was submitted, endio handles completion.
+			 * ctx may be freed if all completed synchronously.
+			 * DO NOT TOUCH ctx after this check.
+			 */
+			if (submitted == 0) {
+				bio->bi_status = ctx->status ? ctx->status : BLK_STS_RESOURCE;
+				bio_endio(bio);
+				kfree(ctx->recon_buf);
+				if (ctx->data_bufs) {
+					for (i = 0; i < ctx->num_slots; i++)
+						kfree(ctx->data_bufs[i]);
+					kfree(ctx->data_bufs);
+				}
+				if (ctx->pages) {
+					for (i = 0; i < ctx->num_slots; i++) {
+						if (ctx->pages[i])
+							__free_page(ctx->pages[i]);
+					}
+					kfree(ctx->pages);
+				}
+				kfree(ctx);
+	return;
+			}
+	return;
+			}
+		}
+
+		/*
+		 * Normal read: direct from target data disk at stripe-aware position.
+		 * physical sector = disk_offset + chunk_start + sector_within_chunk
+		 */
+		{
+			sector_t disk_sector = arr->disk_offset[target_disk]
+					     + chunk_start + (offset % chunk_sects);
+			bio_set_dev(bio, arr->disk[target_disk]);
+			bio->bi_iter.bi_sector = disk_sector;
+			if (lhsr_setup_io_tracking(bio, ti) < 0) {
+				bio->bi_status = BLK_STS_IOERR;
+				bio_endio(bio);
+	return;
+			}
+			submit_bio(bio);
+	return;
+		}
+}
+
 static int lhsr_map(struct dm_target *ti, struct bio *bio)
 {
 	struct lhsr_array *arr = ti->private;
@@ -5274,10 +5551,6 @@ passthrough_single:
 		unsigned int parity_disks = (arr->raid_type == LHSR_RAID5) ? 1 : 2;
 		unsigned int data_disks = arr->disks - parity_disks;
 		unsigned int chunk_sects = arr->chunk_sectors;
-		unsigned int stripe_sects = data_disks * chunk_sects;
-		unsigned int data_disk;
-		unsigned int i;			/* Generic loop counter */
-		sector_t chunk_start;
 		int is_write = (bio_op(bio) != REQ_OP_READ);
 
 		/*
@@ -5286,8 +5559,6 @@ passthrough_single:
 		 *   Sector on data disk = (s / stripe_sects) * chunk_sects + (s % chunk_sects)
 		 *   Parity at same offset on parity disk
 		 */
-		chunk_start = (offset / stripe_sects) * chunk_sects;
-		data_disk = ((unsigned int)(offset / chunk_sects)) % data_disks;
 
 		if (is_write) {
 			const u64 stripe_sects = (u64)data_disks * chunk_sects;
@@ -5403,252 +5674,74 @@ passthrough_single:
 			return DM_MAPIO_SUBMITTED;
 		}
 
-	/*
-	 * RAID5/6 READ: stripe-aware single-disk read with reconstruction fallback
-	 */
 	{
-		unsigned int target_disk = data_disk;
+		unsigned int nsec = bio->bi_iter.bi_size >> SECTOR_SHIFT;
 
-		if (lhsr_failed_disks_get(arr) & (1 << target_disk) || !arr->disk[target_disk]) {
-			/*
-			 * Target data disk failed — reconstruct from survivors using parity.
-			 * Cannot failover to another data disk: each disk has DIFFERENT data.
-			 */
-			struct lhsr_raid_5_read_ctx *ctx;
-			unsigned int working = 0;
-			unsigned int total_slots = 0;
-			unsigned int j;
-			sector_t stripe_sector;
+		/* Multi-chunk reads: fan out one single-chunk piece per
+		 * chunk.  The old code mapped the whole bio to the first
+		 * chunk's disk, silently returning wrong data past it. */
+		if (nsec > 0 &&
+		    (offset / chunk_sects) != ((offset + nsec - 1) / chunk_sects)) {
+			struct lhsr_read_batch *rb;
+			unsigned int total = 0;
+			unsigned int queued = 0;
+			u64 p;
+			u64 wend = (u64)offset + nsec;
 
-			DMDEBUG("RECON: target_disk=%u failed_mask=0x%lx data_disks=%u chunk_start=%llu offset_in_chunk=%llu",
-			        target_disk, lhsr_failed_disks_get(arr), data_disks,
-			        (u64)chunk_start, (u64)(offset % chunk_sects));
+			for (p = offset; p < wend; ) {
+				u64 cb = (p / chunk_sects) * chunk_sects;
 
-			/* Count working survivors (data + parity) */
-			for (i = 0; i < arr->disks; i++) {
-				if (!(lhsr_failed_disks_get(arr) & (1 << i)) && arr->disk[i])
-					working++;
-			}
-			if (working == 0) {
-				DMERR("RECON: no working survivors");
-				bio->bi_status = BLK_STS_IOERR;
-				bio_endio(bio);
-				return DM_MAPIO_SUBMITTED;
+				p = min_t(u64, wend, cb + chunk_sects);
+				total++;
 			}
 
-			/* Count total survivor slots.
-			 * For RAID6: read ALL surviving parity disks (including Q).
-			 * Q is needed by RS(255,N) decode for double-failure recovery.
-			 * In the XOR path (single data failure, P alive), Q is simply
-			 * excluded from the XOR computation.
-			 */
-			total_slots = 0;
-			for (i = 0; i < data_disks; i++) {
-				if (!(lhsr_failed_disks_get(arr) & (1 << i)))
-					total_slots++;
-			}
-			unsigned int parity_to_use = parity_disks;
-			for (j = 0; j < parity_to_use; j++) {
-				if (!(lhsr_failed_disks_get(arr) & (1 << (data_disks + j))))
-					total_slots++;
-			}
-
-			DMDEBUG("RECON: working=%u total_slots=%u", working, total_slots);
-
-			/* Allocate read context with flex array for disk_map */
-			ctx = kzalloc(sizeof(*ctx) + sizeof(unsigned int) * total_slots, GFP_NOIO);
-			if (!ctx) {
+			rb = kzalloc(sizeof(*rb), GFP_NOIO);
+			if (!rb) {
 				bio->bi_status = BLK_STS_RESOURCE;
 				bio_endio(bio);
 				return DM_MAPIO_SUBMITTED;
 			}
+			rb->orig = bio;
+			rb->status = BLK_STS_OK;
+			atomic_set(&rb->pending, total + 1);
 
-			ctx->orig_bio = bio;
-			ctx->arr = arr;
-			ctx->target_disk = data_disk;
-			ctx->data_disks = data_disks;
-			ctx->working = working;
-			ctx->num_slots = total_slots;
-			ctx->offset = offset;
-			ctx->bio_size = bio->bi_iter.bi_size;
-			atomic_set(&ctx->pending, total_slots);
-			ctx->status = 0;
+			for (p = offset; p < wend; ) {
+				u64 cb = (p / chunk_sects) * chunk_sects;
+				u64 we = min_t(u64, wend, cb + chunk_sects);
+				struct bio *clone = NULL;
+				unsigned int d;
 
-			ctx->recon_buf = kzalloc(bio->bi_iter.bi_size, GFP_NOIO);
-			if (!ctx->recon_buf) {
-				kfree(ctx);
-				bio->bi_status = BLK_STS_RESOURCE;
-				bio_endio(bio);
-				return DM_MAPIO_SUBMITTED;
-			}
-
-			ctx->data_bufs = kzalloc(sizeof(void *) * total_slots, GFP_NOIO);
-			if (!ctx->data_bufs) {
-				kfree(ctx->recon_buf);
-				kfree(ctx);
-				bio->bi_status = BLK_STS_RESOURCE;
-				bio_endio(bio);
-				return DM_MAPIO_SUBMITTED;
-			}
-
-			/* Build disk_map: survivors (data then parity)
-			 * For RAID6, BOTH P and Q are included in disk_map.
-			 * Q is a GF-weighted sum and CANNOT be combined with XOR,
-			 * but IS needed for RS(255,N) double-failure decode.
-			 */
-			j = 0;
-			for (i = 0; i < data_disks; i++) {
-				if (!(lhsr_failed_disks_get(arr) & (1 << i))) {
-					ctx->disk_map[j] = i;
-					j++;
+				for (d = 0; d < arr->disks; d++) {
+					if (arr->disk[d])
+						break;
 				}
-			}
-			ctx->data_survivors = j;	/* Number of surviving data in disk_map */
-			for (i = 0; i < parity_to_use; i++) {
-				unsigned int pd = data_disks + i;
-				if (!(lhsr_failed_disks_get(arr) & (1 << pd))) {
-					ctx->disk_map[j] = pd;
-					j++;
-				}
-			}
-
-			/*
-			 * All survivors read at the same stripe position:
-			 * each disk's chunk for this stripe is at chunk_start + sector_in_chunk
-			 */
-			stripe_sector = chunk_start + (offset % chunk_sects);
-
-			/* Allocate per-slot pages array */
-			ctx->pages = kzalloc(sizeof(struct page *) * ctx->num_slots, GFP_NOIO);
-			if (!ctx->pages) {
-				kfree(ctx->recon_buf);
-				kfree(ctx->data_bufs);
-				kfree(ctx);
-				bio->bi_status = BLK_STS_RESOURCE;
-				bio_endio(bio);
-				return DM_MAPIO_SUBMITTED;
-			}
-
-			/* Phase 1: Pre-allocate a page for each clone */
-			for (i = 0; i < ctx->num_slots; i++) {
-				ctx->pages[i] = alloc_page(GFP_NOIO);
-				if (!ctx->pages[i]) {
-					ctx->status = BLK_STS_RESOURCE;
+				if (d >= arr->disks) {
+					rb->status = BLK_STS_IOERR;
 					break;
 				}
+				clone = bio_alloc_clone(arr->disk[d], bio, GFP_NOIO,
+							&lhsr_bioset);
+				if (!clone) {
+					rb->status = BLK_STS_RESOURCE;
+					break;
+				}
+				bio_trim(clone, (sector_t)(p - offset),
+					 (sector_t)(we - p));
+				clone->bi_end_io = lhsr_read_piece_endio;
+				clone->bi_private = rb;
+				lhsr_map_read_single(ti, arr, clone, (sector_t)p);
+				queued++;
 			}
 
-			/* Phase 2: For each slot, create an independent bio with its own page */
-			{
-			unsigned int submitted = 0;
-			int alloc_failed = 0;
-
-			DMDEBUG("RECON clone setup: orig_bio_size=%zu ctx_bio_size=%zu chunk_bytes=%zu",
-			        (size_t)bio->bi_iter.bi_size, ctx->bio_size, (size_t)chunk_sects << SECTOR_SHIFT);
-
-			for (i = 0; i < ctx->num_slots; i++) {
-				struct bio *recon_bio;
-				unsigned int di = ctx->disk_map[i];
-
-				if (!arr->disk[di]) {
-					ctx->status = BLK_STS_IOERR;
-					atomic_dec(&ctx->pending);
-					DMINFO("RECON clone: disk %u (slot %u) unavailable", di, i);
-					continue;
-				}
-				if (!ctx->pages[i]) {
-					ctx->status = BLK_STS_RESOURCE;
-					atomic_dec(&ctx->pending);
-					alloc_failed = 1;
-					DMINFO("RECON clone: slot %u page allocation failed", i);
-					continue;
-				}
-				recon_bio = bio_alloc_bioset(arr->disk[di], 1,
-							    REQ_OP_READ, GFP_NOIO,
-							    &lhsr_bioset);
-				if (!recon_bio) {
-					ctx->status = BLK_STS_RESOURCE;
-					atomic_dec(&ctx->pending);
-					alloc_failed = 1;
-					DMINFO("RECON clone: bio_alloc_bioset failed for disk %u", di);
-					continue;
-				}
-				/* Use bio_add_page to properly set up the bvec.
-				 * Page ownership: we allocated the page and bio_add_page
-				 * does NOT take a reference (the caller retains ownership).
-				 * The endio handler will __free_page to release it.
-				 */
-				if (!bio_add_page(recon_bio, ctx->pages[i],
-						  bio->bi_iter.bi_size, 0)) {
-					bio_put(recon_bio);
-					ctx->status = BLK_STS_RESOURCE;
-					atomic_dec(&ctx->pending);
-					DMERR("RECON clone: bio_add_page failed for disk %u", di);
-					alloc_failed = 1;
-					continue;
-				}
-				ctx->data_bufs[i] = kzalloc(bio->bi_iter.bi_size, GFP_NOIO);
-				if (!ctx->data_bufs[i]) {
-					bio_put(recon_bio);
-					ctx->status = BLK_STS_RESOURCE;
-					atomic_dec(&ctx->pending);
-					alloc_failed = 1;
-					continue;
-				}
-				recon_bio->bi_iter.bi_sector = stripe_sector + arr->disk_offset[di];
-				recon_bio->bi_end_io = lhsr_raid_5_read_endio;
-				recon_bio->bi_private = ctx;
-				submit_bio(recon_bio);
-				submitted++;
-			}
-
-			/*
-			 * If none were submitted, no endio will fire.
-			 * Complete orig_bio and free ctx here.
-			 * If at least one was submitted, endio handles completion.
-			 * ctx may be freed if all completed synchronously.
-			 * DO NOT TOUCH ctx after this check.
-			 */
-			if (submitted == 0) {
-				bio->bi_status = ctx->status ? ctx->status : BLK_STS_RESOURCE;
-				bio_endio(bio);
-				kfree(ctx->recon_buf);
-				if (ctx->data_bufs) {
-					for (i = 0; i < ctx->num_slots; i++)
-						kfree(ctx->data_bufs[i]);
-					kfree(ctx->data_bufs);
-				}
-				if (ctx->pages) {
-					for (i = 0; i < ctx->num_slots; i++) {
-						if (ctx->pages[i])
-							__free_page(ctx->pages[i]);
-					}
-					kfree(ctx->pages);
-				}
-				kfree(ctx);
-				return DM_MAPIO_SUBMITTED;
+			if (atomic_sub_and_test((total + 1) - queued, &rb->pending)) {
+				rb->orig->bi_status = rb->status;
+				bio_endio(rb->orig);
+				kfree(rb);
 			}
 			return DM_MAPIO_SUBMITTED;
-			}
 		}
-
-		/*
-		 * Normal read: direct from target data disk at stripe-aware position.
-		 * physical sector = disk_offset + chunk_start + sector_within_chunk
-		 */
-		{
-			sector_t disk_sector = arr->disk_offset[target_disk]
-					     + chunk_start + (offset % chunk_sects);
-			bio_set_dev(bio, arr->disk[target_disk]);
-			bio->bi_iter.bi_sector = disk_sector;
-			if (lhsr_setup_io_tracking(bio, ti) < 0) {
-				bio->bi_status = BLK_STS_IOERR;
-				bio_endio(bio);
-				return DM_MAPIO_SUBMITTED;
-			}
-			submit_bio(bio);
-			return DM_MAPIO_SUBMITTED;
-		}
+		lhsr_map_read_single(ti, arr, bio, offset);
+		return DM_MAPIO_SUBMITTED;
 	}
 	}
 
