@@ -5742,6 +5742,7 @@ passthrough_single:
 				clone->bi_private = rb;
 				lhsr_map_read_single(ti, arr, clone, (sector_t)p);
 				queued++;
+				p = we;
 			}
 
 			if (atomic_sub_and_test((total + 1) - queued, &rb->pending)) {
