@@ -3293,11 +3293,26 @@ static void lhsr_parallel_endio(struct bio *bio)
 	bio_put(bio);
 }
 
+/* Record a synchronous failure in a parallel batch. Balances the pending
+ * count for a submission that will never see an endio (skip or alloc
+ * failure) so waiters always wake. Callers pre-validate disks, so a skip
+ * here means a race with disk_fail and must fail the stripe, never hang
+ * it with the stripe lock held.
+ * ponytail: single helper, no new struct or workqueue. */
+static void lhsr_pio_fail(struct lhsr_parallel_io *pio, blk_status_t st)
+{
+	if (st && pio->status == BLK_STS_OK)
+		pio->status = st;
+	if (atomic_dec_and_test(&pio->pending))
+		complete(&pio->done);
+}
+
 /* Submit one page-aligned I/O as part of a parallel batch.
- * If the target disk is failed or missing:
- *   - For reads: zero the page and skip (no I/O submitted)
- *   - For writes: skip entirely (parity write to failed disk is meaningless)
- * Returns 0 on success (or skip), -ENOMEM on bio allocation failure.
+ * Callers pre-validate disks against a failed-mask snapshot; a skip here
+ * means a race with disk_fail (or a missing page) and fails the batch
+ * via lhsr_pio_fail instead of stranding pending. Never returns success
+ * without either submitting a bio or balancing pending.
+ * Returns 0 on submit, negative errno on skip/failure (pending balanced).
  */
 static int lhsr_submit_parallel(struct lhsr_array *arr, unsigned int disk_idx,
 				struct page *page, size_t len,
@@ -3307,10 +3322,14 @@ static int lhsr_submit_parallel(struct lhsr_array *arr, unsigned int disk_idx,
 	struct bio *bio;
 	struct block_device *bdev;
 
-	if (!page)
-		return 0;
-	if (!arr->disk[disk_idx])
-		return 0;
+	if (!page) {
+		lhsr_pio_fail(pio, BLK_STS_IOERR);
+		return -EIO;
+	}
+	if (!arr->disk[disk_idx]) {
+		lhsr_pio_fail(pio, BLK_STS_IOERR);
+		return -EIO;
+	}
 
 	/* Failed disk handling */
 	if (lhsr_failed_disks_get(arr) & (1 << disk_idx)) {
@@ -3319,13 +3338,14 @@ static int lhsr_submit_parallel(struct lhsr_array *arr, unsigned int disk_idx,
 			memset(ptr, 0, len);
 			kunmap_local(ptr);
 		}
-		return 0;
+		lhsr_pio_fail(pio, BLK_STS_IOERR);
+		return -EIO;
 	}
 
 	bdev = arr->disk[disk_idx];
 	bio = bio_alloc_bioset(bdev, 1, opf, GFP_NOIO, &lhsr_bioset);
 	if (!bio) {
-		atomic_dec(&pio->pending);
+		lhsr_pio_fail(pio, BLK_STS_RESOURCE);
 		return -ENOMEM;
 	}
 
@@ -3335,7 +3355,7 @@ static int lhsr_submit_parallel(struct lhsr_array *arr, unsigned int disk_idx,
 
 	if (!bio_add_page(bio, page, len, 0)) {
 		bio_put(bio);
-		atomic_dec(&pio->pending);
+		lhsr_pio_fail(pio, BLK_STS_IOERR);
 		return -EIO;
 	}
 
@@ -5602,8 +5622,7 @@ passthrough_single:
 					fbio = bio_alloc_bioset(arr->disk[d], 0, REQ_OP_FLUSH,
 								GFP_NOIO, &lhsr_bioset);
 					if (!fbio) {
-						fio.status = BLK_STS_RESOURCE;
-						atomic_dec(&fio.pending);
+						lhsr_pio_fail(&fio, BLK_STS_RESOURCE);
 						continue;
 					}
 					fbio->bi_end_io = lhsr_parallel_endio;
