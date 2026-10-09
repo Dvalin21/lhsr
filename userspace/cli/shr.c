@@ -80,12 +80,14 @@ static const char *raid_type_name(unsigned int t)
  *
  * 1. Reserve alignment sectors at start of each disk for GPT
  * 2. Sort disks by size ascending (smallest first for capacity calc)
- * 3. While >= min_disks_for_parity disks have available >= min_partition:
- *    a. partition_size = min(available) among qualifying disks
- *    b. partition_size = round DOWN to alignment boundary
- *    c. Allocate partition on each qualifying disk at its next offset
- *    d. Reduce each disk's available by partition_size
- *    e. Remove disks with available < min_partition from qualifying set
+ * 3. While >= 2 disks have available >= min_partition:
+ *    a. pick the RAID type the remaining disk count supports
+ *       (SHR-1: RAID5 at 3+, RAID1 at exactly 2; SHR-2: RAID6 at 4+ only)
+ *    b. partition_size = min(available) among qualifying disks
+ *    c. partition_size = round DOWN to alignment boundary
+ *    d. Allocate partition on each qualifying disk at its next offset
+ *    e. Reduce each disk's available by partition_size
+ *    f. Remove disks with available < min_partition from qualifying set
  * 4. Report remaining space as unusable
  * =================================================================== */
 
@@ -174,9 +176,36 @@ int shr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
 			active[i] = true;
 		active_count = disk_count;
 
-		while (active_count >= min_disks) {
+		while (active_count >= 2) {
 			uint64_t min_avail = (uint64_t)-1;
 			uint64_t part_size;
+			unsigned int tier_raid_type;
+			unsigned int data_members;
+
+			/*
+			 * Choose the RAID type this tier can support.
+			 *
+			 * SHR-1: RAID5 while >= 3 disks remain, then a final
+			 * RAID1 mirror on the last 2. Without the mirror tier
+			 * the tail of a mixed set is stranded — 8/6/4/4/2 TB
+			 * loses 6 TB raw (2 TB usable) because the loop used
+			 * to stop at min_disks.
+			 *
+			 * SHR-2 promises 2-disk fault tolerance on every tier,
+			 * so it must NOT degrade to RAID5/RAID1 at the tail.
+			 */
+			if (parity == 2) {
+				if (active_count < 4)
+					break;
+				tier_raid_type = 3;              /* RAID6 */
+				data_members = active_count - 2;
+			} else if (active_count >= 3) {
+				tier_raid_type = 2;              /* RAID5 */
+				data_members = active_count - 1;
+			} else {
+				tier_raid_type = LHSR_RAID1;     /* mirror */
+				data_members = 1;
+			}
 
 			/* Find smallest available among active disks */
 			for (i = 0; i < disk_count; i++) {
@@ -196,11 +225,12 @@ int shr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
 
 			/* Create tier */
 			layout->tiers[tier_idx].partition_count = active_count;
-			layout->tiers[tier_idx].raid_type = (parity == 1) ? 2 : 3; /* RAID5 or RAID6 */
-			layout->tiers[tier_idx].parity_per_tier = parity;
+			layout->tiers[tier_idx].raid_type = tier_raid_type;
+			layout->tiers[tier_idx].parity_per_tier =
+				(tier_raid_type == LHSR_RAID1) ? 1 : parity;
 			layout->tiers[tier_idx].partition_size = part_size;
 			layout->tiers[tier_idx].usable_sectors =
-				part_size * (active_count - parity);
+				part_size * data_members;
 			layout->tiers[tier_idx].md_idx = tier_idx;
 
 			/* Allocate partitions on each active disk */
