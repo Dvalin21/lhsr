@@ -232,7 +232,7 @@ MODULE_VERSION(LHSR_VERSION);
 
 /* Build ID stamp: update on every test build so dmesg proves which
  * binary is actually loaded. Format: YYYYMMDD-NN */
-#define LHSR_BUILD_ID "20261009-01"
+#define LHSR_BUILD_ID "20261009-02"
 
 /* Module parameters (tunable at insmod/modprobe time) */
 static unsigned int lhsr_rmw_max_active = 32;
