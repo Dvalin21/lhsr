@@ -4,20 +4,22 @@
 
 ---
 
-LHSR is a **Linux Device Mapper target** that provides RAID5/6 with CRC32c
-scrubbing and read-side self-healing.  It is implemented as a kernel module
-(`dm-lhsr.ko`) with userspace tools for administration and recovery.
+LHSR is a **Linux Device Mapper target** that does RAID5/6 with CRC32c
+scrubbing and read-side self-healing.  It's a kernel module
+(`dm-lhsr.ko`) plus userspace tools for admin and recovery.
 
-> **Status:** qualified production. RAID5/6 survives sustained file IO
-> (≈2.5M RMW cycles, reshape, rebuild, scrub — all clean on VM, Oct 2026).
-> Verified envelope: 4KB/64KB chunks, btrfs, single-disk degraded, kernel 6.1.
-> Not yet verified: RAID6 dual-failure decode, Debian 13 runtime, real disks.
-> See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for the honest ledger.
+> **Where things stand:** RAID5/6 holds up under sustained file IO
+> (about 2.5M RMW cycles, a reshape, a rebuild and a scrub, all clean
+> on a VM in Oct 2026).  That covers 4KB/64KB chunks, btrfs, one dead
+> disk at a time, kernel 6.1.  Still unproven: RAID6 dual-failure
+> decode, Debian 13 runtime, real disks.  The full story, warts and
+> all, is in [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
 
 ## What it does
 
-- **RAID5 and RAID6** — XOR and Reed-Solomon GF(2^8) parity with correct RMW
-  state machine.  RAID0 (single) and RAID1 (mirror) also supported.
+- **RAID5 and RAID6** — XOR and Reed-Solomon GF(2^8) parity with an RMW
+  state machine we have beaten on pretty hard.  RAID0 (single) and
+  RAID1 (mirror) also supported.
 - **CRC32c background scrub** — rate-limited, configurable block size,
   corruption detection and logging.
 - **Read-side reconstruction** — transparent parity-read recovery when a disk
@@ -97,45 +99,48 @@ The daemon (`lhsrd`) runs in userspace and handles:
 
 ## Operations
 
-Three things operators need.  Every module build carries a build ID —
-refuse to test a box that reports the wrong one:
+Three things that will save you.  Every module build carries a build ID.
+If the box reports the wrong one, stop, you are testing the wrong binary
+(we lost hours to this exact mistake):
 
 ```bash
-# What build is loaded? (must match the commit under test)
+# What build is loaded? Must match the commit under test.
 sudo dmesg | grep 'Module loaded'
-# RMW accounting: works must equal done; errors must stay 0
+# RMW accounting: works must equal done; errors must stay 0.
 sudo dmsetup message <dev> 0 rmw_stats
-# Stripe locks: buckets with age growing past ~60s are wedged
+# Stripe locks: a bucket whose age keeps climbing past ~60s is wedged.
 sudo dmsetup message <dev> 0 rmw_locks
 ```
 
-A single transient EIO on a single-device filesystem (btrfs included)
-forces it read-only — that is filesystem behavior, not an LHSR bug.
-Monitor `rmw_stats` errors and dmesg; the recovery runbook is in
-[RECOVERY.md](RECOVERY.md), the full ledger in
+One thing that is not our bug: a single transient EIO on a single-device
+filesystem (btrfs included) forces it read-only.  That is the filesystem
+doing its job.  Watch `rmw_stats` errors and dmesg.  Recovery steps are in
+[RECOVERY.md](RECOVERY.md); the whole story is in
 [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md).
 
 ## What it does NOT do (yet)
 
-- **Online reshape with writes accepted** — RAID5→RAID6 in-place reshape is
-  implemented (kernel-based, crash-safe, sha256-verified data preservation)
-  via [`deploy/lhsr-reshape.sh`](deploy/lhsr-reshape.sh), supports chunks up
-  to 64KB, but **writes are rejected** during migration — the filesystem must
-  be quiet.  A fully online reshape with bio deferral is deferred.
-  Offline migration (backup → recreate → restore) is also supported via
+- **Online reshape with writes accepted** — RAID5→RAID6 reshape works
+  in place (kernel-based, crash-safe, and we have verified byte-identical
+  data through it) via [`deploy/lhsr-reshape.sh`](deploy/lhsr-reshape.sh),
+  chunks up to 64KB.  Catch: **writes are rejected** while it runs, so
+  quiet the filesystem first.  Fully online reshape (bio deferral) is
+  future work.  The slower safe path — backup, recreate, restore — is
   [`deploy/lhsr-migrate.sh`](deploy/lhsr-migrate.sh).
 - **Persistent checksum cache** — the CRC32c checksum cache is ephemeral
   (xarray, lost on module unload).  For persistent anti-bit-rot,
   [stack LHSR on dm-integrity](INSTALL.md#dm-integrity-stacking).
 - **RAID6 dual-failure recovery in production** — the Vandermonde 2x2 decode
-  exists but has not been executed against current code.  Do not rely on it
-  until it is tested.
-- **Debian 13 runtime + real disks** — verified on 6.1 (Debian 12 VM);
-  6.12 builds clean but version skew has bitten before (standalone FLUSH
-  bios).  Real-disk SMART/failover behavior is untested.
-- **mdadm-class write performance** — ~5-11x slower on VM (4 sync IOs per
-  4KB write; measured 3-5MB/s btrfs file IO).  Unmeasured after the
-  October fixes; real hardware numbers needed.
+  is written but has never run against current code.  Don't depend on it
+  until somebody watches it work.
+- **Debian 13 runtime + real disks** — proven on 6.1 (Debian 12 VM).
+  6.12 builds fine, but kernel version skew has already bitten us once
+  (standalone FLUSH bios), so 6.12 runtime is unverified.  Real-disk
+  SMART/failover behavior is unverified too.
+- **mdadm-class write performance** — about 5-11x slower on a VM (4 sync
+  IOs per 4KB write; we measured 3-5MB/s of btrfs file IO).  Nobody has
+  measured it since the October fixes, and VM numbers are not hardware
+  numbers anyway.
 
 ## Components
 
