@@ -232,7 +232,7 @@ MODULE_VERSION(LHSR_VERSION);
 
 /* Build ID stamp: update on every test build so dmesg proves which
  * binary is actually loaded. Format: YYYYMMDD-NN */
-#define LHSR_BUILD_ID "20261010-01"
+#define LHSR_BUILD_ID "20261010-02"
 
 /* Module parameters (tunable at insmod/modprobe time) */
 static unsigned int lhsr_rmw_max_active = 32;
@@ -2037,9 +2037,7 @@ static int lhsr_rebuild_start(struct lhsr_array *arr, unsigned int disk_idx)
  * During reshape, all non-read I/O is rejected.  Userspace should
  * remount the filesystem read-only before starting.
  *
- * Reshape requires chunk_sectors * SECTOR_SHIFT <= PAGE_SIZE
- * (default 8 sectors = 4 KB = 1 page).  Arrays with larger chunks
- * must use mdadm --grow.
+ * Reshape supports chunk sizes up to 64KB (compound pages).
  * =====================================================================
  */
 
@@ -2047,10 +2045,8 @@ static int lhsr_rebuild_start(struct lhsr_array *arr, unsigned int disk_idx)
  *
  * Reads chunk_bytes from each data disk at position 'offset', computes
  * Q = Σ_{d=0}^{data_disks-1} gf_mul(data[d], g^d), and writes Q to the
- * new disk at the same offset with REQ_FUA.
- *
- * Requires arr->chunk_sectors * SECTOR_SHIFT <= PAGE_SIZE (enforced
- * by the reshape start function).
+ * new disk at the same offset with REQ_FUA.  Chunk sizes up to 64KB
+ * via compound pages (limit enforced by the reshape start function).
  *
  * Returns 0 on success, -ENOMEM on allocation failure, -EIO on I/O
  * error.
@@ -2063,15 +2059,20 @@ static int lhsr_reshape_compute_q_stripe(struct lhsr_array *arr,
 	struct page *q_page;
 	struct page *read_page;
 	unsigned int d;
+	unsigned int order = get_order(chunk_bytes);
 	int ret = 0;
 
-	q_page = alloc_page(GFP_KERNEL);
-	read_page = alloc_page(GFP_KERNEL);
+	/* Compound pages: Q compute and member IO use full chunk_bytes
+	 * (up to 64KB). Single pages would overflow (same class as the
+	 * recovery heap smash). */
+
+	q_page = alloc_pages(GFP_KERNEL, order);
+	read_page = alloc_pages(GFP_KERNEL, order);
 	if (!q_page || !read_page) {
 		if (q_page)
-			__free_page(q_page);
+			__free_pages(q_page, order);
 		if (read_page)
-			__free_page(read_page);
+			__free_pages(read_page, order);
 		return -ENOMEM;
 	}
 
@@ -2128,8 +2129,8 @@ static int lhsr_reshape_compute_q_stripe(struct lhsr_array *arr,
 	}
 
 out:
-	__free_page(q_page);
-	__free_page(read_page);
+	__free_pages(q_page, order);
+	__free_pages(read_page, order);
 	return ret;
 }
 
@@ -2298,10 +2299,9 @@ static int lhsr_reshape_start_raid5_to_raid6(struct dm_target *ti,
 		return -EINVAL;
 	}
 
-	if ((size_t)arr->chunk_sectors << SECTOR_SHIFT > PAGE_SIZE) {
-		DMERR("reshape: chunk size %u sectors > PAGE_SIZE (%lu) "
-		      "not supported for reshape",
-		      arr->chunk_sectors, (unsigned long)PAGE_SIZE);
+	if ((size_t)arr->chunk_sectors << SECTOR_SHIFT > 64 * 1024) {
+		DMERR("reshape: chunk size %u sectors > 64KB not supported",
+		      arr->chunk_sectors);
 		return -EOPNOTSUPP;
 	}
 
