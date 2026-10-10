@@ -206,6 +206,7 @@ under test is identified by build ID (`dmesg | grep 'Module loaded'`).
 | [INSTALL.md](INSTALL.md) | Full installation and deployment guide |
 | [RECOVERY.md](RECOVERY.md) | Step-by-step disk failure recovery (5 scenarios) |
 | [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) | Honest gap analysis |
+| [docs/wiki/Home.md](docs/wiki/Home.md) | Operator wiki: runbooks, diagnostics, failure catalog, test matrix |
 | [CHANGELOG.md](CHANGELOG.md) | Version history |
 | [ROADMAP.md](ROADMAP.md) | Phased implementation plan |
 | [TEST_HARDWARE.md](TEST_HARDWARE.md) | VM test environment specs |
