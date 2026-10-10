@@ -937,6 +937,12 @@ sha256-identical data; degraded RAID6 single-disk 200MB read sha256-identical;
 dirty recoveries complete. Residue: `debug/bio-shape-20261009` branch holds
 the throwaway probes; `main` carries fixes only.
 
+**Overnight gambit 2026-10-10 (same VM, `main` builds):** reshape fix +
+RAID6 452K-cycle stress (0 err) + degraded read/rebuild with identical
+sha256 + 4KB-chunk 964K-cycle stress (0 err) + btrfs scrub 3.56GB with
+0 errors. Total ≈2.5M RMW cycles, zero failures. Still open: RAID6
+dual-failure decode, Debian 13 validation, write-perf measurement.
+
 **Still open after the hunt:** RAID6 dual-failure decode on new paths;
 Debian 13 validation; `+850GB` recovery memset oops (likely fallout of #3,
 2 clean recoveries since — watch item); write-perf gap unmeasured.
