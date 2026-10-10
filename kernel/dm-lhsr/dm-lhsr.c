@@ -232,7 +232,7 @@ MODULE_VERSION(LHSR_VERSION);
 
 /* Build ID stamp: update on every test build so dmesg proves which
  * binary is actually loaded. Format: YYYYMMDD-NN */
-#define LHSR_BUILD_ID "20261009-02"
+#define LHSR_BUILD_ID "20261010-01"
 
 /* Module parameters (tunable at insmod/modprobe time) */
 static unsigned int lhsr_rmw_max_active = 32;
@@ -4666,8 +4666,7 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		struct lhsr_parallel_io pio;
 		unsigned long failed;
 		unsigned int l;
-		unsigned int n = 0;
-		bool full;
+		bool full = true;
 		bool locked = false;
 		bool chunk_full[LHSR_MAX_DISKS];
 		int nr;
@@ -4680,12 +4679,14 @@ static void lhsr_rmw_worker(struct work_struct *work)
 		for (l = 0; l < data_disks; l++) {
 			u64 v = stripe_start + (u64)l * chunk_bytes;
 
-			if (v >= vstart + vsize || v + chunk_bytes <= vstart)
+			if (v >= vstart + vsize || v + chunk_bytes <= vstart) {
+				full = false;
 				continue;
+			}
 			chunk_full[l] = (vstart <= v && v + chunk_bytes <= vstart + vsize);
-			n++;
+			if (!chunk_full[l])
+				full = false;
 		}
-		full = (n == data_disks);
 
 		for (l = 0; l < data_disks; l++) {
 			u64 v = stripe_start + (u64)l * chunk_bytes;
@@ -4697,7 +4698,13 @@ static void lhsr_rmw_worker(struct work_struct *work)
 				status = BLK_STS_RESOURCE;
 				goto out_stripe;
 			}
-			if (!full) {
+			/* Per-chunk od: a stripe with every chunk touched
+			 * is not necessarily fully contained (bio-edge
+			 * chunks stay partial). Gating od on stripe-level
+			 * full left od[l] NULL for edge chunks, whose use
+			 * below then dereferenced a wild page with the
+			 * stripe lock held. */
+			if (!chunk_full[l]) {
 				od[l] = alloc_pages(GFP_NOIO, chunk_order);
 				if (!od[l]) {
 					status = BLK_STS_RESOURCE;
@@ -4747,6 +4754,9 @@ static void lhsr_rmw_worker(struct work_struct *work)
 
 				if (v >= vstart + vsize || v + chunk_bytes <= vstart)
 					continue;
+				/* Fully-contained chunks need no old data. */
+				if (chunk_full[l])
+					continue;
 				nr++;
 			}
 			nr += 1 + (parity_disks > 1 ? 1 : 0);
@@ -4758,6 +4768,8 @@ static void lhsr_rmw_worker(struct work_struct *work)
 				u64 v = stripe_start + (u64)l * chunk_bytes;
 
 				if (v >= vstart + vsize || v + chunk_bytes <= vstart)
+					continue;
+				if (chunk_full[l])
 					continue;
 				lhsr_submit_parallel(arr, l, od[l], chunk_bytes,
 						     disk_pos, REQ_OP_READ, &pio);
