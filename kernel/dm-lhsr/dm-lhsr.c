@@ -3870,19 +3870,24 @@ static int lhsr_bitmap_recover(struct lhsr_array *arr)
 		struct page *parity_page = NULL, *temp_page = NULL, *q_page = NULL;
 		void *parity_buf, *temp_buf, *q_buf = NULL;
 		size_t chunk_bytes = arr->chunk_sectors * 512;
+		unsigned int order = get_order(chunk_bytes);
 		int ret;
 
-		parity_page = alloc_page(GFP_KERNEL);
-		temp_page   = alloc_page(GFP_KERNEL);
+		/* Compound pages: all IO/memset below use chunk_bytes
+		 * (up to 64KB). Single pages overflow into adjacent
+		 * memory (observed: 60KB heap smash -> wild ctr memset
+		 * -> panic during recovery). */
+		parity_page = alloc_pages(GFP_KERNEL, order);
+		temp_page   = alloc_pages(GFP_KERNEL, order);
 		if (!parity_page || !temp_page) {
 			DMERR("bitmap: recovery OOM");
-			if (parity_page) __free_page(parity_page);
-			if (temp_page) __free_page(temp_page);
+			if (parity_page) __free_pages(parity_page, order);
+			if (temp_page) __free_pages(temp_page, order);
 			goto out;
 		}
 
 		if (arr->raid_type == LHSR_RAID6) {
-			q_page = alloc_page(GFP_KERNEL);
+			q_page = alloc_pages(GFP_KERNEL, order);
 			if (!q_page)
 				DMWARN("bitmap: Q page OOM, skipping Q parity rebuild");
 		}
@@ -4030,10 +4035,10 @@ static int lhsr_bitmap_recover(struct lhsr_array *arr)
 			kunmap_local(q_buf);
 		kunmap_local(temp_buf);
 		kunmap_local(parity_buf);
-		__free_page(temp_page);
-		__free_page(parity_page);
+		__free_pages(temp_page, order);
+		__free_pages(parity_page, order);
 		if (q_page)
-			__free_page(q_page);
+			__free_pages(q_page, order);
 	}
 
 out:
