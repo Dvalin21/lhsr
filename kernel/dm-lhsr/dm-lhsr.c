@@ -233,7 +233,7 @@ MODULE_VERSION(LHSR_VERSION);
 
 /* Build ID stamp: update on every test build so dmesg proves which
  * binary is actually loaded. Format: YYYYMMDD-NN */
-#define LHSR_BUILD_ID "20261010-03"
+#define LHSR_BUILD_ID "20261010-04"
 
 /* Module parameters (tunable at insmod/modprobe time) */
 static unsigned int lhsr_rmw_max_active = 32;
@@ -719,13 +719,23 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 				}
 				DMDEBUG("RECON XOR: recon_buf non_zero_first64=%d bio_size=%zu",
 				        non_zero, bio_size);
+			/* Copy reconstructed data to original bio: walk ALL
+			 * segments (the old code stopped after the first,
+			 * returning correct data for 4KB reads and garbage
+			 * past it on degraded arrays). */
+			{
+				size_t done = 0;
+
 				bio_for_each_segment(bv, ctx->orig_bio, iter) {
 					void *kaddr = kmap_local_page(bv.bv_page);
-					void *dst = kaddr + bv.bv_offset;
-					memcpy(dst, ctx->recon_buf, bv.bv_len);
+
+					memcpy(kaddr + bv.bv_offset,
+					       (u8 *)ctx->recon_buf + done,
+					       bv.bv_len);
 					kunmap_local(kaddr);
-					break; /* Single segment for now */
+					done += bv.bv_len;
 				}
+			}
 			}
 		}
 
