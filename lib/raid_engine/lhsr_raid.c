@@ -607,10 +607,10 @@ struct lhsr_array *lhsr_array_create(struct lhsr_context *ctx,
 		arr->data_disks = disk_count - 2;
 		arr->parity_disks = 2;
 		break;
-	case LHSR_RAID_SHR:
-	case LHSR_RAID_SHR2:
-		/* SHR calculates optimal layout */
-		lhsr_shr_calculate_layout(arr, disks, disk_count);
+	case LHSR_HSR1:
+	case LHSR_HSR2:
+		/* HSR calculates optimal layout */
+		lhsr_hsr_calculate_layout(arr, disks, disk_count);
 		break;
 	default:
 		free(arr->disks);
@@ -630,13 +630,13 @@ struct lhsr_array *lhsr_array_create(struct lhsr_context *ctx,
 }
 
 /*
- * Calculate SHR layout (simplified)
+ * Calculate HSR layout (simplified)
  */
-void lhsr_shr_calculate_layout(struct lhsr_array *arr,
+void lhsr_hsr_calculate_layout(struct lhsr_array *arr,
 				struct lhsr_disk *disks,
 				unsigned int count)
 {
-	/* Simplified SHR calculation */
+	/* Simplified HSR calculation */
 	/* In production, this would calculate optimal segment layout */
 
 	arr->segment_count = 1;
@@ -656,7 +656,7 @@ void lhsr_shr_calculate_layout(struct lhsr_array *arr,
 	arr->segments[0].raid_type = LHSR_RAID5;
 	arr->total_capacity = arr->segments[0].size;
 
-	printf("SHR layout: %lu sectors across %u disks\n",
+	printf("HSR layout: %lu sectors across %u disks\n",
 	       arr->total_capacity, count);
 }
 
@@ -670,8 +670,8 @@ const char *lhsr_raid_name(unsigned int type)
 	case LHSR_RAID_MIRROR: return "Mirror";
 	case LHSR_RAID5: return "RAID5";
 	case LHSR_RAID6: return "RAID6";
-	case LHSR_RAID_SHR: return "SHR";
-	case LHSR_RAID_SHR2: return "SHR-2";
+	case LHSR_HSR1: return "HSR";
+	case LHSR_HSR2: return "HSR-2";
 	default: return "Unknown";
 	}
 }

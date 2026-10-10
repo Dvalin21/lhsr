@@ -94,7 +94,7 @@ rmmod dm-lhsr
 
 - **Version**: 1.4.0
 - **Implemented**: RAID0, RAID1, RAID5, RAID6
-- **Not implemented**: SHR, SHR2 (data structures exist but are never populated)
+- **Not implemented**: HSR, HSR2 (data structures exist but are never populated)
 - **Status**: Production — RAID5/6/1/0, scrub, WIB incremental rebuild, reshape, dm-integrity stacking
 
 > **⚠️ See [PRODUCTION_READINESS.md](PRODUCTION_READINESS.md) for complete

@@ -45,7 +45,9 @@
  * MIXED DISK SIZES:
  *   Array capacity = min(disk_sectors) for mirror, or data_disks × min(disk_sectors)
  *   for RAID5/6.  Extra space on larger disks is NOT used.  This is a known
- *   limitation.  Future SHR-style chunk mapping would eliminate the waste.
+ *   limitation.  Mixed-size disks are handled in userspace instead
+ *   (HSR tiers: partition into equal chunks, one RAID tier per chunk
+ *   size — see userspace/cli/hsr.c).
  *   For now: partition larger disks to match before creating the array, or
  *   accept the waste.
  *
@@ -2696,9 +2698,9 @@ static int lhsr_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	 * a RAID5 of [100GB, 200GB, 300GB] gives 200GB usable and wastes
 	 * 300GB (the extra capacity on the two larger disks is unused).
 	 *
-	 * Future SHR-style chunk mapping (per-chunk stripe offsets) would
-	 * allow using the full capacity of every disk, but that's a
-	 * significant rearchitecture of the stripe map in lhsr_map().
+	 * Mixed-size disks are handled in userspace via HSR tiers instead
+	 * (per-chunk stripe offsets would be a significant rearchitecture
+	 * of the stripe map in lhsr_map()).
 	 *
 	 * Workaround for now: partition larger disks to match before
 	 * creating the array, or accept the waste.  See header comment

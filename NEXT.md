@@ -59,12 +59,12 @@ sudo ./tests/test-benchmark.sh        # max_active/chunk-size sweeps
 Record in `docs/wiki/Performance-Notes.md` with hardware + build ID.
 VM numbers are indicative only; real numbers need item 3's hardware.
 
-### 5. Daemon + SHR tiers end to end
+### 5. Daemon + HSR tiers end to end
 ```bash
 make -C userspace/cli && make -C userspace/daemon
-sudo ./userspace/cli/lhsrctl shr create ...    # see lhsrctl --help
-sudo ./userspace/cli/lhsrctl shr expand ...
-sudo ./userspace/cli/lhsrctl shr status ...
+sudo ./userspace/cli/lhsrctl hsr create ...    # see lhsrctl --help
+sudo ./userspace/cli/lhsrctl hsr expand ...
+sudo ./userspace/cli/lhsrctl hsr status ...
 # daemon: build lhsrd, run against the test array, check /run/lhsrd.status
 ```
 Last ran Jun 19 (pre-hunt). Re-run on current `main`, record in Test-Matrix.

@@ -36,7 +36,7 @@ scrubbing and read-side self-healing.  It's a kernel module
   (default 32, tunable for high-queue-depth devices).
 - **Boot-time autodiscovery** — initramfs hook scans for LHSR superblocks and
   assembles arrays before root mount.
-- **SHR-like tiered arrays** — `lhsrctl shr` partitions mixed-size disks into
+- **HSR-like tiered arrays** — `lhsrctl hsr` partitions mixed-size disks into
   equal chunks, builds one LHSR target per tier, merges with LVM
   (LHSR-native, no mdadm).  Plan/create/status/destroy/expand/replace.
 

@@ -145,17 +145,19 @@ typedef uint64_t __u64;
  * RAID types stored in superblock raid_type field
  *
  * These values are ON-DISK.  Do not renumber.
- * LHSR_RAID_SHR and LHSR_RAID_SHR2 are NOT implemented in the kernel
- * module — they are reserved for future userspace-only mapping on top
- * of equal-sized mdadm + LVM (Synology SHR model).
+ * LHSR_HSR1 and LHSR_HSR2 are NOT implemented in the kernel
+ * module — they describe userspace-only tiered arrays (mixed-size
+ * disks partitioned into equal chunks, one RAID tier per chunk size,
+ * merged with LVM).  HSR arrays cannot be read by, and cannot read,
+ * any other vendor's hybrid-RAID product; there is no affiliation.
  * =================================================================== */
 
 #define LHSR_RAID_SINGLE       0
 #define LHSR_RAID_MIRROR       1
 #define LHSR_RAID5             2
 #define LHSR_RAID6             3
-#define LHSR_RAID_SHR          4
-#define LHSR_RAID_SHR2         5
+#define LHSR_HSR1              4
+#define LHSR_HSR2              5
 
 /* Convenience aliases used internally in kernel module */
 #define LHSR_RAID0             LHSR_RAID_SINGLE

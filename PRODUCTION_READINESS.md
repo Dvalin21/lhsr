@@ -21,43 +21,46 @@ No hype. No marketing. Just what works, what doesn't, and what's needed.
 
 | # | Feature | Phase  | Reality | Criticality | Effort |
 |--|---------|--------|---------|-------------|--------|
-| 1 | SHR flexible disk sizes | Phase 6-7 | ✅ Userspace tool (`lhsrctl shr plan/create`), LHSR-only after Phase 16 purge | Medium | Phases 6-7, 16 |
+| 1 | HSR flexible disk sizes | Phase 6-7 | ✅ Userspace tool (`lhsrctl hsr plan/create`), LHSR-only after Phase 16 purge | Medium | Phases 6-7, 16 |
 | 2 | Self-healing with auto repair | Phase 1 | ⚠️ Scrub/read-repair work, checksums persistent via dm-integrity stacking | High | Phase 1 |
 | 3 | Anti-bit-rot protection | Phase 1 | ✅ Functional via dm-integrity stacking (persistent CRC32c per-block) | Medium | Phase 1 |
 | 4 | Predictive failure detection | Phase 3 | ✅ SMART polling + SQLite trends + control socket + `predict` CLI wired (daemon discovers real arrays) | Low | Phase 3 |
-| 5 | Live block migration | Phase 16 | ⚠️ Kernel RAID5→RAID6 reshape exists (Phase 9, in-place, crash-safe, read-only during migration). Live data migration from failing disks still not possible — use `shr expand` for new tiers | Low | Large |
+| 5 | Live block migration | Phase 16 | ⚠️ Kernel RAID5→RAID6 reshape exists (Phase 9, in-place, crash-safe, read-only during migration). Live data migration from failing disks still not possible — use `hsr expand` for new tiers | Low | Large |
 | 6 | Instant RAID recovery | Phase 5 | ⚠️ Read-side reconstruction works, `lhsrctl recover/reconstruct` exist, no partial mount | Medium | Phase 5 |
 | 7 | Incremental rebuild | Phase 2 | ✅ Write-Intent Bitmap (WIB) — persistent, 1MB granularity, rebuild skips clean regions | High | Phase 2 |
 | 8 | Firmware failure mitigation | Phase 0 | ❌ Vaporware (kernel quirks exist, not LHSR's problem) | Low | Small |
-| 9 | Hot spare / disk replacement | Phase 8 | ✅ `lhsrctl shr disk replace` — staged replace, rebuild-to-spare, auto-failover | Medium | Phase 8 |
+| 9 | Hot spare / disk replacement | Phase 8 | ✅ `lhsrctl hsr disk replace` — staged replace, rebuild-to-spare, auto-failover | Medium | Phase 8 |
 | 10 | Write performance | Phase 15 | ⚠️ 5-11x slower than mdadm on VM. RMW does 4 sync IOs per 4KB write. TBD. | High | Large (Phase 15 planned) |
 
 ---
 
 ## Detailed Analysis
 
-### 1. SHR-Like Flexible Disk Sizes
+### 1. HSR-Like Flexible Disk Sizes
 
-**Claimed:** Mixed disk capacities without waste, Synology Hybrid RAID compatible.
+**Claimed (2026 audit):** Mixed disk capacities without waste, comparable to
+vendor hybrid-RAID products. (No compatibility is claimed — HSR arrays are
+LHSR's own format.)
 
 **Reality: VAPORWARE**
 
-- `include/lhsr.h` declares segment data structures (SHR segment layout) but
-  **nothing populates them**. There is zero code that computes an SHR mapping,
+- `include/lhsr.h` declares segment data structures (HSR segment layout) but
+  **nothing populates them**. There is zero code that computes an HSR mapping,
   zero code that allocates RAID segments across mixed-size disks, zero code that
   presents the resulting layout as a block device.
-- Synology's SHR is **not special kernel code** — it's mdraid + LVM with
+- Vendor hybrid-RAID products are **not special kernel code** — typically
+  mdraid + LVM with intelligent partition sizing in userspace.
   intelligent partition sizing in userspace. The `mdadm` + `lvm` stack already
-  handles this. LHSR does not need a kernel SHR implementation; it needs a
+  handles this. LHSR does not need a kernel HSR implementation; it needs a
   userspace tool that partitions disks and creates stacked DM targets.
-- The `lhsrctl create --raid shr` command is a stub. Running it will either
+- The `lhsrctl create --raid hsr` command is a stub. Running it will either
   fail or produce undefined behavior.
 
 **What exists:**
 - Segment data structures in `include/lhsr.h`: `struct lhsr_segment_layout`,
   `struct lhsr_segment` (pre-declared, unused)
-- RAID types `SHR` and `SHR2` in the enum (used nowhere)
-- `lhsrctl` accepts `--raid shr` on the command line (validation present,
+- RAID types `HSR` and `HSR2` in the enum (used nowhere)
+- `lhsrctl` accepts `--raid hsr` on the command line (validation present,
   implementation absent)
 
 **Required:**
@@ -276,9 +279,9 @@ downtime.
   - ✅ Deploy script — `lhsr-reshape <dev> status|add <new-device>`
   - ❌ **Writes rejected during reshape** — filesystem must be read-only
   - ❌ RAID level locked to RAID5→RAID6 only — no general capacity-add reshape
-- `lhsrctl shr expand <device>...` — adds a device as a new SHR tier (new
+- `lhsrctl hsr expand <device>...` — adds a device as a new HSR tier (new
   RAID array + lvextend). This is a capacity-add operation, not data migration.
-- `lhsrctl shr disk replace <tier> <idx> <device>` — staged disk replacement
+- `lhsrctl hsr disk replace <tier> <idx> <device>` — staged disk replacement
   within a tier. Rebuilds data to new disk, then removes old one.
 
 **What's missing:**
@@ -288,12 +291,12 @@ downtime.
 - **Write-accepting reshape**: Reads work during reshape but writes are rejected.
   Full online reshape requires bio deferral (deferred — see ROADMAP).
 - **General capacity growth**: Adding disks to grow an existing RAID5/6 array is
-  not supported. Capacity expansion is via new SHR tiers.
+  not supported. Capacity expansion is via new HSR tiers.
 
 **Workaround:**
-- Grow capacity by adding whole new SHR tiers via `shr expand`, not by
+- Grow capacity by adding whole new HSR tiers via `hsr expand`, not by
   growing existing arrays.
-- Replace failing disks within a tier via `shr disk replace`.
+- Replace failing disks within a tier via `hsr disk replace`.
 - For RAID5→RAID6 migration: use `lhsr-reshape.sh` (in-place, read-only mount).
 - The resulting LVM VG spans multiple tiers; data lives on all of them.
 
@@ -433,7 +436,7 @@ firmware crash detection.
 
 ---
 
-### 9. SHR Tiers (Synology Hybrid RAID)
+### 9. HSR Tiers (mixed-size tiered arrays)
 
 **Claimed:** Mixed disk capacities without waste, partition disks into equal-sized
 chunks, stack RAID arrays per tier, merge with LVM.
@@ -441,23 +444,23 @@ chunks, stack RAID arrays per tier, merge with LVM.
 **Reality: ✅ FUNCTIONAL (Phase 6-7 completed, Phase 16 mdadm purge made LHSR-only)**
 
 **What exists:**
-- **`lhsrctl shr plan`** — layout calculator: takes N disks of varying sizes,
+- **`lhsrctl hsr plan`** — layout calculator: takes N disks of varying sizes,
   computes greedy tier layout (equal-sized chunks per tier), prints partition
   + RAID commands.
-- **`lhsrctl shr create`** — executes the plan: partitions disks (sgdisk),
+- **`lhsrctl hsr create`** — executes the plan: partitions disks (sgdisk),
   creates LHSR dm targets per tier, creates LVM VG + LV.
-- **`lhsrctl shr status`** — per-tier and per-disk status, PV/LV usage.
-- **`lhsrctl shr destroy`** — full teardown: dmsetup remove + LVM cleanup.
-- **`lhsrctl shr expand <device>...`** — add device(s) as new SHR tier + lvextend.
-- **`lhsrctl shr disk replace <tier> <idx> <device>`** — hot spare replacement
+- **`lhsrctl hsr status`** — per-tier and per-disk status, PV/LV usage.
+- **`lhsrctl hsr destroy`** — full teardown: dmsetup remove + LVM cleanup.
+- **`lhsrctl hsr expand <device>...`** — add device(s) as new HSR tier + lvextend.
+- **`lhsrctl hsr disk replace <tier> <idx> <device>`** — hot spare replacement
   within a tier (Phase 8, see #10).
 - **LHSR-only after Phase 16**: All mdadm code paths removed. No `--mdadm` flag.
 
 **What was removed (Phase 16):**
 - mdadm creation paths: `shr_print_commands()`, `shr_create_raid()`,
   `shr_create_lvm()` — all mdadm branches eliminated.
-- `cmd_shr_grow()` — mdadm-based online grow replaced with stub redirecting to
-  `shr expand`.
+- `cmd_hsr_grow()` — mdadm-based online grow replaced with stub redirecting to
+  `hsr expand`.
 - `scan_md_devices()`, `struct md_entry` — sysfs mdadm discovery deleted.
 - Net: **-978 lines** of dead mdadm code.
 
@@ -465,12 +468,12 @@ chunks, stack RAID arrays per tier, merge with LVM.
 - Greedy tiering: partition the smallest remaining disk, all disks of that size
   or larger get a matching chunk, repeat with remaining capacity.
 - Each tier is a RAID5/6 LHSR dm target (3+ disks) or RAID1 (2 disks).
-- All tiers combined into a single LVM VG → single LV (`/dev/shr_vg/shr_vol`).
-- LVM filter required: `filter = [ "a|/dev/mapper/shr_tier_.*", "r|.*" ]`.
+- All tiers combined into a single LVM VG → single LV (`/dev/hsr_vg/hsr_vol`).
+- LVM filter required: `filter = [ "a|/dev/mapper/hsr_tier_.*", "r|.*" ]`.
 
 **Required for production:**
-- ✅ ~~Userspace SHR tool~~ Done (Phase 6-7, all mdadm code removed Phase 16).
-- ⏳ Integration test: `shr create` → `expand` → `status` → `destroy` on VM
+- ✅ ~~Userspace HSR tool~~ Done (Phase 6-7, all mdadm code removed Phase 16).
+- ⏳ Integration test: `hsr create` → `expand` → `status` → `destroy` on VM
   (LHSR-only, no mdadm).
 - ⏳ Auto-rebalance on disk add (currently manual via `expand`; new tier is not
   automatically populated with existing data).
@@ -480,15 +483,15 @@ chunks, stack RAID arrays per tier, merge with LVM.
 
 ### 10. Hot Spare & Disk Replacement
 
-**Claimed:** Staged disk replacement within a SHR tier, rebuild to spare, automatic
+**Claimed:** Staged disk replacement within a HSR tier, rebuild to spare, automatic
 failover.
 
 **Reality: ✅ FUNCTIONAL (Phase 8 — 2026-06-16)**
 
 **What exists (Phase 8):**
-- **`lhsrctl shr disk status`** — list all disks per tier with state, errors,
-  rebuild progress (same as `shr status`)
-- **`lhsrctl shr disk replace <tier_name> <disk_idx> <new_device>`** — staged
+- **`lhsrctl hsr disk status`** — list all disks per tier with state, errors,
+  rebuild progress (same as `hsr status`)
+- **`lhsrctl hsr disk replace <tier_name> <disk_idx> <new_device>`** — staged
   replacement:
   1. Fail the old disk via `dmsetup message` (kicks degraded read path)
   2. If `new_device` is a spare (not currently in any LHSR array):
@@ -502,7 +505,7 @@ failover.
   devices at configurable interval (default 300s).
 - **Match by size**: Finds spares matching array member size (±1% tolerance).
 - **Auto-failover**: When a disk fails (health scoring + consecutive error
-  threshold), the daemon can optionally trigger `shr disk replace` automatically
+  threshold), the daemon can optionally trigger `hsr disk replace` automatically
   (configurable via `auto_failover` in `lhsrd.conf`).
 
 **Required for production:**
@@ -833,22 +836,22 @@ handles concurrent I/O correctly. The primary remaining issue is performance
 
 ---
 
-## Phase 16 Testing (SHR mdadm Purge) — 2026-06-19
+## Phase 16 Testing (HSR mdadm Purge) — 2026-06-19
 
 | Scenario | Result | Notes |
 |----------|--------|-------|
 | **Build** (userspace/cli after mdadm code removal) | ✅ PASS | `make -C userspace/cli` — zero warnings |
-| **shr.c** -978 lines removed | ✅ PASS | Net deletion: all mdadm branches gone |
-| `cmd_shr_grow()` stub | ✅ PASS | Redirects to `shr expand` |
-| `cmd_shr_plan()` no `--mdadm`/`--lhsr` flags | ✅ PASS | LHSR-only mode |
-| `cmd_shr_create()` no `--mdadm` option | ✅ PASS | Creates dm targets only |
-| `cmd_shr_destroy()` LHSR-only | ✅ PASS | No mdadm teardown in path |
-| `cmd_shr_expand()` correct RAID5 params | ✅ PASS | `8 1 8` instead of incorrect `8 %u %u` |
+| **hsr.c** -978 lines removed | ✅ PASS | Net deletion: all mdadm branches gone |
+| `cmd_hsr_grow()` stub | ✅ PASS | Redirects to `hsr expand` |
+| `cmd_hsr_plan()` no `--mdadm`/`--lhsr` flags | ✅ PASS | LHSR-only mode |
+| `cmd_hsr_create()` no `--mdadm` option | ✅ PASS | Creates dm targets only |
+| `cmd_hsr_destroy()` LHSR-only | ✅ PASS | No mdadm teardown in path |
+| `cmd_hsr_expand()` correct RAID5 params | ✅ PASS | `8 1 8` instead of incorrect `8 %u %u` |
 | No `struct md_entry` / `scan_md_devices()` | ✅ PASS | Dead struct and functions removed |
 | No `#include <dirent.h>` | ✅ PASS | Deleted with dead code |
 
 **Not yet tested (VM session, Jun 19):**
-- End-to-end: `shr create` → `expand` → `status` → `destroy` with LHSR-only
+- End-to-end: `hsr create` → `expand` → `status` → `destroy` with LHSR-only
   — ✅ **PASS** (3×128MB loopbacks → RAID5 tier, expand 4th disk → 2 tiers, status shows 2 PVs, destroy clean)
 
 ---
@@ -864,7 +867,7 @@ handles concurrent I/O correctly. The primary remaining issue is performance
 - Write verification modes
 
 ### What belongs in userspace (but is in-kernel or doesn't exist):
-- SHR mapping computation (userspace, like Synology)
+- HSR tier mapping computation (userspace tiers, not kernel mapping)
 - SMART polling (userspace daemon — done via sysfs + SG_IO, no shelling out)
 - Rebuild orchestration (currently in-kernel rebuild loop)
 - Predictive failure model (userspace, or separate tool)
@@ -892,18 +895,18 @@ handles concurrent I/O correctly. The primary remaining issue is performance
 
 LHSR is a **well-written kernel module with correctly implemented RAID5/6/1
 parity operations, scrubbing, and write-intent bitmap**. The RMW state machine
-handles concurrent I/O correctly (15/15 stress tests PASS). The SHR userspace
-tool (`lhsrctl shr`) provides mixed-disk-size tiered RAID with LVM stacking,
+handles concurrent I/O correctly (15/15 stress tests PASS). The HSR userspace
+tool (`lhsrctl hsr`) provides mixed-disk-size tiered RAID with LVM stacking,
 and a complete set of disk management commands (plan/create/status/destroy/
 expand/replace).
 
 **Honest elevator pitch:**
 "LHSR is a Linux DM target providing RAID5/6/1 with hardware-accelerated CRC32c
 scrubbing, write-intent bitmap incremental rebuild, read-side self-healing, and
-dm-integrity stacking for persistent anti-bit-rot. The SHR userspace tool adds
+dm-integrity stacking for persistent anti-bit-rot. The HSR userspace tool adds
 mixed-disk-size tiered RAID with LVM. In-place kernel RAID5→RAID6 reshape is
 supported (Phase 9, read-only during migration). Online disk-add reshape is not
-supported — add capacity via new SHR tiers. Write performance is ~5-11x slower
+supported — add capacity via new HSR tiers. Write performance is ~5-11x slower
 than mdadm (known issue, Phase 15)."
 
 **Remaining gaps (see ROADMAP.md for phases):**
@@ -911,7 +914,7 @@ than mdadm (known issue, Phase 15)."
 2. ~~`lhsrctl predict` stub~~ (✅ resolved: CLI wired, daemon DM discovery fixed)
 3. ~~RAID6 dual-disk RS decode~~ (✅ resolved: Vandermonde 2x2 in `lhsr_rs_decode_2()`)
 4. ~~Periodic WIB flush~~ (✅ resolved: 30-second timer via `wib_wq` + `delayed_work`)
-5. ~~Integration test: SHR LHSR-only create → expand → status → destroy~~ (✅ PASS on VM, Jun 19)
+5. ~~Integration test: HSR LHSR-only create → expand → status → destroy~~ (✅ PASS on VM, Jun 19)
 6. RAID5/6 WIB clear on full-stripe write (minor optimization, not correctness-critical)
 
 ---

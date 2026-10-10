@@ -1,12 +1,12 @@
 /*
- * LHSR SHR (Synology Hybrid RAID) — Plan and Create Subcommands
+ * LHSR HSR — mixed-size tiered arrays. Plan and Create Subcommands.
  *
  * Computes the optimal partition layout for N disks of varying sizes,
  * using the greedy tiering algorithm: smallest-disk-first, one RAID
  * tier per iteration.
  *
- * "shr plan"  — prints the plan and shell commands (no disk writes)
- * "shr create" — executes partitioning, RAID creation, and LVM setup
+ * "hsr plan"  — prints the plan and shell commands (no disk writes)
+ * "hsr create" — executes partitioning, RAID creation, and LVM setup
  *
  * "Bad programmers worry about the code. Good programmers worry about
  *  data structures and their relationships."         — Linus Torvalds
@@ -31,10 +31,10 @@
 #include <linux/fs.h>
 #include <errno.h>
 
-#include "shr.h"
+#include "hsr.h"
 
 /* Forward declarations */
-static int shr_disk_replace(const char *tier_name,
+static int hsr_disk_replace(const char *tier_name,
 			    unsigned int disk_idx, const char *new_dev);
 
 /* ===================================================================
@@ -82,7 +82,7 @@ static const char *raid_type_name(unsigned int t)
  * 2. Sort disks by size ascending (smallest first for capacity calc)
  * 3. While >= 2 disks have available >= min_partition:
  *    a. pick the RAID type the remaining disk count supports
- *       (SHR-1: RAID5 at 3+, RAID1 at exactly 2; SHR-2: RAID6 at 4+ only)
+ *       (HSR-1: RAID5 at 3+, RAID1 at exactly 2; HSR-2: RAID6 at 4+ only)
  *    b. partition_size = min(available) among qualifying disks
  *    c. partition_size = round DOWN to alignment boundary
  *    d. Allocate partition on each qualifying disk at its next offset
@@ -91,43 +91,43 @@ static const char *raid_type_name(unsigned int t)
  * 4. Report remaining space as unusable
  * =================================================================== */
 
-int shr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
+int hsr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
 		    unsigned int parity, uint64_t alignment,
-		    uint64_t min_part, struct shr_layout *layout)
+		    uint64_t min_part, struct hsr_layout *layout)
 {
 	unsigned int min_disks;
-	uint64_t disk_offset[SHR_MAX_DISKS];
+	uint64_t disk_offset[HSR_MAX_DISKS];
 	unsigned int i, j;
 
 	if (!sizes || !layout)
 		return -1;
 	if (disk_count < 3) {
-		fprintf(stderr, "Error: SHR requires at least 3 disks, got %u\n",
+		fprintf(stderr, "Error: HSR requires at least 3 disks, got %u\n",
 			disk_count);
 		return -1;
 	}
 	if (parity != 1 && parity != 2) {
-		fprintf(stderr, "Error: parity must be 1 (SHR-1) or 2 (SHR-2), got %u\n",
+		fprintf(stderr, "Error: parity must be 1 (HSR-1) or 2 (HSR-2), got %u\n",
 			parity);
 		return -1;
 	}
-	if (disk_count > SHR_MAX_DISKS) {
+	if (disk_count > HSR_MAX_DISKS) {
 		fprintf(stderr, "Error: too many disks (%u, max %u)\n",
-			disk_count, SHR_MAX_DISKS);
+			disk_count, HSR_MAX_DISKS);
 		return -1;
 	}
 
 	min_disks = (parity == 1) ? 3 : 4;
 	if (disk_count < min_disks) {
-		fprintf(stderr, "Error: SHR-%u requires at least %u disks, got %u\n",
+		fprintf(stderr, "Error: HSR-%u requires at least %u disks, got %u\n",
 			parity, min_disks, disk_count);
 		return -1;
 	}
 
 	if (alignment == 0)
-		alignment = SHR_ALIGNMENT;
+		alignment = HSR_ALIGNMENT;
 	if (min_part == 0)
-		min_part = SHR_MIN_PARTITION;
+		min_part = HSR_MIN_PARTITION;
 
 	/* Initialize layout */
 	memset(layout, 0, sizeof(*layout));
@@ -168,7 +168,7 @@ int shr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
 	 * active disk as a partition for the new tier.
 	 */
 	{
-		bool active[SHR_MAX_DISKS];
+		bool active[HSR_MAX_DISKS];
 		unsigned int active_count;
 		unsigned int tier_idx = 0;
 
@@ -185,13 +185,13 @@ int shr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
 			/*
 			 * Choose the RAID type this tier can support.
 			 *
-			 * SHR-1: RAID5 while >= 3 disks remain, then a final
+			 * HSR-1: RAID5 while >= 3 disks remain, then a final
 			 * RAID1 mirror on the last 2. Without the mirror tier
 			 * the tail of a mixed set is stranded — 8/6/4/4/2 TB
 			 * loses 6 TB raw (2 TB usable) because the loop used
 			 * to stop at min_disks.
 			 *
-			 * SHR-2 promises 2-disk fault tolerance on every tier,
+			 * HSR-2 promises 2-disk fault tolerance on every tier,
 			 * so it must NOT degrade to RAID5/RAID1 at the tail.
 			 */
 			if (parity == 2) {
@@ -258,9 +258,9 @@ int shr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
 
 				/* Record partition */
 				j = layout->partition_count;
-				if (j >= SHR_MAX_PARTITIONS) {
+				if (j >= HSR_MAX_PARTITIONS) {
 					fprintf(stderr, "Error: too many partitions (%u max)\n",
-						SHR_MAX_PARTITIONS);
+						HSR_MAX_PARTITIONS);
 					return -1;
 				}
 				layout->partitions[j].disk_idx = i;
@@ -297,15 +297,15 @@ int shr_plan_layout(const uint64_t *sizes, unsigned int disk_count,
  * Print the plan
  * =================================================================== */
 
-void shr_print_plan(const struct shr_layout *layout,
+void hsr_print_plan(const struct hsr_layout *layout,
 		    const char * const *disk_paths)
 {
 	unsigned int i, j;
 	uint64_t total_unused = 0;
 
-	printf("\nLHSR SHR Layout Plan");
+	printf("\nLHSR HSR Layout Plan");
 	printf("\n====================");
-	printf("\nMode: SHR-%u (%u parity per tier)",
+	printf("\nMode: HSR-%u (%u parity per tier)",
 	       layout->parity_per_tier, layout->parity_per_tier);
 	printf("\nAlignment: %llu sectors (%llu KB)",
 	       (unsigned long long)layout->alignment,
@@ -363,7 +363,7 @@ void shr_print_plan(const struct shr_layout *layout,
 	       "Tier", "Type", "Members", "PartSz", "Usable", "Disks");
 	printf("\n");
 	for (i = 0; i < layout->tier_count; i++) {
-		const struct shr_tier *t = &layout->tiers[i];
+		const struct hsr_tier *t = &layout->tiers[i];
 		char members_str[64];
 
 		snprintf(members_str, sizeof(members_str), "%u disks", t->partition_count);
@@ -424,11 +424,11 @@ void shr_print_plan(const struct shr_layout *layout,
  * Print shell commands to execute the plan
  * =================================================================== */
 
-void shr_print_commands(const struct shr_layout *layout,
+void hsr_print_commands(const struct hsr_layout *layout,
 			const char * const *disk_paths)
 {
 	unsigned int i, j;
-	unsigned int part_num[SHR_MAX_DISKS];
+	unsigned int part_num[HSR_MAX_DISKS];
 	char size_str[64];
 
 	/* Track partition numbering per disk (1-based for sgdisk) */
@@ -436,7 +436,7 @@ void shr_print_commands(const struct shr_layout *layout,
 		part_num[i] = 0;
 
 	printf("# ============================================================");
-	printf("\n# LHSR SHR — Execute the following commands as root");
+	printf("\n# LHSR HSR — Execute the following commands as root");
 	printf("\n#");
 	printf("\n# Review the plan before running anything.");
 	printf("\n# Commands are idempotent where possible.");
@@ -477,7 +477,7 @@ void shr_print_commands(const struct shr_layout *layout,
 			printf("\n  --typecode=%u:fd00 \\", pn); /* Linux RAID */
 			pn++;
 		}
-		printf("\n  --backup=/tmp/shr_gpt_backup_%s.dump", dev + 5);
+		printf("\n  --backup=/tmp/hsr_gpt_backup_%s.dump", dev + 5);
 		/* Remove leading /dev/ if present */
 		printf("\n");
 		part_num[i] = pn - 1;
@@ -509,7 +509,7 @@ void shr_print_commands(const struct shr_layout *layout,
 	printf("# Step 3: Create RAID arrays for each tier (LHSR)");
 	printf("\n");
 	for (i = 0; i < layout->tier_count; i++) {
-		const struct shr_tier *t = &layout->tiers[i];
+		const struct hsr_tier *t = &layout->tiers[i];
 		char table[4096];
 		int table_pos = 0;
 		int dev_count = 0;
@@ -544,7 +544,7 @@ void shr_print_commands(const struct shr_layout *layout,
 			sizeof(table) - table_pos, "\"");
 		table[sizeof(table) - 1] = '\0';
 
-		printf("dmsetup create shr_tier_%u --table %s\n", i, table);
+		printf("dmsetup create hsr_tier_%u --table %s\n", i, table);
 	}
 	printf("\n");
 
@@ -552,34 +552,34 @@ void shr_print_commands(const struct shr_layout *layout,
 	printf("# Step 4: LVM — initialize PVs, create VG, create LV");
 	printf("\n");
 	for (i = 0; i < layout->tier_count; i++)
-		printf("pvcreate /dev/mapper/shr_tier_%u\n", i);
+		printf("pvcreate /dev/mapper/hsr_tier_%u\n", i);
 	printf("\n# Create VG on first tier");
-	printf("\nvgcreate shr_vg /dev/mapper/shr_tier_0");
+	printf("\nvgcreate hsr_vg /dev/mapper/hsr_tier_0");
 	printf("\n# Extend VG with remaining tiers");
 	for (i = 1; i < layout->tier_count; i++)
-		printf("\nvgextend shr_vg /dev/mapper/shr_tier_%u", i);
+		printf("\nvgextend hsr_vg /dev/mapper/hsr_tier_%u", i);
 	printf("\n\n# Create LV spanning all available space");
-	printf("\nlvcreate -l 100%%FREE -n shr_vol shr_vg");
+	printf("\nlvcreate -l 100%%FREE -n hsr_vol hsr_vg");
 	printf("\n\n# Format (user's choice):");
-	printf("\n# mkfs.ext4 /dev/shr_vg/shr_vol");
-	printf("\n# mkfs.xfs  /dev/shr_vg/shr_vol");
-	printf("\n# mkfs.btrfs /dev/shr_vg/shr_vol");
+	printf("\n# mkfs.ext4 /dev/hsr_vg/hsr_vol");
+	printf("\n# mkfs.xfs  /dev/hsr_vg/hsr_vol");
+	printf("\n# mkfs.btrfs /dev/hsr_vg/hsr_vol");
 	printf("\n\n# Mount:");
-	printf("\n# mount /dev/shr_vg/shr_vol /mnt/storage");
+	printf("\n# mount /dev/hsr_vg/hsr_vol /mnt/storage");
 
 	printf("\n\n");
 }
 
 /* ===================================================================
- * Entry point for "lhsrctl shr plan"
+ * Entry point for "lhsrctl hsr plan"
  * =================================================================== */
 
-int cmd_shr_plan(int argc, char **argv)
+int cmd_hsr_plan(int argc, char **argv)
 {
 	uint64_t *sizes = NULL;
 	const char **disk_paths = NULL;
 	unsigned int disk_count = 0;
-	int parity = 1; /* SHR-1 default */
+	int parity = 1; /* HSR-1 default */
 	int ret = 1;
 	int opt_consumed = 1; /* argv[0] = "plan", count it */
 	unsigned int i;
@@ -595,15 +595,15 @@ int cmd_shr_plan(int argc, char **argv)
 			opt_consumed += 2;
 		} else if (argv[i][0] == '-') {
 			fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
-			fprintf(stderr, "Usage: lhsrctl shr plan [--parity 1|2] <device>...\n");
+			fprintf(stderr, "Usage: lhsrctl hsr plan [--parity 1|2] <device>...\n");
 			return 1;
 		}
 	}
 
 	disk_count = argc - opt_consumed;
 	if (disk_count < 3) {
-		fprintf(stderr, "Error: SHR requires at least 3 disks\n");
-		fprintf(stderr, "Usage: lhsrctl shr plan [--parity 1|2] <device>...\n");
+		fprintf(stderr, "Error: HSR requires at least 3 disks\n");
+		fprintf(stderr, "Usage: lhsrctl hsr plan [--parity 1|2] <device>...\n");
 		return 1;
 	}
 
@@ -641,17 +641,17 @@ int cmd_shr_plan(int argc, char **argv)
 	qsort(sizes, disk_count, sizeof(uint64_t), cmp_u64_asc);
 
 	/* Compute layout */
-	struct shr_layout layout;
-	if (shr_plan_layout(sizes, disk_count, parity, 0, 0, &layout) < 0)
+	struct hsr_layout layout;
+	if (hsr_plan_layout(sizes, disk_count, parity, 0, 0, &layout) < 0)
 		goto out;
 
 	/* Print plan */
-	shr_print_plan(&layout, disk_paths);
+	hsr_print_plan(&layout, disk_paths);
 
 	/* Print commands (LHSR dmsetup mode) */
 	printf("Execution Commands");
 	printf("\n==================\n");
-	shr_print_commands(&layout, disk_paths);
+	hsr_print_commands(&layout, disk_paths);
 
 	ret = 0;
 
@@ -662,9 +662,9 @@ out:
 }
 
 /* ===================================================================
- * Phase 6.2 — "lhsrctl shr create"
+ * Phase 6.2 — "lhsrctl hsr create"
  *
- * Executes the SHR layout: partitions disks, creates RAID arrays
+ * Executes the HSR layout: partitions disks, creates RAID arrays
  * (LHSR dmsetup), sets up LVM.
  *
  * This is DESTRUCTIVE. All data on the specified disks will be lost.
@@ -672,7 +672,7 @@ out:
 
 /* ---- helpers ---- */
 
-static int shr_run_cmd(const char *fmt, ...)
+static int hsr_run_cmd(const char *fmt, ...)
 {
 	char cmd[4096];
 	va_list ap;
@@ -700,7 +700,7 @@ static int shr_run_cmd(const char *fmt, ...)
 
 /* Build partition device path from a base device and partition number.
  * Handles both /dev/sda → /dev/sda1 and /dev/loop5 → /dev/loop5p1. */
-static char *shr_get_part_dev(const char *dev, int part_num,
+static char *hsr_get_part_dev(const char *dev, int part_num,
 			      char *buf, size_t sz)
 {
 	size_t len = strlen(dev);
@@ -716,14 +716,14 @@ static char *shr_get_part_dev(const char *dev, int part_num,
 
 /* Poll for partition device to appear, up to timeout_ms.
  * If part_num is 0, poll for the base device path directly. */
-static int shr_wait_for_part(const char *dev, int part_num, int timeout_ms)
+static int hsr_wait_for_part(const char *dev, int part_num, int timeout_ms)
 {
 	char pdev[512];
 	struct stat st;
 	int waited = 0;
 
 	if (part_num > 0)
-		shr_get_part_dev(dev, part_num, pdev, sizeof(pdev));
+		hsr_get_part_dev(dev, part_num, pdev, sizeof(pdev));
 	else
 		snprintf(pdev, sizeof(pdev), "%s", dev);
 
@@ -742,7 +742,7 @@ static int shr_wait_for_part(const char *dev, int part_num, int timeout_ms)
 
 /* Check that a device path is safe to pass to shell commands.
  * Must exist, be a block device, not contain shell metacharacters. */
-static int shr_validate_device(const char *dev)
+static int hsr_validate_device(const char *dev)
 {
 	struct stat st;
 	const char *p;
@@ -770,7 +770,7 @@ static int shr_validate_device(const char *dev)
 
 /* Warn that a disk already has partitions or md superblock.
  * Returns non-zero if we should abort. */
-static int shr_warn_used_device(const char *dev)
+static int hsr_warn_used_device(const char *dev)
 {
 	char pdev[512];
 	struct stat st;
@@ -778,7 +778,7 @@ static int shr_warn_used_device(const char *dev)
 
 	/* Check for existing partition devices */
 	for (i = 1; i <= 4; i++) {
-		shr_get_part_dev(dev, i, pdev, sizeof(pdev));
+		hsr_get_part_dev(dev, i, pdev, sizeof(pdev));
 		if (stat(pdev, &st) == 0) {
 			fprintf(stderr, "Warning: %s already has partitions "
 				"(e.g. %s)\n", dev, pdev);
@@ -813,7 +813,7 @@ static int shr_warn_used_device(const char *dev)
 /* ---- execution steps ---- */
 
 /* Step 1: Partition all disks with sgdisk */
-static int shr_create_partitions(struct shr_layout *layout,
+static int hsr_create_partitions(struct hsr_layout *layout,
 				 const char **disk_paths)
 {
 	unsigned int i, j;
@@ -826,7 +826,7 @@ static int shr_create_partitions(struct shr_layout *layout,
 
 		/* Wipe existing partition table */
 		printf("\n# Disk %u: %s\n", i, dev);
-		if (shr_run_cmd("sgdisk --zap-all '%s'", dev) < 0)
+		if (hsr_run_cmd("sgdisk --zap-all '%s'", dev) < 0)
 			return -1;
 
 		/* Create partitions for each tier this disk participates in */
@@ -837,7 +837,7 @@ static int shr_create_partitions(struct shr_layout *layout,
 				continue;
 
 			size = layout->partitions[j].size_sectors;
-			if (shr_run_cmd("sgdisk --new=%u:0:+%llus "
+			if (hsr_run_cmd("sgdisk --new=%u:0:+%llus "
 					"--typecode=%u:fd00 '%s'",
 					pn, (unsigned long long)size,
 					pn, dev) < 0)
@@ -849,7 +849,7 @@ static int shr_create_partitions(struct shr_layout *layout,
 }
 
 /* Step 2: Wait for partition table re-read and partition devices */
-static int shr_create_wait_partitions(struct shr_layout *layout,
+static int hsr_create_wait_partitions(struct hsr_layout *layout,
 				      const char **disk_paths)
 {
 	unsigned int i;
@@ -876,7 +876,7 @@ static int shr_create_wait_partitions(struct shr_layout *layout,
 		{
 			char first_part[512];
 			struct stat st;
-			shr_get_part_dev(dev, 1, first_part, sizeof(first_part));
+			hsr_get_part_dev(dev, 1, first_part, sizeof(first_part));
 			if (stat(first_part, &st) == 0 && S_ISBLK(st.st_mode)) {
 				printf("  Partition %s already exists, skipping re-read\n",
 				       first_part);
@@ -888,19 +888,19 @@ static int shr_create_wait_partitions(struct shr_layout *layout,
 		printf("  Re-reading partition table on %s ...\n", dev);
 		fflush(stdout);
 
-		if (shr_run_cmd("partprobe '%s' 2>/dev/null || "
+		if (hsr_run_cmd("partprobe '%s' 2>/dev/null || "
 				"blockdev --rereadpt '%s' 2>/dev/null || "
 				"partx -a '%s' 2>/dev/null",
 				dev, dev, dev) < 0) {
 			fprintf(stderr, "  Warning: partition re-read failed "
 				"for %s, trying partx -a\n", dev);
-			shr_run_cmd("partx -a '%s'", dev);
+			hsr_run_cmd("partx -a '%s'", dev);
 		}
 
 wait_phase:
 		/* Wait for each partition device to appear */
 		for (pn = 1; pn <= pcount; pn++) {
-			if (shr_wait_for_part(dev, pn, 5000) < 0)
+			if (hsr_wait_for_part(dev, pn, 5000) < 0)
 				return -1;
 		}
 	}
@@ -908,7 +908,7 @@ wait_phase:
 }
 
 /* Step 3: Create RAID arrays via LHSR dmsetup */
-static int shr_create_raid(struct shr_layout *layout,
+static int hsr_create_raid(struct hsr_layout *layout,
 			   const char **disk_paths)
 {
 	unsigned int i, j;
@@ -917,12 +917,12 @@ static int shr_create_raid(struct shr_layout *layout,
 	printf("\n--- Step 3: Create RAID arrays (LHSR) ---\n");
 
 	for (i = 0; i < layout->tier_count; i++) {
-		struct shr_tier *t = &layout->tiers[i];
+		struct hsr_tier *t = &layout->tiers[i];
 		int raid_level = (t->raid_type == 2) ? 5 : 6;
 		int pos;
 
 		pos = snprintf(cmd, sizeof(cmd),
-			"dmsetup create shr_tier_%u --table "
+			"dmsetup create hsr_tier_%u --table "
 			"\"0 %llu lhsr raid%c 8 1 8",
 			i, (unsigned long long)t->usable_sectors,
 			raid_level + '0');
@@ -933,7 +933,7 @@ static int shr_create_raid(struct shr_layout *layout,
 				continue;
 			unsigned int di = layout->partitions[j].disk_idx;
 			unsigned int pn = layout->partitions[j].tier + 1;
-			shr_get_part_dev(disk_paths[di], pn, pdev, sizeof(pdev));
+			hsr_get_part_dev(disk_paths[di], pn, pdev, sizeof(pdev));
 			pos += snprintf(cmd + pos, sizeof(cmd) - pos,
 					" %s 0", pdev);
 			if ((size_t)pos >= sizeof(cmd) - 64) {
@@ -942,53 +942,53 @@ static int shr_create_raid(struct shr_layout *layout,
 			}
 		}
 		snprintf(cmd + pos, sizeof(cmd) - pos, "\"");
-		if (shr_run_cmd("%s", cmd) < 0)
+		if (hsr_run_cmd("%s", cmd) < 0)
 			return -1;
 	}
 	return 0;
 }
 
 /* Step 4: LVM — PVs, VG, LV */
-static int shr_create_lvm(struct shr_layout *layout)
+static int hsr_create_lvm(struct hsr_layout *layout)
 {
 	unsigned int i;
-	/* LVM config filter: only accept /dev/mapper/shr_tier_*
+	/* LVM config filter: only accept /dev/mapper/hsr_tier_*
 	 * This prevents LVM from detecting the underlying RAID member partitions
 	 * as duplicate PVs (the PV metadata gets striped across members). */
 	const char *lvm_filter =
 		"devices { "
 		"preferred_names=[\"^/dev/mapper/\"] "
-		"filter = [ \"a|/dev/mapper/shr_tier_.*|\", \"r|.*|\" ] "
+		"filter = [ \"a|/dev/mapper/hsr_tier_.*|\", \"r|.*|\" ] "
 		"}";
 
 	printf("\n--- Step 4: LVM setup ---\n");
 
 	for (i = 0; i < layout->tier_count; i++) {
-		if (shr_run_cmd("pvcreate --config '%s' "
-				"/dev/mapper/shr_tier_%u",
+		if (hsr_run_cmd("pvcreate --config '%s' "
+				"/dev/mapper/hsr_tier_%u",
 				lvm_filter, i) < 0)
 			return -1;
 	}
 
 	/* Create VG on first tier */
-	printf("\n# Creating volume group 'shr_vg' ...\n");
-	if (shr_run_cmd("vgcreate --config '%s' "
-			"shr_vg /dev/mapper/shr_tier_0",
+	printf("\n# Creating volume group 'hsr_vg' ...\n");
+	if (hsr_run_cmd("vgcreate --config '%s' "
+			"hsr_vg /dev/mapper/hsr_tier_0",
 			lvm_filter) < 0)
 		return -1;
 
 	/* Extend VG with remaining tiers */
 	for (i = 1; i < layout->tier_count; i++) {
-		if (shr_run_cmd("vgextend --config '%s' "
-				"shr_vg /dev/mapper/shr_tier_%u",
+		if (hsr_run_cmd("vgextend --config '%s' "
+				"hsr_vg /dev/mapper/hsr_tier_%u",
 				lvm_filter, i) < 0)
 			return -1;
 	}
 
 	/* Create LV spanning all available space */
 	printf("\n# Creating logical volume ...\n");
-	if (shr_run_cmd("lvcreate --config '%s' "
-			"-l 100%%FREE -n shr_vol --yes shr_vg",
+	if (hsr_run_cmd("lvcreate --config '%s' "
+			"-l 100%%FREE -n hsr_vol --yes hsr_vg",
 			lvm_filter) < 0)
 		return -1;
 
@@ -997,7 +997,7 @@ static int shr_create_lvm(struct shr_layout *layout)
 
 /* ---- entry point ---- */
 
-int cmd_shr_create(int argc, char **argv)
+int cmd_hsr_create(int argc, char **argv)
 {
 	uint64_t *sizes = NULL;
 	const char **disk_paths = NULL;
@@ -1005,12 +1005,12 @@ int cmd_shr_create(int argc, char **argv)
 	int parity = 1;
 	int force = 0;
 	int yes = 0;
-	uint64_t min_part = 0; /* 0 = use default (SHR_MIN_PARTITION) */
+	uint64_t min_part = 0; /* 0 = use default (HSR_MIN_PARTITION) */
 	int ret = 1;
 	int opt_consumed = 1; /* skip "create" */
 	char confirm[64];
 	unsigned int i;
-	struct shr_layout layout;
+	struct hsr_layout layout;
 
 	/* Parse options: --parity N, --force, --yes, --min-part */
 	for (i = 1; i < (unsigned int)argc; i++) {
@@ -1036,7 +1036,7 @@ int cmd_shr_create(int argc, char **argv)
 			opt_consumed += 2;
 		} else if (argv[i][0] == '-') {
 			fprintf(stderr, "Error: unknown option '%s'\n", argv[i]);
-			fprintf(stderr, "Usage: lhsrctl shr create [--parity 1|2] "
+			fprintf(stderr, "Usage: lhsrctl hsr create [--parity 1|2] "
 				"[--force] [--yes] [--min-part N] "
 				"<device>...\n");
 			return 1;
@@ -1045,8 +1045,8 @@ int cmd_shr_create(int argc, char **argv)
 
 	disk_count = argc - opt_consumed;
 	if (disk_count < 3) {
-		fprintf(stderr, "Error: SHR requires at least 3 disks\n");
-		fprintf(stderr, "Usage: lhsrctl shr create [--parity 1|2] "
+		fprintf(stderr, "Error: HSR requires at least 3 disks\n");
+		fprintf(stderr, "Usage: lhsrctl hsr create [--parity 1|2] "
 			"[--force] [--yes] [--min-part N] "
 			"<device>...\n");
 		return 1;
@@ -1055,7 +1055,7 @@ int cmd_shr_create(int argc, char **argv)
 	/* Validate all devices */
 	for (i = 0; i < disk_count; i++) {
 		const char *dev = argv[opt_consumed + i];
-		if (shr_validate_device(dev) < 0)
+		if (hsr_validate_device(dev) < 0)
 			return 1;
 	}
 
@@ -1114,16 +1114,16 @@ int cmd_shr_create(int argc, char **argv)
 	}
 
 	/* Compute layout */
-	if (shr_plan_layout(sizes, disk_count, parity, 0, min_part, &layout) < 0)
+	if (hsr_plan_layout(sizes, disk_count, parity, 0, min_part, &layout) < 0)
 		goto out;
 
 	/* Print plan */
-	shr_print_plan(&layout, disk_paths);
+	hsr_print_plan(&layout, disk_paths);
 
 	/* Pre-flight checks */
 	printf("\n--- Pre-flight checks ---\n");
 	for (i = 0; i < disk_count; i++) {
-		if (shr_warn_used_device(disk_paths[i]) < 0) {
+		if (hsr_warn_used_device(disk_paths[i]) < 0) {
 			if (!force) {
 				fprintf(stderr, "Use --force to override.\n");
 				goto out;
@@ -1155,17 +1155,17 @@ int cmd_shr_create(int argc, char **argv)
 		}
 	}
 
-	printf("\nExecuting SHR layout ...\n");
+	printf("\nExecuting HSR layout ...\n");
 
 	/* Step 1: Partition disks */
-	if (shr_create_partitions(&layout, disk_paths) < 0) {
+	if (hsr_create_partitions(&layout, disk_paths) < 0) {
 		fprintf(stderr, "\nFAILED at Step 1 (partitioning).\n"
 			"Rollback: run `sgdisk --zap-all` on each device.\n");
 		goto out;
 	}
 
 	/* Step 2: Wait for partitions */
-	if (shr_create_wait_partitions(&layout, disk_paths) < 0) {
+	if (hsr_create_wait_partitions(&layout, disk_paths) < 0) {
 		fprintf(stderr, "\nFAILED at Step 2 (partition re-read).\n"
 			"Rollback: partitions may exist; check with sgdisk --print.\n"
 			"Run `partx -a` on each device manually.\n");
@@ -1173,35 +1173,35 @@ int cmd_shr_create(int argc, char **argv)
 	}
 
 	/* Step 3: Create RAID arrays (LHSR dmsetup) */
-	if (shr_create_raid(&layout, disk_paths) < 0) {
+	if (hsr_create_raid(&layout, disk_paths) < 0) {
 		fprintf(stderr, "\nFAILED at Step 3 (RAID creation).\n"
-			"Rollback: use `dmsetup remove shr_tier_*` on each tier "
+			"Rollback: use `dmsetup remove hsr_tier_*` on each tier "
 			"then wipe partitions with sgdisk --zap-all.\n");
 		goto out;
 	}
 
 	/* Step 4: LVM setup */
-	if (shr_create_lvm(&layout) < 0) {
+	if (hsr_create_lvm(&layout) < 0) {
 		fprintf(stderr, "\nFAILED at Step 4 (LVM setup).\n"
 			"Rollback:\n"
-			"  lvremove shr_vg/shr_vol\n"
-			"  vgremove shr_vg\n"
-			"  pvremove /dev/mapper/shr_tier_*\n"
-			"  dmsetup remove shr_tier_*\n");
+			"  lvremove hsr_vg/hsr_vol\n"
+			"  vgremove hsr_vg\n"
+			"  pvremove /dev/mapper/hsr_tier_*\n"
+			"  dmsetup remove hsr_tier_*\n");
 		goto out;
 	}
 
 	/* Success */
 	printf("\n============================================================\n");
-	printf("  SHR LAYOUT CREATED SUCCESSFULLY\n");
+	printf("  HSR LAYOUT CREATED SUCCESSFULLY\n");
 	printf("============================================================\n");
-	printf("\nVolume Group:   shr_vg");
-	printf("\nLogical Volume: shr_vg/shr_vol");
+	printf("\nVolume Group:   hsr_vg");
+	printf("\nLogical Volume: hsr_vg/hsr_vol");
 	printf("\n");
 	printf("\nRAID mode: LHSR (self-healing via dmsetup)\n");
 	printf("\nFormat and mount:\n");
-	printf("  # mkfs.ext4 /dev/shr_vg/shr_vol\n");
-	printf("  # mount /dev/shr_vg/shr_vol /mnt/storage\n");
+	printf("  # mkfs.ext4 /dev/hsr_vg/hsr_vol\n");
+	printf("  # mount /dev/hsr_vg/hsr_vol /mnt/storage\n");
 	printf("\n");
 
 	ret = 0;
@@ -1213,7 +1213,7 @@ out:
 }
 
 /* ===================================================================
- * Phase 6.3: shr status — discover and display current SHR layout
+ * Phase 6.3: hsr status — discover and display current HSR layout
  * =================================================================== */
 
 /* Read a sysfs attribute file into buf.  Returns 0 on success, -1 on error. */
@@ -1237,7 +1237,7 @@ static int read_sysfs(const char *path, char *buf, size_t bufsz)
 
 /* Run a command and capture its stdout into buf.
  * Returns exit code (0 on success), -1 on popen failure. */
-static int shr_capture(const char *cmd, char *buf, size_t bufsz)
+static int hsr_capture(const char *cmd, char *buf, size_t bufsz)
 {
 	FILE *fp;
 	size_t n;
@@ -1264,15 +1264,15 @@ static int dm_msg(const char *dm_name, const char *msg,
 	snprintf(cmd, sizeof(cmd),
 		 "/usr/sbin/dmsetup message '%.63s' 0 %s 2>/dev/null || true",
 		 dm_name, msg);
-	return shr_capture(cmd, result, result_sz);
+	return hsr_capture(cmd, result, result_sz);
 }
 
 /* Entry from dmsetup ls for LHSR dm targets. */
 struct dm_entry {
-	char name[64];  /* e.g. shr_tier_0 */
+	char name[64];  /* e.g. hsr_tier_0 */
 };
 
-/* Scan dmsetup for SHR tier devices (LHSR mode).
+/* Scan dmsetup for HSR tier devices (LHSR mode).
  * Returns count of entries found (max 'max').
  */
 static int scan_dm_tiers(const char *prefix,
@@ -1308,7 +1308,7 @@ static int scan_dm_tiers(const char *prefix,
 	return count;
 }
 
-int cmd_shr_status(int argc, char **argv)
+int cmd_hsr_status(int argc, char **argv)
 {
 	struct dm_entry dments[16];
 	int ntiers;
@@ -1318,17 +1318,17 @@ int cmd_shr_status(int argc, char **argv)
 	(void)argc;
 	(void)argv;
 
-	printf("LHSR SHR Status\n");
+	printf("LHSR HSR Status\n");
 	printf("===============\n\n");
 
-	/* ---- Scan SHR tiers (LHSR dm) ---- */
-	ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	/* ---- Scan HSR tiers (LHSR dm) ---- */
+	ntiers = scan_dm_tiers("hsr_tier_", dments, 16);
 
 	if (ntiers == 0) {
-		printf("No SHR tiers found.\n");
-		printf("  (Scanned dmsetup for shr_tier_* devices)\n\n");
-		printf("No LVM VG created by SHR found.\n");
-		printf("Use 'lhsrctl shr create' to create an SHR layout.\n");
+		printf("No HSR tiers found.\n");
+		printf("  (Scanned dmsetup for hsr_tier_* devices)\n\n");
+		printf("No LVM VG created by HSR found.\n");
+		printf("Use 'lhsrctl hsr create' to create an HSR layout.\n");
 		return 1;
 	}
 
@@ -1383,7 +1383,7 @@ int cmd_shr_status(int argc, char **argv)
 				 "--noheadings -o major,minor "
 				 "'%.63s' 2>/dev/null",
 				 dments[i].name);
-			shr_capture(info_cmd, info, sizeof(info));
+			hsr_capture(info_cmd, info, sizeof(info));
 			if (info[0])
 				printf("    Kernel dev: %s\n", info);
 		}
@@ -1432,7 +1432,7 @@ int cmd_shr_status(int argc, char **argv)
 				 "'%.63s' 2>/dev/null | "
 				 "awk '{print $2}'",
 				 dments[i].name);
-			shr_capture(sz_cmd, sz, sizeof(sz));
+			hsr_capture(sz_cmd, sz, sizeof(sz));
 			if (sz[0])
 				dm_sectors = strtoull(sz, NULL, 10);
 		}
@@ -1482,7 +1482,7 @@ int cmd_shr_status(int argc, char **argv)
 		int rv;
 
 		/* Show VGs */
-		rv = shr_capture(
+		rv = hsr_capture(
 			"lvm vgs --noheadings -o vg_name,vg_size,"
 			"pv_count,lv_count 2>/dev/null || true",
 			buf, sizeof(buf));
@@ -1516,7 +1516,7 @@ int cmd_shr_status(int argc, char **argv)
 
 		/* Show LVs with mount point info */
 		if (found_lvm) {
-			rv = shr_capture(
+			rv = hsr_capture(
 				"lvm lvs --noheadings -o lv_name,vg_name,"
 				"lv_size,lv_attr 2>/dev/null || true",
 				buf, sizeof(buf));
@@ -1544,7 +1544,7 @@ int cmd_shr_status(int argc, char **argv)
 								"2>/dev/null "
 								"|| true",
 								vg, lv);
-							shr_capture(mpt, mnt,
+							hsr_capture(mpt, mnt,
 								sizeof(mnt));
 							printf("    %s/%s (%s, "
 							       "attr=%s)",
@@ -1563,7 +1563,7 @@ int cmd_shr_status(int argc, char **argv)
 		}
 
 		/* Show PVs with type annotation */
-		rv = shr_capture(
+		rv = hsr_capture(
 			"lvm pvs --noheadings -o pv_name,vg_name,pv_size "
 			"2>/dev/null || true",
 			buf, sizeof(buf));
@@ -1583,7 +1583,7 @@ int cmd_shr_status(int argc, char **argv)
 						struct stat pv_st;
 						unsigned int j;
 
-						/* Check if PV is a known SHR tier */
+						/* Check if PV is a known HSR tier */
 						if (stat(pv, &pv_st) == 0) {
 							for (j = 0; j < (unsigned int)ntiers; j++) {
 								char dm_path[128];
@@ -1596,7 +1596,7 @@ int cmd_shr_status(int argc, char **argv)
 								    major(dm_st.st_rdev) &&
 								    minor(pv_st.st_rdev) ==
 								    minor(dm_st.st_rdev)) {
-									type = "SHR tier";
+									type = "HSR tier";
 									break;
 								}
 							}
@@ -1615,7 +1615,7 @@ int cmd_shr_status(int argc, char **argv)
 	}
 
 	if (!found_lvm && ntiers > 0) {
-		printf("No LVM VG found on SHR tiers.\n");
+		printf("No LVM VG found on HSR tiers.\n");
 		printf("The tiers exist but are not yet part of "
 		       "an LVM volume.\n");
 	}
@@ -1625,12 +1625,12 @@ int cmd_shr_status(int argc, char **argv)
 }
 
 /* ===================================================================
- * shr destroy — tear down an existing SHR layout
+ * hsr destroy — tear down an existing HSR layout
  *
- * Scans for SHR tiers (/dev/md/shr_tier_*), discovers LVM on them,
+ * Scans for HSR tiers (/dev/md/hsr_tier_*), discovers LVM on them,
  * and destroys everything in dependency order.
  * =================================================================== */
-int cmd_shr_destroy(int argc, char **argv)
+int cmd_hsr_destroy(int argc, char **argv)
 {
 	struct dm_entry dments[16];
 	int ntiers;
@@ -1650,19 +1650,19 @@ int cmd_shr_destroy(int argc, char **argv)
 			yes = 1;
 		else {
 			fprintf(stderr,
-				"Usage: lhsrctl shr destroy [--force] [--yes]\n");
+				"Usage: lhsrctl hsr destroy [--force] [--yes]\n");
 			return 1;
 		}
 	}
 
-	/* Scan LHSR SHR tiers */
-	ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	/* Scan LHSR HSR tiers */
+	ntiers = scan_dm_tiers("hsr_tier_", dments, 16);
 	if (ntiers == 0) {
-		printf("No LHSR SHR tiers found.\n");
+		printf("No LHSR HSR tiers found.\n");
 		return 1;
 	}
 
-	printf("LHSR SHR Destroy\n");
+	printf("LHSR HSR Destroy\n");
 	printf("================\n");
 	printf("Tiers to destroy: %d\n\n", ntiers);
 
@@ -1670,7 +1670,7 @@ int cmd_shr_destroy(int argc, char **argv)
 	const char *lvm_filter =
 		"devices { "
 		"preferred_names=[\"^/dev/mapper/\"] "
-		"filter = [ \"a|/dev/mapper/shr_tier_.*|\", \"r|.*|\" ] "
+		"filter = [ \"a|/dev/mapper/hsr_tier_.*|\", \"r|.*|\" ] "
 		"}";
 
 	/* Discover LVM on each tier */
@@ -1689,7 +1689,7 @@ int cmd_shr_destroy(int argc, char **argv)
 			 "-o vg_name "
 			 "'%.255s' 2>/dev/null || true",
 			 lvm_filter, tier_path);
-		shr_capture(buf, result, sizeof(result));
+		hsr_capture(buf, result, sizeof(result));
 
 		/* Parse VG name from pvs output */
 		{
@@ -1738,7 +1738,7 @@ int cmd_shr_destroy(int argc, char **argv)
 				 "-o lv_path "
 				 "'%.63s' 2>/dev/null || true",
 				 lvm_filter, vg_names[i]);
-			if (shr_capture(cmd, result, sizeof(result)) == 0
+			if (hsr_capture(cmd, result, sizeof(result)) == 0
 			    && result[0]) {
 				char *line = result;
 				while (line && *line) {
@@ -1755,7 +1755,7 @@ int cmd_shr_destroy(int argc, char **argv)
 							 "'%.255s' "
 							 "2>/dev/null "
 							 "|| true", p);
-						shr_capture(find_cmd, mntbuf,
+						hsr_capture(find_cmd, mntbuf,
 							    sizeof(mntbuf));
 						if (mntbuf[0])
 							printf("    %s -> "
@@ -1775,7 +1775,7 @@ int cmd_shr_destroy(int argc, char **argv)
 	if (!force && !yes) {
 		printf("\n======================================"
 		       "==========================\n");
-		printf("  DESTRUCTIVE — DATA ON SHR TIERS "
+		printf("  DESTRUCTIVE — DATA ON HSR TIERS "
 		       "WILL BE LOST\n");
 		printf("======================================"
 		       "==========================\n");
@@ -1797,7 +1797,7 @@ int cmd_shr_destroy(int argc, char **argv)
 		}
 	}
 
-	printf("\nExecuting SHR destroy (best-effort) ...\n");
+	printf("\nExecuting HSR destroy (best-effort) ...\n");
 
 	/* ---- Teardown: reverse of create order ---- */
 
@@ -1811,7 +1811,7 @@ int cmd_shr_destroy(int argc, char **argv)
 			 "-o lv_path "
 			 "'%.63s' 2>/dev/null || true",
 			 lvm_filter, vg_names[i]);
-		if (shr_capture(cmd, result, sizeof(result)) == 0
+		if (hsr_capture(cmd, result, sizeof(result)) == 0
 		    && result[0]) {
 			char *line = result;
 			while (line && *line) {
@@ -1827,7 +1827,7 @@ int cmd_shr_destroy(int argc, char **argv)
 						 "'%.255s' "
 						 "2>/dev/null || true",
 						 p);
-					shr_capture(cmd, mntbuf,
+					hsr_capture(cmd, mntbuf,
 						    sizeof(mntbuf));
 					if (mntbuf[0]) {
 						printf("  umount %s ... ",
@@ -1904,10 +1904,10 @@ int cmd_shr_destroy(int argc, char **argv)
 			printf("FAIL (ignored)\n");
 	}
 
-	printf("\nSHR destroy complete.\n");
+	printf("\nHSR destroy complete.\n");
 	return ret;
 }
-int cmd_shr_disk(int argc, char **argv)
+int cmd_hsr_disk(int argc, char **argv)
 {
 	struct dm_entry dments[16];
 	int ntiers;
@@ -1915,7 +1915,7 @@ int cmd_shr_disk(int argc, char **argv)
 	unsigned int disk_idx;
 
 	if (argc < 1) {
-		fprintf(stderr, "Usage: lhsrctl shr disk <fail|online|list|replace>\n");
+		fprintf(stderr, "Usage: lhsrctl hsr disk <fail|online|list|replace>\n");
 		return 1;
 	}
 	action = argv[0];
@@ -1923,7 +1923,7 @@ int cmd_shr_disk(int argc, char **argv)
 	/* "replace <tier> <disk_idx> <new_dev>" uses disk index directly */
 	if (strcmp(action, "replace") == 0) {
 		if (argc < 4) {
-			fprintf(stderr, "Usage: lhsrctl shr disk "
+			fprintf(stderr, "Usage: lhsrctl hsr disk "
 				"replace <tier> <disk_idx> <new_dev>\n");
 			return 1;
 		}
@@ -1938,11 +1938,11 @@ int cmd_shr_disk(int argc, char **argv)
 			}
 			disk_idx = (unsigned int)val;
 		}
-		return shr_disk_replace(argv[1], disk_idx, argv[3]);
+		return hsr_disk_replace(argv[1], disk_idx, argv[3]);
 	}
 
 	if (argc < 2) {
-		fprintf(stderr, "Usage: lhsrctl shr disk <fail|online> <idx>\n");
+		fprintf(stderr, "Usage: lhsrctl hsr disk <fail|online> <idx>\n");
 		return 1;
 	}
 
@@ -1957,9 +1957,9 @@ int cmd_shr_disk(int argc, char **argv)
 		disk_idx = (unsigned int)val;
 	}
 
-	ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	ntiers = scan_dm_tiers("hsr_tier_", dments, 16);
 	if (ntiers == 0) {
-		printf("No LHSR SHR tiers found.\n");
+		printf("No LHSR HSR tiers found.\n");
 		return 1;
 	}
 
@@ -1999,26 +1999,26 @@ int cmd_shr_disk(int argc, char **argv)
 }
 
 /*
- * SHR rebuild — control/resync disk rebuild.
+ * HSR rebuild — control/resync disk rebuild.
  *
- * Usage: lhsrctl shr rebuild <start <idx>|stop|status>
+ * Usage: lhsrctl hsr rebuild <start <idx>|stop|status>
  */
-int cmd_shr_rebuild(int argc, char **argv)
+int cmd_hsr_rebuild(int argc, char **argv)
 {
 	struct dm_entry dments[16];
 	int ntiers;
 	const char *action;
 
 	if (argc < 1) {
-		fprintf(stderr, "Usage: lhsrctl shr rebuild "
+		fprintf(stderr, "Usage: lhsrctl hsr rebuild "
 			"<start <idx>|stop|status>\n");
 		return 1;
 	}
 	action = argv[0];
 
-	ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	ntiers = scan_dm_tiers("hsr_tier_", dments, 16);
 	if (ntiers == 0) {
-		printf("No LHSR SHR tiers found.\n");
+		printf("No LHSR HSR tiers found.\n");
 		return 1;
 	}
 
@@ -2030,7 +2030,7 @@ int cmd_shr_rebuild(int argc, char **argv)
 
 			if (strcmp(action, "start") == 0) {
 				if (argc < 2) {
-					fprintf(stderr, "Usage: lhsrctl shr "
+					fprintf(stderr, "Usage: lhsrctl hsr "
 						"rebuild start <disk_idx>\n");
 					return 1;
 				}
@@ -2062,21 +2062,21 @@ int cmd_shr_rebuild(int argc, char **argv)
 	return 0;
 }
 /*
- * SHR scrub — control/resync health check via kernel dm messages.
+ * HSR scrub — control/resync health check via kernel dm messages.
  *
- * Usage: lhsrctl shr scrub [start|stop|status]
+ * Usage: lhsrctl hsr scrub [start|stop|status]
  *
  * Without arguments, reports current scrub state for all discovered tiers.
  */
-int cmd_shr_scrub(int argc, char **argv)
+int cmd_hsr_scrub(int argc, char **argv)
 {
 	struct dm_entry dments[16];
 	int ntiers;
 	int i;
 
-	ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	ntiers = scan_dm_tiers("hsr_tier_", dments, 16);
 	if (ntiers == 0) {
-		printf("No LHSR SHR tiers found.\n");
+		printf("No LHSR HSR tiers found.\n");
 		return 1;
 	}
 
@@ -2111,9 +2111,9 @@ int cmd_shr_scrub(int argc, char **argv)
 }
 
 /* ===================================================================
- * shr expand — add new disk(s) to an existing SHR array
+ * hsr expand — add new disk(s) to an existing HSR array
  *
- * Scans for existing LHSR SHR tiers and their LVM VG, creates a new
+ * Scans for existing LHSR HSR tiers and their LVM VG, creates a new
  * LHSR tier from the new disk(s), and extends the VG/LV.
  *
  * RAID type determined by disk count:
@@ -2121,12 +2121,12 @@ int cmd_shr_scrub(int argc, char **argv)
  *   2 disks → RAID1    (mirror)
  *   3+ disks → RAID5   (single parity)
  *
- * Usage:  lhsrctl shr expand [--force] <device>...
+ * Usage:  lhsrctl hsr expand [--force] <device>...
  *
  * Raw block devices are used directly as RAID members — no partition
  * table needed.
  * =================================================================== */
-int cmd_shr_expand(int argc, char **argv)
+int cmd_hsr_expand(int argc, char **argv)
 {
 	uint64_t *disk_sizes = NULL;
 	unsigned int new_count = 0;
@@ -2137,11 +2137,11 @@ int cmd_shr_expand(int argc, char **argv)
 	unsigned int i;
 	char confirm[64];
 
-	/* LVM config filter: only accept /dev/mapper/shr_tier_* */
+	/* LVM config filter: only accept /dev/mapper/hsr_tier_* */
 	const char *lvm_filter =
 		"devices { "
 		"preferred_names=[\"^/dev/mapper/\"] "
-		"filter = [ \"a|/dev/mapper/shr_tier_.*|\", \"r|.*|\" ] "
+		"filter = [ \"a|/dev/mapper/hsr_tier_.*|\", \"r|.*|\" ] "
 		"}";
 
 	/* ---- Parse options ---- */
@@ -2155,7 +2155,7 @@ int cmd_shr_expand(int argc, char **argv)
 		} else if (argv[i][0] == '-') {
 			fprintf(stderr, "Error: unknown option '%s'\n",
 				argv[i]);
-			fprintf(stderr, "Usage: lhsrctl shr expand "
+			fprintf(stderr, "Usage: lhsrctl hsr expand "
 				"[--force] [--yes] <device>...\n");
 			return 1;
 		}
@@ -2164,7 +2164,7 @@ int cmd_shr_expand(int argc, char **argv)
 	new_count = argc - opt_consumed;
 	if (new_count == 0) {
 		fprintf(stderr, "Error: no new disk devices specified\n");
-		fprintf(stderr, "Usage: lhsrctl shr expand "
+		fprintf(stderr, "Usage: lhsrctl hsr expand "
 			"[--force] [--yes] <device>...\n");
 		return 1;
 	}
@@ -2184,7 +2184,7 @@ int cmd_shr_expand(int argc, char **argv)
 		int fd;
 		uint64_t sz;
 
-		if (shr_validate_device(new_disks[i]) < 0)
+		if (hsr_validate_device(new_disks[i]) < 0)
 			goto out;
 
 		fd = open(new_disks[i], O_RDONLY);
@@ -2209,11 +2209,11 @@ int cmd_shr_expand(int argc, char **argv)
 
 	/* ---- Scan existing LHSR tiers ---- */
 	struct dm_entry dments[16];
-	int ntiers = scan_dm_tiers("shr_tier_", dments, 16);
+	int ntiers = scan_dm_tiers("hsr_tier_", dments, 16);
 	if (ntiers == 0) {
-		fprintf(stderr, "Error: no existing SHR tiers found.\n");
-		fprintf(stderr, "Use 'lhsrctl shr create' to create "
-			"a new SHR layout.\n");
+		fprintf(stderr, "Error: no existing HSR tiers found.\n");
+		fprintf(stderr, "Use 'lhsrctl hsr create' to create "
+			"a new HSR layout.\n");
 		goto out;
 	}
 
@@ -2226,10 +2226,10 @@ int cmd_shr_expand(int argc, char **argv)
 	{
 		char buf[4096];
 		int rv;
-		rv = shr_capture(
+		rv = hsr_capture(
 			"lvm pvs --noheadings -o pv_name,vg_name "
 			"2>/dev/null | "
-			"grep '^[[:space:]]*/dev/mapper/shr_tier_' "
+			"grep '^[[:space:]]*/dev/mapper/hsr_tier_' "
 			"|| true",
 			buf, sizeof(buf));
 		(void)rv;
@@ -2245,7 +2245,7 @@ int cmd_shr_expand(int argc, char **argv)
 	}
 	if (!vg_name[0]) {
 		fprintf(stderr, "Error: no LVM VG found on existing "
-			"SHR tiers.\n");
+			"HSR tiers.\n");
 		fprintf(stderr, "The tiers must be part of an LVM VG "
 			"before expansion.\n");
 		goto out;
@@ -2256,7 +2256,7 @@ int cmd_shr_expand(int argc, char **argv)
 	unsigned int next_tier = 0;
 	for (i = 0; i < (unsigned int)ntiers; i++) {
 		unsigned int idx;
-		if (sscanf(dments[i].name, "shr_tier_%u", &idx) == 1) {
+		if (sscanf(dments[i].name, "hsr_tier_%u", &idx) == 1) {
 			if (idx >= next_tier)
 				next_tier = idx + 1;
 		}
@@ -2286,8 +2286,8 @@ int cmd_shr_expand(int argc, char **argv)
 		if (disk_sizes[i] < tier_sectors)
 			tier_sectors = disk_sizes[i];
 	}
-	/* Align down to SHR alignment */
-	tier_sectors = (tier_sectors / SHR_ALIGNMENT) * SHR_ALIGNMENT;
+	/* Align down to HSR alignment */
+	tier_sectors = (tier_sectors / HSR_ALIGNMENT) * HSR_ALIGNMENT;
 
 	/* Usable = size * (members - parity) */
 	uint64_t usable_sectors;
@@ -2297,7 +2297,7 @@ int cmd_shr_expand(int argc, char **argv)
 		usable_sectors = tier_sectors;
 
 	/* ---- Print plan ---- */
-	printf("\nSHR Expansion Plan\n");
+	printf("\nHSR Expansion Plan\n");
 	printf("==================\n");
 	printf("Mode:               LHSR\n");
 	printf("New disks:          %u\n", new_count);
@@ -2305,7 +2305,7 @@ int cmd_shr_expand(int argc, char **argv)
 	       new_count == 1 ? "no redundancy" :
 	       new_count == 2 ? "mirrored" : "single parity");
 	printf("Tier index:         %u\n", next_tier);
-	printf("Tier device:        /dev/mapper/shr_tier_%u\n", next_tier);
+	printf("Tier device:        /dev/mapper/hsr_tier_%u\n", next_tier);
 	printf("Tier size:          %llu sectors (%.1f GiB)\n",
 	       (unsigned long long)tier_sectors,
 	       (double)tier_sectors * 512 / (1024*1024*1024));
@@ -2313,10 +2313,10 @@ int cmd_shr_expand(int argc, char **argv)
 	       (unsigned long long)usable_sectors,
 	       (double)usable_sectors * 512 / (1024*1024*1024));
 	printf("\nLVM actions:\n");
-	printf("  pvcreate /dev/mapper/shr_tier_%u\n", next_tier);
-	printf("  vgextend %s /dev/mapper/shr_tier_%u\n",
+	printf("  pvcreate /dev/mapper/hsr_tier_%u\n", next_tier);
+	printf("  vgextend %s /dev/mapper/hsr_tier_%u\n",
 	       vg_name, next_tier);
-	printf("  lvextend -l +100%%FREE %s/shr_vol\n", vg_name);
+	printf("  lvextend -l +100%%FREE %s/hsr_vol\n", vg_name);
 
 	/* ---- Confirmation ---- */
 	if (!yes) {
@@ -2339,27 +2339,27 @@ int cmd_shr_expand(int argc, char **argv)
 	}
 
 	/* ---- Execute ---- */
-	printf("\nExecuting SHR expansion ...\n");
+	printf("\nExecuting HSR expansion ...\n");
 
-	/* Step 1: Check for stale /dev/mapper/shr_tier_N */
+	/* Step 1: Check for stale /dev/mapper/hsr_tier_N */
 	{
 		char stale_path[64];
 		struct stat st;
 		snprintf(stale_path, sizeof(stale_path),
-			 "/dev/mapper/shr_tier_%u", next_tier);
+			 "/dev/mapper/hsr_tier_%u", next_tier);
 		if (stat(stale_path, &st) == 0 && S_ISBLK(st.st_mode)) {
 			fprintf(stderr, "Error: %s already exists.\n",
 				stale_path);
 			fprintf(stderr, "Remove it first with "
-				"'dmsetup remove shr_tier_%u' "
+				"'dmsetup remove hsr_tier_%u' "
 				"or use --force.\n", next_tier);
 			if (!force)
 				goto out;
 			fprintf(stderr, "  (--force override: "
 				"removing existing device)\n");
-			shr_run_cmd(
+			hsr_run_cmd(
 				"/usr/sbin/dmsetup remove "
-				"shr_tier_%u 2>/dev/null; true",
+				"hsr_tier_%u 2>/dev/null; true",
 				next_tier);
 		}
 	}
@@ -2367,7 +2367,7 @@ int cmd_shr_expand(int argc, char **argv)
 	/* Step 2: Pre-flight checks */
 	printf("\n--- Pre-flight checks ---\n");
 	for (i = 0; i < new_count; i++) {
-		if (shr_warn_used_device(new_disks[i]) < 0) {
+		if (hsr_warn_used_device(new_disks[i]) < 0) {
 			if (!force) {
 				fprintf(stderr,
 					"Use --force to override.\n");
@@ -2387,17 +2387,17 @@ int cmd_shr_expand(int argc, char **argv)
 		if (raid_type == LHSR_RAID_SINGLE) {
 			/* SINGLE: type + device + offset (kernel requires >=3 args) */
 			pos = snprintf(cmd, sizeof(cmd),
-				"dmsetup create shr_tier_%u --table "
+				"dmsetup create hsr_tier_%u --table "
 				"\"0 %llu lhsr single %s 0\"",
 				next_tier,
 				(unsigned long long)tier_sectors,
 				new_disks[0]);
-			if (shr_run_cmd("%s", cmd) < 0)
+			if (hsr_run_cmd("%s", cmd) < 0)
 				goto out;
 		} else if (raid_type == LHSR_RAID_MIRROR) {
 			/* MIRROR: type + dev/offset pairs */
 			pos = snprintf(cmd, sizeof(cmd),
-				"dmsetup create shr_tier_%u --table "
+				"dmsetup create hsr_tier_%u --table "
 				"\"0 %llu lhsr mirror",
 				next_tier,
 				(unsigned long long)tier_sectors);
@@ -2412,14 +2412,14 @@ int cmd_shr_expand(int argc, char **argv)
 				}
 			}
 			snprintf(cmd + pos, sizeof(cmd) - pos, "\"");
-			if (shr_run_cmd("%s", cmd) < 0)
+			if (hsr_run_cmd("%s", cmd) < 0)
 				goto out;
 		} else {
 			/* RAID5/6: fixed kernel params (chunk_sects=8,
 			 * stripes_per_cont=1, cont_sects=8) + dev/offset pairs */
 			int raid_char = (raid_type == LHSR_RAID5) ? '5' : '6';
 			pos = snprintf(cmd, sizeof(cmd),
-				"dmsetup create shr_tier_%u --table "
+				"dmsetup create hsr_tier_%u --table "
 				"\"0 %llu lhsr raid%c 8 1 8",
 				next_tier,
 				(unsigned long long)tier_sectors,
@@ -2435,7 +2435,7 @@ int cmd_shr_expand(int argc, char **argv)
 				}
 			}
 			snprintf(cmd + pos, sizeof(cmd) - pos, "\"");
-			if (shr_run_cmd("%s", cmd) < 0)
+			if (hsr_run_cmd("%s", cmd) < 0)
 				goto out;
 		}
 	}
@@ -2444,8 +2444,8 @@ int cmd_shr_expand(int argc, char **argv)
 	{
 		char tier_path[64];
 		snprintf(tier_path, sizeof(tier_path),
-			 "/dev/mapper/shr_tier_%u", next_tier);
-		if (shr_wait_for_part(tier_path, 0, 5000) < 0)
+			 "/dev/mapper/hsr_tier_%u", next_tier);
+		if (hsr_wait_for_part(tier_path, 0, 5000) < 0)
 			goto out;
 	}
 
@@ -2454,12 +2454,12 @@ int cmd_shr_expand(int argc, char **argv)
 	{
 		char tier_dev[64];
 		snprintf(tier_dev, sizeof(tier_dev),
-			 "/dev/mapper/shr_tier_%u", next_tier);
+			 "/dev/mapper/hsr_tier_%u", next_tier);
 
-		if (shr_run_cmd("pvcreate --config '%s' '%s'",
+		if (hsr_run_cmd("pvcreate --config '%s' '%s'",
 				lvm_filter, tier_dev) < 0)
 			goto out;
-		if (shr_run_cmd("vgextend --config '%s' "
+		if (hsr_run_cmd("vgextend --config '%s' "
 				"'%s' '%s'",
 				lvm_filter,
 				vg_name, tier_dev) < 0)
@@ -2470,16 +2470,16 @@ int cmd_shr_expand(int argc, char **argv)
 	printf("\n--- Step 6: LVM — extend LV ---\n");
 	{
 		char lv_path[128];
-		snprintf(lv_path, sizeof(lv_path), "%s/shr_vol", vg_name);
+		snprintf(lv_path, sizeof(lv_path), "%s/hsr_vol", vg_name);
 		/* allow_changes_with_duplicate_pvs=1 needed because LVM
 		 * detects PV UUID fragments in RAID5-striped data on the
 		 * underlying member devices.  The LHSR filter prevents LVM
 		 * from USING those devices, but LVM still blocks metadata
 		 * commits when it sees duplicates. */
-		if (shr_run_cmd("lvextend --config "
+		if (hsr_run_cmd("lvextend --config "
 				"'devices { allow_changes_with_duplicate_pvs=1 "
 				"preferred_names=[\"^/dev/mapper/\"] "
-				"filter = [ \"a|/dev/mapper/shr_tier_.*|\", "
+				"filter = [ \"a|/dev/mapper/hsr_tier_.*|\", "
 				"\"r|.*|\" ] }' "
 				"-l +100%%FREE '%s' --yes",
 				lv_path) < 0) {
@@ -2492,10 +2492,10 @@ int cmd_shr_expand(int argc, char **argv)
 
 	/* ---- Success ---- */
 	printf("\n===========================================================\n");
-	printf("  SHR EXPANSION SUCCESSFUL\n");
+	printf("  HSR EXPANSION SUCCESSFUL\n");
 	printf("===========================================================\n");
 	printf("\nAdded %u new disk(s)", new_count);
-	printf(" as %s tier /dev/mapper/shr_tier_%u\n",
+	printf(" as %s tier /dev/mapper/hsr_tier_%u\n",
 	       raid_name, next_tier);
 	printf("Volume group: %s\n", vg_name);
 	printf("Tier size: %llu sectors (%.1f GiB)\n",
@@ -2505,7 +2505,7 @@ int cmd_shr_expand(int argc, char **argv)
 	       (unsigned long long)usable_sectors,
 	       (double)usable_sectors * 512 / (1024*1024*1024));
 	printf("\nIf the filesystem supports online resize:\n");
-	printf("  ext4:  resize2fs /dev/%s/shr_vol\n", vg_name);
+	printf("  ext4:  resize2fs /dev/%s/hsr_vol\n", vg_name);
 	printf("  xfs:   xfs_growfs /mount/point\n");
 	printf("\n");
 
@@ -2517,16 +2517,16 @@ out:
 }
 
 /*
- * Replace a disk in an LHSR SHR tier.
+ * Replace a disk in an LHSR HSR tier.
  *
- * Usage (via cmd_shr_disk):
- *   shr disk replace <tier_name> <disk_idx> <new_dev>
+ * Usage (via cmd_hsr_disk):
+ *   hsr disk replace <tier_name> <disk_idx> <new_dev>
  *
  * Uses the kernel module's device_path message to get the current device
  * for each disk index, builds a new dm table, loads/resumes, then starts
  * rebuild.
  */
-static int shr_disk_replace(const char *tier_name,
+static int hsr_disk_replace(const char *tier_name,
 			    unsigned int disk_idx, const char *new_dev)
 {
 	char cmd[4096];
@@ -2589,7 +2589,7 @@ static int shr_disk_replace(const char *tier_name,
 	/* 3. Get array size from dmsetup table (first 2 tokens: "0 <size> ...") */
 	snprintf(cmd, sizeof(cmd),
 		 "/usr/sbin/dmsetup table '%.63s' 2>/dev/null", tier_name);
-	if (shr_capture(cmd, table_line, sizeof(table_line)) < 0 ||
+	if (hsr_capture(cmd, table_line, sizeof(table_line)) < 0 ||
 	    !table_line[0]) {
 		fprintf(stderr, "Error: cannot get table for '%s'\n", tier_name);
 		return 1;
@@ -2640,7 +2640,7 @@ static int shr_disk_replace(const char *tier_name,
 		 * e.g. "loop0" but we need "/dev/loop0p1" for the dm table) */
 		{
 			char part_str[64];
-			shr_get_part_dev(dp_resp, 1, part_str, sizeof(part_str));
+			hsr_get_part_dev(dp_resp, 1, part_str, sizeof(part_str));
 			snprintf(dev_paths[i], sizeof(dev_paths[i]),
 				 "/dev/%.31s", part_str);
 		}
@@ -2715,7 +2715,7 @@ static int shr_disk_replace(const char *tier_name,
 		printf("  Loading new table ... ");
 		fflush(stdout);
 		{
-			char tmpfile[] = "/tmp/shr_dm_table_XXXXXX";
+			char tmpfile[] = "/tmp/hsr_dm_table_XXXXXX";
 			int fd = mkstemp(tmpfile);
 			if (fd < 0) {
 				perror("  Failed to create temp file");
@@ -2800,21 +2800,21 @@ static int shr_disk_replace(const char *tier_name,
 
 
 /*
- * Grow an SHR tier by adding one or more disks.
+ * Grow an HSR tier by adding one or more disks.
  *
  * NOT IMPLEMENTED for LHSR.  Online RAID reshape requires kernel changes
  * that have not been implemented in the LHSR kernel module.
  *
- * Use 'lhsrctl shr expand' to add capacity via a new tier instead.
+ * Use 'lhsrctl hsr expand' to add capacity via a new tier instead.
  */
-int cmd_shr_grow(int argc, char **argv)
+int cmd_hsr_grow(int argc, char **argv)
 {
 	(void)argc;
 	(void)argv;
 	fprintf(stderr,
-		"Error: 'shr grow' applies to mdadm-based SHR only.\n"
+		"Error: 'hsr grow' applies to mdadm-based HSR only.\n"
 		"LHSR does not support online RAID growth.\n"
-		"Use 'lhsrctl shr expand' to add capacity "
+		"Use 'lhsrctl hsr expand' to add capacity "
 		"via a new tier.\n");
 	return 1;
 }

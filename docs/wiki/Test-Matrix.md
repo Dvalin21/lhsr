@@ -27,7 +27,7 @@ noted, `fio` 4-job 4K randwrite for stress. See `vm-work/` notes and
    needs a fresh VM + the standard stress. Watch for 6.12 behavior skew.
 3. **Write performance** — `tests/bench.sh` + `tests/test-benchmark.sh` exist;
    no post-fix numbers yet. VM numbers are indicative only.
-4. **Daemon/SHR tiers** — `lhsrctl shr create/expand/status/destroy` end to
+4. **Daemon/HSR tiers** — `lhsrctl hsr create/expand/status/destroy` end to
    end on current `main` (last ran Jun 19, pre-hunt).
 5. **Real disks** — blocked on hardware. SMART polling, failover, NCQ depth,
    and the 5–11x gap all need spinning rust/NVMe to mean anything.

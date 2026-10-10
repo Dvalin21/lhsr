@@ -11,7 +11,7 @@
 2. **Don't reimplement the kernel.** dm-integrity, mdadm bitmap, and device
    quirks already exist upstream. Use them.
 3. **Stack, don't replace.** LHSR stacks on dm-integrity for checksums,
-   not mdadm. SHR is a userspace tool, not kernel code.
+   not mdadm. HSR is a userspace tool, not kernel code.
 4. **Ship working code incrementally.** Each phase must produce a testable,
    deployable improvement. No speculative architecture.
 
@@ -410,7 +410,7 @@ $ lhsrctl recover /dev/sdb /dev/sdc /dev/sdd
 **Safety checks:**
 - Validates `present >= min_healthy` (disk_count - parity) before generating commands
 - RAID1 requires both disks
-- SHR/SHR2 types rejected (no kernel module support)
+- HSR/HSR2 types rejected (no kernel module support)
 - Table line overflow detection
 
 **Tested on:**
@@ -493,15 +493,15 @@ Options:
 
 ---
 
-## Phase 6: SHR Userspace
+## Phase 6: HSR Userspace
 
-> **2026-06-19 update:** mdadm support removed in Phase 16. All SHR tiers now
+> **2026-06-19 update:** mdadm support removed in Phase 16. All HSR tiers now
 > use LHSR dmsetup targets. This historical entry documents the original design
 > decisions that included mdadm as an option.
 
-**Status:** Scoping document complete — see `docs/plans/2026-06-13-shr-userspace-design.md`
+**Status:** Scoping document complete — see `docs/plans/2026-06-13-hsr-userspace-design.md`
 
-Synology Hybrid RAID support is a userspace feature that partitions disks of
+HSR (mixed-size tiered arrays) is a userspace feature that partitions disks of
 varying sizes into equal-sized chunks, creates RAID arrays per tier (LHSR
 dmsetup), and merges them with LVM. It does NOT belong in the kernel module.
 
@@ -514,16 +514,16 @@ dmsetup), and merges them with LVM. It does NOT belong in the kernel module.
 3. Stack LHSR self-healing on top of each tier (optional, default mdadm)
 
 ### Design Decisions (from scoping document)
-- **v1 includes create**: Beyond the scoping doc, `shr create` was added in v1
+- **v1 includes create**: Beyond the scoping doc, `hsr create` was added in v1
   because the layout computation is the hard part — executing sgdisk+mdadm+LVM
   is straightforward and eliminates copy-paste errors.
 - **No auto-rebalance**: Adding disks to an existing layout is manual in v1.
 - **mdadm default, LHSR optional**: `--lhsr` flag for self-healing tiers.
-- **Zero kernel changes**: SHR is purely a userspace tool.
+- **Zero kernel changes**: HSR is purely a userspace tool.
 
 ### Effort
 - ~2000 lines, ~11 sessions (2-3 weeks) for full tool with LHSR support
-- ~500 lines, ~3-4 sessions for `shr plan` only (layout calculator + command printer)
+- ~500 lines, ~3-4 sessions for `hsr plan` only (layout calculator + command printer)
 
 ### Key Risks
 1. Partition alignment on 4K drives (mitigated by 2048-sector default)
@@ -531,46 +531,46 @@ dmsetup), and merges them with LVM. It does NOT belong in the kernel module.
 3. Rollback complexity in v1 avoided by plan-only approach
 
 ### Deliverables
-- ✅ Scoping/design document (`docs/plans/2026-06-13-shr-userspace-design.md`)
-- ✅ Phase 6.1: `lhsrctl shr plan` — layout calculator + command generator
-- ✅ Phase 6.2: `lhsrctl shr create` — automatic partitioning + tier creation + LVM setup
-- ✅ Phase 6.3: `lhsrctl shr status` — show current SHR layout from metadata
+- ✅ Scoping/design document (`docs/plans/2026-06-13-hsr-userspace-design.md`)
+- ✅ Phase 6.1: `lhsrctl hsr plan` — layout calculator + command generator
+- ✅ Phase 6.2: `lhsrctl hsr create` — automatic partitioning + tier creation + LVM setup
+- ✅ Phase 6.3: `lhsrctl hsr status` — show current HSR layout from metadata
 - ✅ Phase 6.4: Integration testing with loopback devices of different sizes
         - 4 loopbacks (1G + 3×1.6G) → 2-tier RAID5 → LVM VG
-        - `shr create` partitioned 4 disks into 5 total partitions (1+2+2+2)
+        - `hsr create` partitioned 4 disks into 5 total partitions (1+2+2+2)
         - Both mdadm RAID5 arrays created and running
         - LVM pools both tiers into single VG (4.10g)
-        - `shr status` shows correct hierarchy, PVs annotated [SHR tier]
+        - `hsr status` shows correct hierarchy, PVs annotated [HSR tier]
         - mkfs.ext4, mount, 100MB write/read: SHA256 verified PASS
         - Bugs fixed: paired sort (sizes[]/disk_paths[] sync), --assume-clean
-- ✅ Phase 6.5: `lhsrctl shr destroy` — clean teardown of SHR tiers
-        - `destroy` scans DM tables for SHR tiers (lhsr + mdadm)
+- ✅ Phase 6.5: `lhsrctl hsr destroy` — clean teardown of HSR tiers
+        - `destroy` scans DM tables for HSR tiers (lhsr + mdadm)
         - LVM: lvremove, vgremove, pvremove (with --yes for automation)
         - DM: dmsetup remove on each tier
         - mdadm: stop arrays, zero superblocks on member partitions
         - `--force` flag skips individual failures to clean as much as possible
-        - Tested: 4-loopback RAID5 array, full teardown from SHR to clean state
-- ✅ Phase 6.6: `lhsrctl shr disk fail/online` — per-disk health management
-        - `shr disk fail <tier> <device>`: sends `disk_fail <idx>` message via dmsetup
-        - `shr disk online <tier> <device>`: sends `member_status <idx> 0` to re-enable
-        - `shr disk list <tier>`: shows per-disk state from dmsetup status
+        - Tested: 4-loopback RAID5 array, full teardown from HSR to clean state
+- ✅ Phase 6.6: `lhsrctl hsr disk fail/online` — per-disk health management
+        - `hsr disk fail <tier> <device>`: sends `disk_fail <idx>` message via dmsetup
+        - `hsr disk online <tier> <device>`: sends `member_status <idx> 0` to re-enable
+        - `hsr disk list <tier>`: shows per-disk state from dmsetup status
         - Integration with `lhsrctl status`: displays disk states per tier
-- ✅ Phase 6.7: `lhsrctl shr rebuild start/stop/status` — incremental rebuild
-        - `shr rebuild start <tier>`: sends `rebuild` message, accepts optional target disk index
-        - `shr rebuild stop <tier>`: sends `rebuild_stop` message
-        - `shr rebuild status <tier>`: polls dmsetup status for rebuild progress
+- ✅ Phase 6.7: `lhsrctl hsr rebuild start/stop/status` — incremental rebuild
+        - `hsr rebuild start <tier>`: sends `rebuild` message, accepts optional target disk index
+        - `hsr rebuild stop <tier>`: sends `rebuild_stop` message
+        - `hsr rebuild status <tier>`: polls dmsetup status for rebuild progress
         - Tested: 3-loop RAID5, disk fail → rebuild start → progress tracking → completion
         - WIB-aware: RAID1 skips clean chunks, RAID5 does full parity reconstruction
-- ✅ Phase 6.8: `lhsrctl shr scrub start/stop/status` — background data integrity scrub
-        - `shr scrub start <tier>`: sends `scrub` message
-        - `shr scrub stop <tier>`: sends `scrub_stop` message
-        - `shr scrub status <tier>`: polls dmsetup status for scrub progress
+- ✅ Phase 6.8: `lhsrctl hsr scrub start/stop/status` — background data integrity scrub
+        - `hsr scrub start <tier>`: sends `scrub` message
+        - `hsr scrub stop <tier>`: sends `scrub_stop` message
+        - `hsr scrub status <tier>`: polls dmsetup status for scrub progress
         - Tested: 3-loop RAID5, write data → scrub → checksum verified PASS
-- ✅ Phase 6.9: `lhsrctl shr expand` — add new tier + extend LVM
-        - `shr expand <tier> <device> [device...]`: adds disks as new tier
+- ✅ Phase 6.9: `lhsrctl hsr expand` — add new tier + extend LVM
+        - `hsr expand <tier> <device> [device...]`: adds disks as new tier
         - RAID type by disk count: 1=SINGLE, 2=MIRROR, 3+=RAID5
-        - Uses raw block devices (not partitions) — matches `shr create --lhsr` behavior
-        - LVM: vgextend shr_vg + lvextend -l +100%FREE to grow filesystem online
+        - Uses raw block devices (not partitions) — matches `hsr create --lhsr` behavior
+        - LVM: vgextend hsr_vg + lvextend -l +100%FREE to grow filesystem online
         - Tested: 4-disk RAID5 → +1 disk SINGLE tier → LV grows 6G → 8G
         - **Bugs fixed during implementation:**
           - Kernel table format: SINGLE needs `"single /dev/loop4 0"` (3 args minimum)
@@ -580,40 +580,40 @@ dmsetup), and merges them with LVM. It does NOT belong in the kernel module.
 
 ---
 
-## Phase 7: SHR Userspace Operational Commands — ✅ COMPLETE (2026-06-15)
+## Phase 7: HSR Userspace Operational Commands — ✅ COMPLETE (2026-06-15)
 
-**What changed:** The SHR userspace tool (`lhsrctl shr`) was extended from a setup/status tool into a full operational management suite. All commands that a storage admin needs for day-to-day operation of a Synology-Hybrid-RAID-like pool are now implemented: destroy, disk health, rebuild, scrub, and expand.
+**What changed:** The HSR userspace tool (`lhsrctl hsr`) was extended from a setup/status tool into a full operational management suite. All commands that a storage admin needs for day-to-day operation of a mixed-size tiered pool are now implemented: destroy, disk health, rebuild, scrub, and expand.
 
 **Key design decisions:**
 - **Zero kernel changes**: All commands operate entirely in userspace via `dmsetup message` and `dmsetup table`/`status` parsing. The kernel module already supports disk_fail, rebuild, and scrub messages — no new kernel code was needed.
 - **LHSR and mdadm mode**: All commands work with both `--lhsr` mode (dm-lhsr kernel module) and default mdadm mode, with appropriate code paths for each.
-- **Raw block devices for LHSR tiers**: LHSR mode uses raw block devices directly as tier members (no partition table), matching `shr create --lhsr` behavior. mdadm mode uses partitions on member disks.
+- **Raw block devices for LHSR tiers**: LHSR mode uses raw block devices directly as tier members (no partition table), matching `hsr create --lhsr` behavior. mdadm mode uses partitions on member disks.
 - **LVM filter for duplicate PV protection**: When LHSR tiers are built on loop devices that are also visible to LVM as potential PVs, the duplicate UUID detection blocks operations. Hardened with `--config` flags passing strict LVM filter rules.
 
 ### Deliverables
-- ✅ Phase 6.5: `shr destroy` — clean teardown (LVM + DM + mdadm + superblock wipe)
-- ✅ Phase 6.6: `shr disk fail/online/list` — per-disk health management
-- ✅ Phase 6.7: `shr rebuild start/stop/status` — incremental rebuild with progress
-- ✅ Phase 6.8: `shr scrub start/stop/status` — background integrity verification
-- ✅ Phase 6.9: `shr expand` — dynamic tier addition + online LV extension
+- ✅ Phase 6.5: `hsr destroy` — clean teardown (LVM + DM + mdadm + superblock wipe)
+- ✅ Phase 6.6: `hsr disk fail/online/list` — per-disk health management
+- ✅ Phase 6.7: `hsr rebuild start/stop/status` — incremental rebuild with progress
+- ✅ Phase 6.8: `hsr scrub start/stop/status` — background integrity verification
+- ✅ Phase 6.9: `hsr expand` — dynamic tier addition + online LV extension
 - ✅ All tested end-to-end on VM with 3-4 loopback devices in RAID5 configuration
 - ✅ Zero new compiler warnings on any target
 - ✅ LHSR-specific bug fixes: SINGLE kernel table format, lvextend syntax, LVM duplicate PV
 
 ---
 
-## Phase 8: shr disk replace (✅ COMPLETE 2026-06-16)
+## Phase 8: hsr disk replace (✅ COMPLETE 2026-06-16)
 
 **Status:** IMPLEMENTED AND TESTED END-TO-END ON VM
 
-**What:** `lhsrctl shr disk replace <tier> <disk_idx> <new_dev>` — atomically swap a disk in an
+**What:** `lhsrctl hsr disk replace <tier> <disk_idx> <new_dev>` — atomically swap a disk in an
 LHSR tier by index, then trigger rebuild to populate it.
 
 ### API
 ```
-lhsrctl shr disk replace <tier_name> <disk_idx> <new_dev>
+lhsrctl hsr disk replace <tier_name> <disk_idx> <new_dev>
 ```
-- `<disk_idx>`: 0-based disk index in the array (use `shr status` to see indices)
+- `<disk_idx>`: 0-based disk index in the array (use `hsr status` to see indices)
 - `<new_dev>`: path to replacement block device
 
 ### Implementation
@@ -635,7 +635,7 @@ lhsrctl shr disk replace <tier_name> <disk_idx> <new_dev>
 - **Config message parsing**: Reads `raid=N` and `disks=N` from the `config` message response
   to determine RAID type and disk count for table reconstruction.
 - **Table format reconstruction**: For RAID5, default params: chunk=8, stripes=disks, cont=parity.
-  This matches the `shr create` defaults.
+  This matches the `hsr create` defaults.
 
 ### Kernel change
 - Added `device_path <idx>` handler in `lhsr_message()` that returns `bd_disk->disk_name`
@@ -955,11 +955,11 @@ per-I/O overhead. Test on real hardware before investing in Option A-D.
 
 ---
 
-## Phase 16: SHR Userspace — mdadm Purge ✅ COMPLETE (2026-06-19)
+## Phase 16: HSR Userspace — mdadm Purge ✅ COMPLETE (2026-06-19)
 
 **Duration:** 1 session
 
-**What changed:** All mdadm code paths removed from the SHR userspace CLI.
+**What changed:** All mdadm code paths removed from the HSR userspace CLI.
 The tool now exclusively uses LHSR dmsetup targets. This eliminates ~1000
 lines of dead mdadm code and simplifies future maintenance.
 
@@ -970,7 +970,7 @@ lines of dead mdadm code and simplifies future maintenance.
 - `cmd_shr_status()`: mdadm sysfs reads removed; PV detection uses
   `/dev/mapper/` paths only
 - `cmd_shr_destroy()`: rewritten LHSR-only (no mdadm teardown)
-- `cmd_shr_grow()`: replaced with stub redirecting to `shr expand`
+- `cmd_shr_grow()`: replaced with stub redirecting to `hsr expand`
 - `cmd_shr_expand()`: mdadm creation branch removed; RAID5 table params
   fixed (`8 %u %u` → `8 1 8` — was passing wrong values as kernel geometry)
 - Deleted: `struct md_entry`, `scan_md_devices()`, `md_entry_read_members()`
@@ -980,15 +980,15 @@ lines of dead mdadm code and simplifies future maintenance.
 ### Why
 - LHSR is the only RAID backend; dual-mode (mdadm + dm-lhsr) adds
   complexity without benefit
-- All SHR testing uses LHSR mode; mdadm was never tested post-Phase 7
+- All HSR testing uses LHSR mode; mdadm was never tested post-Phase 7
 - Fewer code paths → fewer bugs (Linus: "If 50 lines solve it, 500
   lines is a confession of failure")
 
 ### Impact on other phases
-- **Phase 9 (old `shr grow`)**: Replaced with stub — no mdadm, no reshape
+- **Phase 9 (old `hsr grow`)**: Replaced with stub — no mdadm, no reshape
 - **Phase 9 (new kernel reshape)**: Independent of mdadm — dm-lhsr only
-- **Phase 15 (Write Perf)**: Unchanged — kernel module, not SHR
-- **Phase 6-7 (SHR core)**: Unchanged logic, mdadm paths only removed
+- **Phase 15 (Write Perf)**: Unchanged — kernel module, not HSR
+- **Phase 6-7 (HSR core)**: Unchanged logic, mdadm paths only removed
 
 **Commit:** `285c578` — zero-warning build on 6.12.90+deb13.1-amd64
 
@@ -1004,10 +1004,10 @@ lines of dead mdadm code and simplifies future maintenance.
 | 3 | Daemon refactor | **1 day** (est. 2-3 weeks) | Phase 0 |
 | 4 | Predictive failure | **1 session** (est. 2 weeks) | Phase 3 |
 | 5 | Recovery tools + kernel degraded mode | 2 weeks | Phase 0 |
-| 6 | SHR userspace (core: plan/create/status) | ~1 week | Phase 0 |
-| 7 | SHR operational commands (destroy/disk/rebuild/scrub/expand) | **1 session** | Phase 6 |
-| 8 | shr disk replace | **1 session** | Phase 7 |
-| 9 | Live migration / shr grow | **1 session** | Phase 6 |
+| 6 | HSR userspace (core: plan/create/status) | ~1 week | Phase 0 |
+| 7 | HSR operational commands (destroy/disk/rebuild/scrub/expand) | **1 session** | Phase 6 |
+| 8 | hsr disk replace | **1 session** | Phase 7 |
+| 9 | Live migration / hsr grow | **1 session** | Phase 6 |
 | 9 | **Kernel RAID5→RAID6 reshape** *(replaced old Phase 9)* | **2 sessions** | Phase 0 |
 | 10-C | Monitoring & observability | **1 session** | Phase 4 |
 | 10-D | Performance baseline benchmarks | **1 session** | Phase 0 |
@@ -1018,7 +1018,7 @@ lines of dead mdadm code and simplifies future maintenance.
 | 13 | Parallel I/O waves in RMW (concurrent bio submission) | **1 session** | Phase 12
 | 14 | Concurrent RMW stress testing (4-way fio, 15/15 PASS) | **1 session** | Phase 13
 | 15 | Write performance optimization (close 5-11x gap vs mdadm) | TBD | Phase 14
-| 16 | SHR mdadm purge (LHSR-only userspace, -978 lines) | **1 session** | Phase 7
+| 16 | HSR mdadm purge (LHSR-only userspace, -978 lines) | **1 session** | Phase 7
 
 ---
 

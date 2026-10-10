@@ -25,7 +25,7 @@
 #include <sys/un.h>
 
 #include "../../lib/raid_engine.h"
-#include "shr.h"
+#include "hsr.h"
 
 #include "lhsr.h"		/* canonical on-disk format definitions */
 
@@ -59,13 +59,13 @@ static int connect_control_socket(void);
 static char *control_query(const char *cmd);
 
 /* Forward declarations from subcommand files */
-int cmd_shr_plan(int argc, char **argv);
-int cmd_shr_create(int argc, char **argv);
-int cmd_shr_status(int argc, char **argv);
-int cmd_shr_destroy(int argc, char **argv);
-int cmd_shr_scrub(int argc, char **argv);
-int cmd_shr_disk(int argc, char **argv);
-int cmd_shr_rebuild(int argc, char **argv);
+int cmd_hsr_plan(int argc, char **argv);
+int cmd_hsr_create(int argc, char **argv);
+int cmd_hsr_status(int argc, char **argv);
+int cmd_hsr_destroy(int argc, char **argv);
+int cmd_hsr_scrub(int argc, char **argv);
+int cmd_hsr_disk(int argc, char **argv);
+int cmd_hsr_rebuild(int argc, char **argv);
 
 /* Command options */
 enum {
@@ -83,7 +83,7 @@ enum {
 	CMD_RECOVER,
 	CMD_RECONSTRUCT,
 	CMD_HEALTH,
-	CMD_SHR,
+	CMD_HSR,
 };
 
 /* Usage */
@@ -111,14 +111,14 @@ static void usage(const char *prog)
 		"  recover <device>...          Scan and assemble LHSR arrays\n"
 		"  reconstruct [opts] <dev>...   Reconstruct missing RAID5/6 disk from N-1\n"
 		"  health [--json]               Show daemon health summary\n"
-		"  shr plan [opts] <dev>...     Compute SHR layout for variable-size disks\n"
-		"  shr create [opts] <dev>...   Execute SHR layout (DESTRUCTIVE)\n"
-		"  shr status                   Show current SHR topology and health\n"
-		"  shr scrub [start|stop]       Start/stop scrubbing (health check)\n"
-		"  shr disk <fail|online|list> <n>  Fail/bring online/list member disk\n"
-		"  shr disk replace <tier> <old> <new>  Replace disk, start rebuild\n"
-		"  shr rebuild <start <n>|stop|status>  Rebuild a failed disk\n"
-		"  shr expand <tier> <dev>...    Add disks as new tier + extend LVM\n"
+		"  hsr plan [opts] <dev>...     Compute HSR layout for variable-size disks\n"
+		"  hsr create [opts] <dev>...   Execute HSR layout (DESTRUCTIVE)\n"
+		"  hsr status                   Show current HSR topology and health\n"
+		"  hsr scrub [start|stop]       Start/stop scrubbing (health check)\n"
+		"  hsr disk <fail|online|list> <n>  Fail/bring online/list member disk\n"
+		"  hsr disk replace <tier> <old> <new>  Replace disk, start rebuild\n"
+		"  hsr rebuild <start <n>|stop|status>  Rebuild a failed disk\n"
+		"  hsr expand <tier> <dev>...    Add disks as new tier + extend LVM\n"
 		"  message <device> <msg> [args] Send message to kernel\n"
 		"\n"
 		"RAID Types:\n"
@@ -126,12 +126,12 @@ static void usage(const char *prog)
 		"  mirror  2-way mirroring\n"
 		"  raid5   RAID5 (single parity)\n"
 		"  raid6   RAID6 (dual parity)\n"
-		"  shr     Synology Hybrid RAID\n"
-		"  shr2    Synology Hybrid RAID-2\n"
+		"  hsr     Mixed-size tiered arrays (1-disk redundancy)\n"
+		"  hsr2    Mixed-size tiered arrays (2-disk redundancy)\n"
 		"\n"
 		"Examples:\n"
 		"  %s create --raid raid5 /dev/sdb /dev/sdc /dev/sdd\n"
-		"  %s create --raid shr /dev/sdb /dev/sdc /dev/sdd /dev/sde\n"
+		"  %s create --raid hsr /dev/sdb /dev/sdc /dev/sdd /dev/sde\n"
 		"  %s status\n"
 		"  %s predict\n"
 		"\n"
@@ -277,8 +277,8 @@ static int cmd_status(int argc, char **argv)
 				case 1: type_str = "MIRROR"; break;
 				case 2: type_str = "RAID5"; break;
 				case 3: type_str = "RAID6"; break;
-				case 4: type_str = "SHR"; break;
-				case 5: type_str = "SHR2"; break;
+				case 4: type_str = "HSR"; break;
+				case 5: type_str = "HSR2"; break;
 				}
 				printf("Array: %s  (%s, %d disks, %d working)\n",
 				       name, type_str, num_d, num_w);
@@ -1182,8 +1182,8 @@ static const char *raid_type_name(unsigned int t)
 	case LHSR_RAID_MIRROR: return "MIRROR";
 	case LHSR_RAID5:       return "RAID5";
 	case LHSR_RAID6:       return "RAID6";
-	case LHSR_RAID_SHR:    return "SHR";
-	case LHSR_RAID_SHR2:   return "SHR2";
+	case LHSR_HSR1:    return "HSR";
+	case LHSR_HSR2:   return "HSR2";
 	default:               return "UNKNOWN";
 	}
 }
@@ -1207,8 +1207,8 @@ static const char *raid_type_table_name(unsigned int t)
 	case LHSR_RAID_MIRROR: return "mirror";
 	case LHSR_RAID5:       return "raid5";
 	case LHSR_RAID6:       return "raid6";
-	case LHSR_RAID_SHR:
-	case LHSR_RAID_SHR2:
+	case LHSR_HSR1:
+	case LHSR_HSR2:
 	default:               return NULL; /* unsupported for direct assembly */
 	}
 }
@@ -2292,8 +2292,8 @@ int main(int argc, char **argv)
 		cmd = CMD_RECONSTRUCT;
 	} else if (strcmp(argv[1], "health") == 0) {
 		cmd = CMD_HEALTH;
-	} else if (strcmp(argv[1], "shr") == 0) {
-		cmd = CMD_SHR;
+	} else if (strcmp(argv[1], "hsr") == 0) {
+		cmd = CMD_HSR;
 	} else if (strcmp(argv[1], "message") == 0) {
 		ret = cmd_message(argc, argv);
 	} else {
@@ -2332,10 +2332,10 @@ int main(int argc, char **argv)
 				raid_type = LHSR_RAID5;
 			else if (strcmp(raid_type_str, "raid6") == 0)
 				raid_type = LHSR_RAID6;
-			else if (strcmp(raid_type_str, "shr") == 0)
-				raid_type = LHSR_RAID_SHR;
-			else if (strcmp(raid_type_str, "shr2") == 0)
-				raid_type = LHSR_RAID_SHR2;
+			else if (strcmp(raid_type_str, "hsr") == 0)
+				raid_type = LHSR_HSR1;
+			else if (strcmp(raid_type_str, "hsr2") == 0)
+				raid_type = LHSR_HSR2;
 			else {
 				fprintf(stderr, "Error: Unknown RAID type '%s'\n",
 				       raid_type_str);
@@ -2377,31 +2377,31 @@ int main(int argc, char **argv)
 	case CMD_HEALTH:
 		ret = cmd_health(argc, argv);
 		break;
-	case CMD_SHR:
-		/* Parse shr subcommands: "lhsrctl shr plan|create|status" */
+	case CMD_HSR:
+		/* Parse hsr subcommands: "lhsrctl hsr plan|create|status" */
 		if (argc < 3) {
-			fprintf(stderr, "Usage: %s shr <plan|create|status> [opts] <device>...\n", PROGNAME);
+			fprintf(stderr, "Usage: %s hsr <plan|create|status> [opts] <device>...\n", PROGNAME);
 			ret = 1;
 		} else if (strcmp(argv[2], "plan") == 0) {
-			ret = cmd_shr_plan(argc - 2, argv + 2);
+			ret = cmd_hsr_plan(argc - 2, argv + 2);
 		} else if (strcmp(argv[2], "create") == 0) {
-			ret = cmd_shr_create(argc - 2, argv + 2);
+			ret = cmd_hsr_create(argc - 2, argv + 2);
 		} else if (strcmp(argv[2], "status") == 0) {
-			ret = cmd_shr_status(argc - 2, argv + 2);
+			ret = cmd_hsr_status(argc - 2, argv + 2);
 		} else if (strcmp(argv[2], "destroy") == 0) {
-			ret = cmd_shr_destroy(argc - 2, argv + 2);
+			ret = cmd_hsr_destroy(argc - 2, argv + 2);
 		} else if (strcmp(argv[2], "scrub") == 0) {
-			ret = cmd_shr_scrub(argc - 3, argv + 3);
+			ret = cmd_hsr_scrub(argc - 3, argv + 3);
 		} else if (strcmp(argv[2], "disk") == 0) {
-			ret = cmd_shr_disk(argc - 3, argv + 3);
+			ret = cmd_hsr_disk(argc - 3, argv + 3);
 		} else if (strcmp(argv[2], "rebuild") == 0) {
-			ret = cmd_shr_rebuild(argc - 3, argv + 3);
+			ret = cmd_hsr_rebuild(argc - 3, argv + 3);
 		} else if (strcmp(argv[2], "expand") == 0) {
-			ret = cmd_shr_expand(argc - 3, argv + 3);
+			ret = cmd_hsr_expand(argc - 3, argv + 3);
 		} else if (strcmp(argv[2], "grow") == 0) {
-			ret = cmd_shr_grow(argc - 3, argv + 3);
+			ret = cmd_hsr_grow(argc - 3, argv + 3);
 		} else {
-			fprintf(stderr, "Unknown shr subcommand '%s'. "
+			fprintf(stderr, "Unknown hsr subcommand '%s'. "
 				"Use: plan, create, status, destroy, "
 				"disk, rebuild, scrub, expand, grow\n",
 				argv[2]);

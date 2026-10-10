@@ -75,8 +75,8 @@ static const char *raid_type_str(uint32_t type)
 	case LHSR_RAID_MIRROR: return "MIRROR";
 	case LHSR_RAID5:       return "RAID5";
 	case LHSR_RAID6:       return "RAID6";
-	case LHSR_RAID_SHR:    return "SHR";
-	case LHSR_RAID_SHR2:   return "SHR2";
+	case LHSR_HSR1:    return "HSR";
+	case LHSR_HSR2:   return "HSR2";
 	default:               return "UNKNOWN";
 	}
 }

@@ -90,12 +90,12 @@ struct lhsr_array {
 	unsigned int data_disks;
 	unsigned int parity_disks;
 
-	/* SHR segments */
+	/* HSR segments */
 	unsigned int segment_count;
 	struct lhsr_segment *segments;
 };
 
-/* Segment (for SHR) */
+/* Segment (for HSR) */
 struct lhsr_segment {
 	uint64_t start;
 	uint64_t size;
@@ -210,8 +210,8 @@ int lhsr_raid6_reconstruct(void *result, void *p, void *q,
 			    void **disks, unsigned int count,
 			    unsigned int failed1, unsigned int failed2, size_t block_len);
 
-/* SHR layout */
-void lhsr_shr_calculate_layout(struct lhsr_array *arr,
+/* HSR layout */
+void lhsr_hsr_calculate_layout(struct lhsr_array *arr,
 				struct lhsr_disk *disks,
 				unsigned int count);
 

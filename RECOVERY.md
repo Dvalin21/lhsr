@@ -40,7 +40,7 @@ of LHSR recovery tools.
 **What LHSR CANNOT do (yet):**
 - Dual-disk RAID6 recovery (needs Reed-Solomon online rebuild — Phase 8)
 - Live reshape (add/remove disks while online)
-- SHR variable-size disk repair
+- HSR variable-size disk repair
 
 If you need any of those, see [ROADMAP.md](ROADMAP.md) for status.
 
