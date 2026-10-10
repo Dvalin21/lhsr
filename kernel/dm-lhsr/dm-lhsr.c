@@ -5609,45 +5609,16 @@ passthrough_single:
 
 			/* REQ_PREFLUSH (including blkdev_issue_flush, which is a
 			 * zero-length REQ_OP_WRITE|REQ_PREFLUSH, not REQ_OP_FLUSH):
-			 * flush all member disks first.  Without this the bio
-			 * either hangs (zero-length: no stripe work is queued)
-			 * or completes without anything reaching stable media.
-			 * The member flushes complete before any data write is
-			 * submitted below, giving correct barrier ordering. */
+			 * drain queued RMW work so all previously submitted data
+			 * reaches the members before this barrier completes.
+			 * Member-flush bios are deliberately NOT used: standalone
+			 * REQ_OP_FLUSH is rejected by submit_bio (blk-core.c),
+			 * and empty WRITE+PREFLUSH member bios wedge in blk-mq.
+			 * The drain IS the barrier. Without it the bio either
+			 * hangs (zero-length: no stripe work is queued) or
+			 * completes without prior writes reaching the members. */
 			if (bio->bi_opf & REQ_PREFLUSH) {
-				struct lhsr_parallel_io fio;
-				unsigned long ffailed = lhsr_failed_disks_get(arr);
-				unsigned int d;
-				int fnr = 0;
-
-				init_completion(&fio.done);
-				fio.status = BLK_STS_OK;
-				for (d = 0; d < arr->disks; d++)
-					if (lhsr_disk_present(arr, d, ffailed))
-						fnr++;
-				atomic_set(&fio.pending, fnr);
-				for (d = 0; d < arr->disks; d++) {
-					struct bio *fbio;
-
-					if (!lhsr_disk_present(arr, d, ffailed))
-						continue;
-					fbio = bio_alloc_bioset(arr->disk[d], 0, REQ_OP_FLUSH,
-								GFP_NOIO, &lhsr_bioset);
-					if (!fbio) {
-						lhsr_pio_fail(&fio, BLK_STS_RESOURCE);
-						continue;
-					}
-					fbio->bi_end_io = lhsr_parallel_endio;
-					fbio->bi_private = &fio;
-					submit_bio(fbio);
-				}
-				if (fnr > 0)
-					wait_for_completion_io(&fio.done);
-				if (fio.status != BLK_STS_OK) {
-					bio->bi_status = fio.status;
-					bio_endio(bio);
-					return DM_MAPIO_SUBMITTED;
-				}
+				flush_workqueue(arr->rmw_wq);
 				if (bio->bi_iter.bi_size == 0) {
 					bio->bi_status = BLK_STS_OK;
 					bio_endio(bio);
