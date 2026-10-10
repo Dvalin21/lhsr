@@ -3,7 +3,22 @@
 Measured numbers only. Every line needs hardware + build ID + workload,
 or it gets deleted.
 
-## What we have (Oct 2026, VM, 4 vCPU, virtio)
+## mdadm shootout (Oct 2026, VM, 4 vCPU, virtio, 3 disks, 4K chunks)
+
+`tests/perf/bench.sh both 3`, fio direct, 100MB, 8s runs. LHSR build
+20261010-04, mdadm 4.2 RAID5 `--assume-clean`. Medians of 3 reps:
+
+| Workload | mdadm | LHSR | Ratio |
+|----------|-------|------|-------|
+| seqwrite 1M qd4 | 61 MB/s | 22 MB/s | 2.8x slower |
+| randwrite 4K qd16 | 2.0 MB/s | 3.0 MB/s | 1.5x faster |
+| randread 4K qd16 | 8.6 MB/s | 9.0 MB/s | even |
+
+The old "5-11x slower" claim is dead, at least for 4K chunks on a VM —
+the multi-chunk worker and the delta path did their job. Sequential
+writes still trail (per-stripe RMW round-trips); random writes lead.
+
+## Older numbers (same VM class, btrfs file IO, pre-shootout)
 
 | Workload | Throughput | Build |
 |----------|-----------|-------|

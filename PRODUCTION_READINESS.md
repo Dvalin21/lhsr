@@ -30,7 +30,7 @@ No hype. No marketing. Just what works, what doesn't, and what's needed.
 | 7 | Incremental rebuild | Phase 2 | ✅ Write-Intent Bitmap (WIB) — persistent, 1MB granularity, rebuild skips clean regions | High | Phase 2 |
 | 8 | Firmware failure mitigation | Phase 0 | ❌ Vaporware (kernel quirks exist, not LHSR's problem) | Low | Small |
 | 9 | Hot spare / disk replacement | Phase 8 | ✅ `lhsrctl hsr disk replace` — staged replace, rebuild-to-spare, auto-failover | Medium | Phase 8 |
-| 10 | Write performance | Phase 15 | ⚠️ 5-11x slower than mdadm on VM. RMW does 4 sync IOs per 4KB write. TBD. | High | Large (Phase 15 planned) |
+| 10 | Write performance | Oct 2026 shootout | ⚠️ Seq writes ~2.8x slower than mdadm on VM (22 vs 61MB/s); randwrites faster, reads even. Real hardware numbers still needed. | High | Real hardware needed |
 
 ---
 
@@ -906,11 +906,11 @@ scrubbing, write-intent bitmap incremental rebuild, read-side self-healing, and
 dm-integrity stacking for persistent anti-bit-rot. The HSR userspace tool adds
 mixed-disk-size tiered RAID with LVM. In-place kernel RAID5→RAID6 reshape is
 supported (Phase 9, read-only during migration). Online disk-add reshape is not
-supported — add capacity via new HSR tiers. Write performance is ~5-11x slower
-than mdadm (known issue, Phase 15)."
+supported — add capacity via new HSR tiers. Write performance is ~2.8x slower
+than mdadm on sequential VM writes (randwrites lead); hardware numbers pending."
 
 **Remaining gaps (see ROADMAP.md for phases):**
-1. Write performance (5-11x gap vs mdadm, Phase 15 — real hardware needed)
+1. Write performance (seq ~2.8x gap vs mdadm on VM — real hardware needed)
 2. ~~`lhsrctl predict` stub~~ (✅ resolved: CLI wired, daemon DM discovery fixed)
 3. ~~RAID6 dual-disk RS decode~~ (✅ resolved: Vandermonde 2x2 in `lhsr_rs_decode_2()`)
 4. ~~Periodic WIB flush~~ (✅ resolved: 30-second timer via `wib_wq` + `delayed_work`)

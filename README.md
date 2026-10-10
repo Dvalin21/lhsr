@@ -137,10 +137,10 @@ doing its job.  Watch `rmw_stats` errors and dmesg.  Recovery steps are in
   6.12 builds fine, but kernel version skew has already bitten us once
   (standalone FLUSH bios), so 6.12 runtime is unverified.  Real-disk
   SMART/failover behavior is unverified too.
-- **mdadm-class write performance** — about 5-11x slower on a VM (4 sync
-  IOs per 4KB write; we measured 3-5MB/s of btrfs file IO).  Nobody has
-  measured it since the October fixes, and VM numbers are not hardware
-  numbers anyway.
+- **mdadm-class write performance** — sequential writes run about 3x
+  slower than mdadm on a VM (22 vs 61MB/s); random 4K writes actually
+  beat it there (3.0 vs 2.0MB/s), reads are even.  VM numbers, not
+  hardware numbers — real disks still need measuring.
 
 ## Components
 
