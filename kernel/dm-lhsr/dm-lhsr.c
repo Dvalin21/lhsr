@@ -212,7 +212,8 @@ struct lhsr_raid_5_read_ctx {
 	sector_t offset;			/* Sector offset */
 	size_t bio_size;			/* Byte count stored at read start (safe from completion) */
 	void **data_bufs;			/* Array of data+parity buffers */
-	struct page **pages;		/* Per-slot owned pages (for reconstruction reads) */
+	struct page **pages;		/* Per-slot owned pages: num_slots * nr_pages flat */
+	unsigned int nr_pages;		/* Pages per slot = ceil(bio_size / PAGE_SIZE) */
 	unsigned int disk_map[0];	/* Flex array: slot_idx -> disk_idx */
 };
 
@@ -232,7 +233,7 @@ MODULE_VERSION(LHSR_VERSION);
 
 /* Build ID stamp: update on every test build so dmesg proves which
  * binary is actually loaded. Format: YYYYMMDD-NN */
-#define LHSR_BUILD_ID "20261010-02"
+#define LHSR_BUILD_ID "20261010-03"
 
 /* Module parameters (tunable at insmod/modprobe time) */
 static unsigned int lhsr_rmw_max_active = 32;
@@ -555,35 +556,60 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 	 * which we allocated and mapped into the bio at offset 0.
 	 */
 	if (slot < ctx->num_slots && ctx->data_bufs && ctx->data_bufs[slot]) {
-		void *kaddr = kmap_local_page(ctx->pages[slot]);
-		int non_zero = 0;
+		unsigned int p;
 
-		memcpy(ctx->data_bufs[slot], kaddr, ctx->bio_size);
+		for (p = 0; p < ctx->nr_pages; p++) {
+			struct page *pg = ctx->pages[slot * ctx->nr_pages + p];
+			unsigned int page_bytes = (p == ctx->nr_pages - 1) ?
+				ctx->bio_size - (p << PAGE_SHIFT) : PAGE_SIZE;
+			void *kaddr;
+
+			if (!pg)
+				break;
+			kaddr = kmap_local_page(pg);
+			memcpy((u8 *)ctx->data_bufs[slot] + (p << PAGE_SHIFT),
+			       kaddr, page_bytes);
+			kunmap_local(kaddr);
+		}
 
 		/* Quick non-zero check on first bytes */
 		{
 			u8 *tmp = (u8 *)ctx->data_bufs[slot];
 			unsigned int k;
+			int non_zero = 0;
 			for (k = 0; k < min_t(size_t, 64, ctx->bio_size); k++) {
 				if (tmp[k]) non_zero++;
 			}
+			DMDEBUG("read_endio: slot=%u disk=%u non_zero_first64=%d bio_size=%zu",
+			        slot, ctx->disk_map[slot], non_zero, ctx->bio_size);
 		}
 
-		kunmap_local(kaddr);
+		/* Free our per-clone pages (not shared, safe to free here) */
+		if (ctx->pages && slot < ctx->num_slots) {
+			unsigned int p;
 
-		DMDEBUG("read_endio: slot=%u disk=%u non_zero_first64=%d bio_size=%zu",
-		        slot, ctx->disk_map[slot], non_zero, ctx->bio_size);
-
-		/* Free our per-clone page (not shared, safe to free here) */
-		if (ctx->pages && slot < ctx->num_slots && ctx->pages[slot]) {
-			__free_page(ctx->pages[slot]);
-			ctx->pages[slot] = NULL;
+			for (p = 0; p < ctx->nr_pages; p++) {
+				struct page **pgp =
+					&ctx->pages[slot * ctx->nr_pages + p];
+				if (*pgp) {
+					__free_page(*pgp);
+					*pgp = NULL;
+				}
+			}
 		}
 	} else if (bio->bi_status == BLK_STS_OK) {
-		/* No data_bufs slot but bio completed OK — free page anyway */
-		if (slot < ctx->num_slots && ctx->pages && ctx->pages[slot]) {
-			__free_page(ctx->pages[slot]);
-			ctx->pages[slot] = NULL;
+		/* No data_bufs slot but bio completed OK — free pages anyway */
+		if (slot < ctx->num_slots && ctx->pages) {
+			unsigned int p;
+
+			for (p = 0; p < ctx->nr_pages; p++) {
+				struct page **pgp =
+					&ctx->pages[slot * ctx->nr_pages + p];
+				if (*pgp) {
+					__free_page(*pgp);
+					*pgp = NULL;
+				}
+			}
 		}
 	}
 
@@ -717,7 +743,7 @@ static void lhsr_raid_5_read_endio(struct bio *bio)
 		}
 		if (ctx->pages) {
 			unsigned int j;
-			for (j = 0; j < ctx->num_slots; j++) {
+			for (j = 0; j < ctx->num_slots * ctx->nr_pages; j++) {
 				if (ctx->pages[j])
 					__free_page(ctx->pages[j]);
 			}
@@ -5166,31 +5192,43 @@ static void lhsr_map_read_single(struct dm_target *ti, struct lhsr_array *arr,
 				}
 			}
 
-			/*
-			 * All survivors read at the same stripe position:
-			 * each disk's chunk for this stripe is at chunk_start + sector_in_chunk
-			 */
-			stripe_sector = chunk_start + (offset % chunk_sects);
+		/*
+		 * All survivors read at the same stripe position:
+		 * each disk's chunk for this stripe is at chunk_start + sector_in_chunk.
+		 * Multi-page slots: bios up to bio_size need nr_pages each;
+		 * single pages overflow past 4KB (observed: 1MB DMA smash
+		 * into adjacent memory -> scheduler panic on degraded read).
+		 */
+		stripe_sector = chunk_start + (offset % chunk_sects);
 
-			/* Allocate per-slot pages array */
-			ctx->pages = kzalloc(sizeof(struct page *) * ctx->num_slots, GFP_NOIO);
-			if (!ctx->pages) {
-				kfree(ctx->recon_buf);
-				kfree(ctx->data_bufs);
-				kfree(ctx);
-				bio->bi_status = BLK_STS_RESOURCE;
-				bio_endio(bio);
+		/* Allocate per-slot pages array (flat: slot * nr_pages + p) */
+		ctx->nr_pages = (ctx->bio_size + PAGE_SIZE - 1) >> PAGE_SHIFT;
+		ctx->pages = kzalloc(sizeof(struct page *) * ctx->num_slots *
+				     ctx->nr_pages, GFP_NOIO);
+		if (!ctx->pages) {
+			kfree(ctx->recon_buf);
+			kfree(ctx->data_bufs);
+			kfree(ctx);
+			bio->bi_status = BLK_STS_RESOURCE;
+			bio_endio(bio);
 	return;
-			}
+		}
 
-			/* Phase 1: Pre-allocate a page for each clone */
-			for (i = 0; i < ctx->num_slots; i++) {
-				ctx->pages[i] = alloc_page(GFP_NOIO);
-				if (!ctx->pages[i]) {
+		/* Phase 1: Pre-allocate pages for each clone */
+		for (i = 0; i < ctx->num_slots; i++) {
+			unsigned int p;
+
+			for (p = 0; p < ctx->nr_pages; p++) {
+				ctx->pages[i * ctx->nr_pages + p] =
+					alloc_page(GFP_NOIO);
+				if (!ctx->pages[i * ctx->nr_pages + p]) {
 					ctx->status = BLK_STS_RESOURCE;
 					break;
 				}
 			}
+			if (p < ctx->nr_pages)
+				break;
+		}
 
 			/* Phase 2: For each slot, create an independent bio with its own page */
 			{
@@ -5200,40 +5238,59 @@ static void lhsr_map_read_single(struct dm_target *ti, struct lhsr_array *arr,
 			DMDEBUG("RECON clone setup: orig_bio_size=%zu ctx_bio_size=%zu chunk_bytes=%zu",
 			        (size_t)bio->bi_iter.bi_size, ctx->bio_size, (size_t)chunk_sects << SECTOR_SHIFT);
 
-			for (i = 0; i < ctx->num_slots; i++) {
-				struct bio *recon_bio;
-				unsigned int di = ctx->disk_map[i];
+		for (i = 0; i < ctx->num_slots; i++) {
+			struct bio *recon_bio;
+			unsigned int di = ctx->disk_map[i];
+			unsigned int p;
+			int slot_ok = 1;
 
-				if (!arr->disk[di]) {
-					ctx->status = BLK_STS_IOERR;
-					atomic_dec(&ctx->pending);
-					DMINFO("RECON clone: disk %u (slot %u) unavailable", di, i);
-					continue;
+			if (!arr->disk[di]) {
+				ctx->status = BLK_STS_IOERR;
+				atomic_dec(&ctx->pending);
+				DMINFO("RECON clone: disk %u (slot %u) unavailable", di, i);
+				continue;
+			}
+			for (p = 0; p < ctx->nr_pages; p++) {
+				if (!ctx->pages[i * ctx->nr_pages + p]) {
+					slot_ok = 0;
+					break;
 				}
-				if (!ctx->pages[i]) {
-					ctx->status = BLK_STS_RESOURCE;
-					atomic_dec(&ctx->pending);
-					alloc_failed = 1;
-					DMINFO("RECON clone: slot %u page allocation failed", i);
-					continue;
+			}
+			if (!slot_ok) {
+				ctx->status = BLK_STS_RESOURCE;
+				atomic_dec(&ctx->pending);
+				alloc_failed = 1;
+				DMINFO("RECON clone: slot %u page allocation failed", i);
+				continue;
+			}
+			recon_bio = bio_alloc_bioset(arr->disk[di], ctx->nr_pages,
+						    REQ_OP_READ, GFP_NOIO,
+						    &lhsr_bioset);
+			if (!recon_bio) {
+				ctx->status = BLK_STS_RESOURCE;
+				atomic_dec(&ctx->pending);
+				alloc_failed = 1;
+				DMINFO("RECON clone: bio_alloc_bioset failed for disk %u", di);
+				continue;
+			}
+			/* One bvec per page; contiguous sectors follow from
+			 * bi_sector (page p covers stripe_sector + p * 8). */
+			{
+				int page_fail = 0;
+
+				for (p = 0; p < ctx->nr_pages; p++) {
+					unsigned int page_bytes =
+						(p == ctx->nr_pages - 1) ?
+						ctx->bio_size - (p << PAGE_SHIFT) :
+						PAGE_SIZE;
+					if (!bio_add_page(recon_bio,
+							  ctx->pages[i * ctx->nr_pages + p],
+							  page_bytes, 0)) {
+						page_fail = 1;
+						break;
+					}
 				}
-				recon_bio = bio_alloc_bioset(arr->disk[di], 1,
-							    REQ_OP_READ, GFP_NOIO,
-							    &lhsr_bioset);
-				if (!recon_bio) {
-					ctx->status = BLK_STS_RESOURCE;
-					atomic_dec(&ctx->pending);
-					alloc_failed = 1;
-					DMINFO("RECON clone: bio_alloc_bioset failed for disk %u", di);
-					continue;
-				}
-				/* Use bio_add_page to properly set up the bvec.
-				 * Page ownership: we allocated the page and bio_add_page
-				 * does NOT take a reference (the caller retains ownership).
-				 * The endio handler will __free_page to release it.
-				 */
-				if (!bio_add_page(recon_bio, ctx->pages[i],
-						  bio->bi_iter.bi_size, 0)) {
+				if (page_fail) {
 					bio_put(recon_bio);
 					ctx->status = BLK_STS_RESOURCE;
 					atomic_dec(&ctx->pending);
@@ -5241,6 +5298,7 @@ static void lhsr_map_read_single(struct dm_target *ti, struct lhsr_array *arr,
 					alloc_failed = 1;
 					continue;
 				}
+			}
 				ctx->data_bufs[i] = kzalloc(bio->bi_iter.bi_size, GFP_NOIO);
 				if (!ctx->data_bufs[i]) {
 					bio_put(recon_bio);
@@ -5272,14 +5330,14 @@ static void lhsr_map_read_single(struct dm_target *ti, struct lhsr_array *arr,
 						kfree(ctx->data_bufs[i]);
 					kfree(ctx->data_bufs);
 				}
-				if (ctx->pages) {
-					for (i = 0; i < ctx->num_slots; i++) {
-						if (ctx->pages[i])
-							__free_page(ctx->pages[i]);
-					}
-					kfree(ctx->pages);
+			if (ctx->pages) {
+				for (i = 0; i < ctx->num_slots * ctx->nr_pages; i++) {
+					if (ctx->pages[i])
+						__free_page(ctx->pages[i]);
 				}
-				kfree(ctx);
+				kfree(ctx->pages);
+			}
+			kfree(ctx);
 	return;
 			}
 	return;
