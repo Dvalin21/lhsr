@@ -6,6 +6,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-10-10 — Orphan-lock hunt + 64KB-chunk hardening
+
+Six defects found by VM reproduction (btrfs + 64KB chunks, sustained file
+IO), all fixed on `main`, all with build IDs for load verification:
+
+### Fixed
+- RMW `full` vs `chunk_full` mismatch: bio-edge stripes used `od[l]==NULL`
+  (worker GPF with stripe lock held = orphaned bucket, dead holder PID).
+  Per-chunk `od`, true full-stripe, partial-only reads.
+- Flush: standalone `REQ_OP_FLUSH` rejected by `submit_bio`; member-wave
+  replacement wedged in blk-mq. Drain `rmw_wq` as the barrier.
+- Recovery + reshape + degraded-read paths used single pages with
+  `chunk_bytes` IO (up to 64KB): heap smash / DMA overflow / panic.
+  Compound pages everywhere chunk IO happens.
+- Degraded-read copy-back stopped after the first bio segment (correct
+  4KB, garbage past it). Walk all segments.
+- `pio` pending imbalance on skip/failure paths (hardening; converts
+  hangs to stripe errors).
+
+### Verified (VM, 6.1.0-50-cloud, RAID5/6, 64KB chunks, btrfs)
+- 585K + 556K RMW cycles, 0 errors, sustained file IO, fs healthy.
+- In-place RAID5→RAID6 reshape with data preservation (sha256 identical).
+- Degraded RAID6 single-disk read: sha256 identical over 200MB.
+- Dirty bitmap recoveries complete cleanly.
+
+### Known remaining
+- RAID6 dual-failure decode untested on new code paths.
+- Debian 13 (6.12) validation pending; no 13 test image on hand.
+- 5-11x write-perf gap vs mdadm stands (unmeasured after fixes).
+
 ## [8.0.0] — 2026-06-23 — Phase 9: Kernel RAID5→RAID6 Reshape
 
 ### Added (Phase 9a: Data Layout Analysis)

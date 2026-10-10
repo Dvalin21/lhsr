@@ -913,3 +913,30 @@ than mdadm (known issue, Phase 15)."
 4. ~~Periodic WIB flush~~ (✅ resolved: 30-second timer via `wib_wq` + `delayed_work`)
 5. ~~Integration test: SHR LHSR-only create → expand → status → destroy~~ (✅ PASS on VM, Jun 19)
 6. RAID5/6 WIB clear on full-stripe write (minor optimization, not correctness-critical)
+
+---
+
+## October 2026 hunt: orphaned stripe locks + 64KB-chunk hardening
+
+**Symptom (observed twice, btrfs file IO, never raw fio):** 1–4 of 128
+stripe buckets wedged permanently, holder PIDs gone, data consistent.
+
+**Root causes found (all reproduced live on VM, all fixed on `main`):**
+
+| # | Defect | Effect | Fix |
+|---|--------|--------|-----|
+| 1 | `full` (all-touched) vs `chunk_full[l]` (fully-contained) mismatch: `od[]` gated on the former, used on the latter | Bio-edge stripes used `od[l]==NULL` → wild kmap → worker GPF **with stripe lock held** = orphaned bucket, dead holder PID | Per-chunk `od`, true full-stripe, partial-only reads |
+| 2 | Standalone `REQ_OP_FLUSH` bios rejected by `submit_bio` (blk-core.c); member-wave replacement wedged in blk-mq | Every piggybacked btrfs barrier failed → forced ro (3/3 runs); then mkfs stuck in flush wait | Drain `rmw_wq` as the barrier (−29 lines) |
+| 3 | Recovery/reshape/degraded-read paths: single pages with `chunk_bytes` (≤64KB) IO/memset | 60KB heap smash → wild `ctr` memset → panic; 1MB DMA smash on degraded read → scheduler panic | Compound pages everywhere chunk IO happens |
+| 4 | Degraded-read copy-back stopped after first bio segment | Correct 4KB reads, garbage past 4KB on degraded arrays | Walk all orig segments |
+| 5 | `pio` pending imbalance on skip/failure paths | Potential hang (never observed live) | Balance + complete (hardening) |
+
+**Verification (VM 6.1.0-50-cloud, RAID5/6, 64KB chunks, btrfs, 4K randwrite):**
+585K + 556K RMW cycles with 0 errors; in-place RAID5→RAID6 reshape with
+sha256-identical data; degraded RAID6 single-disk 200MB read sha256-identical;
+dirty recoveries complete. Residue: `debug/bio-shape-20261009` branch holds
+the throwaway probes; `main` carries fixes only.
+
+**Still open after the hunt:** RAID6 dual-failure decode on new paths;
+Debian 13 validation; `+850GB` recovery memset oops (likely fallout of #3,
+2 clean recoveries since — watch item); write-perf gap unmeasured.
